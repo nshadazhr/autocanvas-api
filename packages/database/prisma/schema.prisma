@@ -1,0 +1,731 @@
+// ============================================================================
+// AI Creator Platform — Core Database Schema
+//
+// Design principles this file enforces (see docs/architecture.md):
+//   1. `Project` is generic and module-agnostic. Every studio (audio, script,
+//      image, video...) gets its own 1:1 extension table (e.g. AudioProject)
+//      instead of Project growing module-specific columns.
+//   2. `Job` is generic across modules. Audio/Image/Video generations all
+//      reference a Job row, so Admin's Jobs/Failed Jobs screens, retry logic,
+//      and credit accounting work identically for every future module.
+//   3. Credits are an append-only ledger (CreditTransaction), never a mutated
+//      balance in place — this is what prevents double-spend race conditions.
+//   4. AiProvider / AiModel are DB-driven, not hard-coded — admins can
+//      activate/deactivate providers and models without a deploy.
+//   5. Every module-specific table (Audio* below) follows the exact shape
+//      that Script/Image/Video/Music modules will replicate later.
+// ============================================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// ENUMS
+// ─────────────────────────────────────────────────────────────────────────
+
+enum UserRole {
+  USER
+  ADMIN
+  SUPER_ADMIN
+
+  @@map("user_role")
+}
+
+enum OrgMemberRole {
+  OWNER
+  ADMIN
+  EDITOR
+  WRITER
+  DESIGNER
+  VIEWER
+
+  @@map("org_member_role")
+}
+
+enum ProjectStatus {
+  DRAFT
+  ACTIVE
+  ARCHIVED
+
+  @@map("project_status")
+}
+
+/// Drives which extension table (AudioProject, ScriptProject, ...) applies.
+/// New modules add a value here + a new extension table — Project itself
+/// never changes shape.
+enum ProjectType {
+  AUDIO
+  SCRIPT
+  IMAGE
+  THUMBNAIL
+  VIDEO
+  MUSIC
+  SFX
+  SUBTITLE
+
+  @@map("project_type")
+}
+
+enum FileKind {
+  AUDIO
+  IMAGE
+  VIDEO
+  SUBTITLE
+  THUMBNAIL
+  MUSIC
+  SFX
+  OTHER
+
+  @@map("file_kind")
+}
+
+enum CreditTxType {
+  RESERVE
+  CONSUME
+  REFUND
+  PURCHASE
+  GRANT
+  ADJUSTMENT
+
+  @@map("credit_tx_type")
+}
+
+enum PaymentProviderKey {
+  STRIPE
+  RAZORPAY
+  CASHFREE
+  /// Free-tier or admin-granted subscriptions — no real payment gateway involved.
+  NONE
+
+  @@map("payment_provider_key")
+}
+
+enum SubscriptionStatus {
+  ACTIVE
+  TRIALING
+  PAST_DUE
+  CANCELED
+  INCOMPLETE
+
+  @@map("subscription_status")
+}
+
+enum PaymentStatus {
+  PENDING
+  SUCCEEDED
+  FAILED
+  REFUNDED
+
+  @@map("payment_status")
+}
+
+/// Generic across every module — Audio Studio today, Image/Video tomorrow.
+enum JobStatus {
+  QUEUED
+  PROCESSING
+  COMPLETED
+  FAILED
+  RETRYING
+  CANCELED
+
+  @@map("job_status")
+}
+
+enum SceneStatus {
+  PENDING
+  QUEUED
+  PROCESSING
+  COMPLETED
+  FAILED
+
+  @@map("scene_status")
+}
+
+enum ExportType {
+  CHUNK
+  MERGED
+
+  @@map("export_type")
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// PLATFORM CORE: USERS, ORGS, RBAC
+// ─────────────────────────────────────────────────────────────────────────
+
+model User {
+  id              String    @id @default(uuid())
+  email           String    @unique
+  passwordHash    String?   @map("password_hash")
+  name            String?
+  avatarUrl       String?   @map("avatar_url")
+  role            UserRole  @default(USER)
+  twoFactorSecret String?   @map("two_factor_secret")
+  emailVerifiedAt DateTime? @map("email_verified_at")
+  /// Bumped to force-invalidate all outstanding JWT sessions for this user
+  /// (password change, suspicious activity, admin-initiated logout).
+  /// Required because the Credentials provider only supports JWT sessions,
+  /// not Auth.js's database session strategy — see packages/auth/src/config.ts.
+  tokenVersion    Int       @default(0) @map("token_version")
+
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  deletedAt DateTime? @map("deleted_at")
+
+  ownedOrganizations   Organization[]         @relation("OrganizationOwner")
+  organizationMembers  OrganizationMember[]
+  projects             Project[]
+  creditAccount        CreditAccount?
+  subscriptions        Subscription[]
+  payments             Payment[]
+  notifications        Notification[]
+  apiKeys              ApiKey[]
+  voiceProfiles        VoiceProfile[]
+  jobs                 Job[]
+  usageRecords         UsageRecord[]
+  auditLogsAsActor     AuditLog[]
+
+  @@map("users")
+}
+
+model Organization {
+  id      String  @id @default(uuid())
+  name    String
+  ownerId String  @map("owner_id")
+  owner   User    @relation("OrganizationOwner", fields: [ownerId], references: [id])
+  planId  String? @map("plan_id")
+  plan    SubscriptionPlan? @relation(fields: [planId], references: [id])
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  members       OrganizationMember[]
+  projects      Project[]
+  subscriptions Subscription[]
+  creditAccount CreditAccount?
+
+  @@map("organizations")
+}
+
+model OrganizationMember {
+  id             String        @id @default(uuid())
+  organizationId String        @map("organization_id")
+  organization   Organization  @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  userId         String        @map("user_id")
+  user           User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  role           OrgMemberRole @default(VIEWER)
+
+  invitedAt DateTime  @default(now()) @map("invited_at")
+  joinedAt  DateTime? @map("joined_at")
+
+  @@unique([organizationId, userId])
+  @@map("organization_members")
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// PROJECTS (generic container — module extension tables hang off this)
+// ─────────────────────────────────────────────────────────────────────────
+
+model Project {
+  id             String        @id @default(uuid())
+  ownerId        String        @map("owner_id")
+  owner          User          @relation(fields: [ownerId], references: [id])
+  organizationId String?       @map("organization_id")
+  organization   Organization? @relation(fields: [organizationId], references: [id])
+
+  type        ProjectType
+  name        String
+  description String?
+  status      ProjectStatus @default(DRAFT)
+  metadata    Json          @default("{}")
+
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  deletedAt DateTime? @map("deleted_at")
+
+  files        ProjectFile[]
+  jobs         Job[]
+  audioProject AudioProject?
+
+  @@index([ownerId])
+  @@index([organizationId])
+  @@index([type, status])
+  @@map("projects")
+}
+
+model ProjectFile {
+  id         String   @id @default(uuid())
+  projectId  String   @map("project_id")
+  project    Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  kind       FileKind
+  storageKey String   @map("storage_key")
+  mimeType   String   @map("mime_type")
+  sizeBytes  BigInt   @map("size_bytes")
+  checksum   String?
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@index([projectId])
+  @@map("project_files")
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// CREDITS (append-only ledger — see packages/credits)
+// ─────────────────────────────────────────────────────────────────────────
+
+model CreditAccount {
+  id             String        @id @default(uuid())
+  userId         String?       @unique @map("user_id")
+  user           User?         @relation(fields: [userId], references: [id])
+  organizationId String?       @unique @map("organization_id")
+  organization   Organization? @relation(fields: [organizationId], references: [id])
+
+  balance  BigInt @default(0)
+  reserved BigInt @default(0)
+
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  transactions CreditTransaction[]
+  jobs         Job[]
+
+  @@map("credit_accounts")
+}
+
+model CreditTransaction {
+  id              String        @id @default(uuid())
+  creditAccountId String        @map("credit_account_id")
+  creditAccount   CreditAccount @relation(fields: [creditAccountId], references: [id], onDelete: Cascade)
+
+  type          CreditTxType
+  amount        BigInt // positive = credit added, negative = debited
+  referenceType String?      @map("reference_type") // e.g. "job", "payment"
+  referenceId   String?      @map("reference_id")
+  balanceAfter  BigInt       @map("balance_after")
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@index([creditAccountId, createdAt])
+  @@index([referenceType, referenceId])
+  @@map("credit_transactions")
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// BILLING & SUBSCRIPTIONS
+// ─────────────────────────────────────────────────────────────────────────
+
+model SubscriptionPlan {
+  id              String  @id @default(uuid())
+  key             String  @unique // "free" | "creator" | "pro" | "business" | "enterprise"
+  name            String
+  monthlyCredits  Int     @map("monthly_credits")
+  storageGb       Int     @map("storage_gb")
+  maxTeamMembers  Int     @map("max_team_members")
+  priceCents      Int     @map("price_cents")
+  currency        String  @default("usd")
+  features        Json    @default("{}") // { "models_allowed": [...], "max_projects": 20, ... }
+  isActive        Boolean @default(true) @map("is_active")
+
+  // Added in Chunk 9 (packages/billing) — the provider-side price/plan id
+  // that `createCheckoutSession()` points at when starting a subscription
+  // for this plan. Nullable because the "free" and "enterprise" (sales-
+  // negotiated) plans never go through a real checkout at all, and because
+  // a plan can exist locally before anyone has created its counterpart in
+  // the Stripe/Razorpay dashboard. Whichever provider a checkout is
+  // requested through, `getPaymentProvider(provider).createCheckoutSession`
+  // reads the matching column here and throws PlanNotCheckoutReadyError if
+  // it's still null — see packages/billing/src/errors.ts.
+  stripePriceId   String? @map("stripe_price_id")
+  razorpayPlanId  String? @map("razorpay_plan_id")
+
+  createdAt     DateTime       @default(now()) @map("created_at")
+  updatedAt     DateTime       @updatedAt @map("updated_at")
+  subscriptions Subscription[]
+  organizations Organization[]
+
+  @@map("subscription_plans")
+}
+
+model Subscription {
+  id                       String              @id @default(uuid())
+  userId                   String?             @map("user_id")
+  user                     User?               @relation(fields: [userId], references: [id])
+  organizationId           String?             @map("organization_id")
+  organization             Organization?       @relation(fields: [organizationId], references: [id])
+  planId                   String              @map("plan_id")
+  plan                     SubscriptionPlan    @relation(fields: [planId], references: [id])
+
+  provider                 PaymentProviderKey
+  providerSubscriptionId   String?             @map("provider_subscription_id")
+  status                   SubscriptionStatus  @default(ACTIVE)
+  currentPeriodEnd         DateTime?           @map("current_period_end")
+  cancelAtPeriodEnd        Boolean             @default(false) @map("cancel_at_period_end")
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  payments Payment[]
+
+  @@index([userId])
+  @@index([organizationId])
+  // Added in Chunk 9 — the upsert target for every incoming webhook that
+  // touches a subscription. Without this being unique, "find or create the
+  // local row for this provider subscription" would need a fragile
+  // findFirst-then-create race instead of a real upsert, and duplicate
+  // webhook deliveries (both Stripe and Razorpay explicitly document that
+  // webhooks CAN be delivered more than once) could create two local rows
+  // for the same real-world subscription.
+  @@unique([provider, providerSubscriptionId])
+  @@map("subscriptions")
+}
+
+model Payment {
+  id               String         @id @default(uuid())
+  subscriptionId   String?        @map("subscription_id")
+  subscription     Subscription?  @relation(fields: [subscriptionId], references: [id])
+  userId           String         @map("user_id")
+  user             User           @relation(fields: [userId], references: [id])
+
+  provider         PaymentProviderKey
+  providerPaymentId String?       @map("provider_payment_id")
+  amountCents      Int            @map("amount_cents")
+  currency         String
+  status           PaymentStatus  @default(PENDING)
+  rawPayload       Json?          @map("raw_payload")
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  invoice Invoice?
+
+  @@index([userId])
+  // Tightened from a plain @@index to @@unique in Chunk 9 — same
+  // duplicate-webhook-delivery reasoning as Subscription's unique
+  // constraint above. This is also what makes `applyPaymentSettled`'s
+  // "have we already granted credits for this payment?" check a real
+  // upsert instead of a check-then-insert race between two concurrent
+  // deliveries of the same webhook.
+  @@unique([provider, providerPaymentId])
+  @@map("payments")
+}
+
+model Invoice {
+  id            String   @id @default(uuid())
+  paymentId     String   @unique @map("payment_id")
+  payment       Payment  @relation(fields: [paymentId], references: [id])
+  number        String   @unique
+  pdfStorageKey String?  @map("pdf_storage_key")
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@map("invoices")
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// JOBS (generic across every module — audio today, image/video tomorrow)
+// ─────────────────────────────────────────────────────────────────────────
+
+model Job {
+  id        String    @id @default(uuid())
+  userId    String    @map("user_id")
+  user      User      @relation(fields: [userId], references: [id])
+  projectId String?   @map("project_id")
+  project   Project?  @relation(fields: [projectId], references: [id])
+
+  // Which ledger account this job's credits are reserved/consumed/refunded
+  // against. Added in Chunk 4 (packages/queue) — without it, the worker
+  // would have to re-derive "who pays for this" from userId at consume/
+  // refund time, which silently breaks for org-owned projects (the paying
+  // account there is the org's CreditAccount, not the acting user's
+  // personal one). Storing it on the Job itself makes that binding
+  // explicit and immutable for the life of the job.
+  creditAccountId String?        @map("credit_account_id")
+  creditAccount   CreditAccount? @relation(fields: [creditAccountId], references: [id])
+
+  module   String // "audio" | "script" | "image" | "video" ...
+  jobType  String @map("job_type") // "generate_scene" | "merge_audio" ...
+  status   JobStatus @default(QUEUED)
+
+  attempts    Int    @default(0)
+  maxAttempts Int    @default(3) @map("max_attempts")
+
+  provider String?
+  model    String?
+  payload  Json    @default("{}")
+  error    String?
+
+  creditsReserved  Int @default(0) @map("credits_reserved")
+  creditsConsumed  Int @default(0) @map("credits_consumed")
+
+  queuedAt   DateTime  @default(now()) @map("queued_at")
+  startedAt  DateTime? @map("started_at")
+  finishedAt DateTime? @map("finished_at")
+
+  attemptLogs      JobAttempt[]
+  audioGeneration  AudioGeneration?
+
+  @@index([userId])
+  @@index([projectId])
+  @@index([creditAccountId])
+  @@index([module, status])
+  @@map("jobs")
+}
+
+model JobAttempt {
+  id            String   @id @default(uuid())
+  jobId         String   @map("job_id")
+  job           Job      @relation(fields: [jobId], references: [id], onDelete: Cascade)
+  attemptNumber Int      @map("attempt_number")
+  status        JobStatus
+  error         String?
+
+  startedAt  DateTime? @map("started_at")
+  finishedAt DateTime? @map("finished_at")
+
+  @@index([jobId])
+  @@map("job_attempts")
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// AI PROVIDER REGISTRY (DB-driven — no hard-coded providers)
+// ─────────────────────────────────────────────────────────────────────────
+
+model AiProvider {
+  id       String  @id @default(uuid())
+  key      String  @unique // "elevenlabs" | "openai_tts" | "azure_speech" | ...
+  name     String
+  module   String // "audio" | "image" | "video" ...
+  isActive Boolean @default(true) @map("is_active")
+  config   Json    @default("{}")
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  models          AiModel[]
+  voiceProfiles   VoiceProfile[]
+  audioGenerations AudioGeneration[]
+
+  @@map("ai_providers")
+}
+
+model AiModel {
+  id           String  @id @default(uuid())
+  providerId   String  @map("provider_id")
+  provider     AiProvider @relation(fields: [providerId], references: [id], onDelete: Cascade)
+  key          String
+  name         String
+  capabilities Json    @default("{}")
+  costPerUnit  Decimal @map("cost_per_unit") @db.Decimal(10, 6)
+  isActive     Boolean @default(true) @map("is_active")
+
+  audioGenerations AudioGeneration[]
+
+  @@unique([providerId, key])
+  @@map("ai_models")
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// AUDIO STUDIO MODULE
+// (Script/Image/Video modules will mirror this exact shape later)
+// ─────────────────────────────────────────────────────────────────────────
+
+model AudioProject {
+  id              String   @id @default(uuid())
+  projectId       String   @unique @map("project_id")
+  project         Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  language        String   @default("en-US")
+  defaultVoiceId  String?  @map("default_voice_id")
+  defaultVoice    VoiceProfile? @relation(fields: [defaultVoiceId], references: [id])
+  defaultStyle    String?  @map("default_style")
+  defaultEmotion  String?  @map("default_emotion")
+  defaultFormat   String   @default("mp3") @map("default_format")
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  scenes  AudioScene[]
+  exports AudioExport[]
+
+  @@map("audio_projects")
+}
+
+model AudioScene {
+  id             String   @id @default(uuid())
+  audioProjectId String   @map("audio_project_id")
+  audioProject   AudioProject @relation(fields: [audioProjectId], references: [id], onDelete: Cascade)
+
+  sceneNumber    Int     @map("scene_number")
+  orderIndex     Int     @map("order_index")
+  title          String?
+  text           String
+  voiceProfileId String? @map("voice_profile_id")
+  voiceProfile   VoiceProfile? @relation(fields: [voiceProfileId], references: [id])
+  character      String?
+  style          String?
+  emotion        String?
+  language       String?
+  targetDuration Decimal? @map("target_duration") @db.Decimal(10, 2)
+  status         SceneStatus @default(PENDING)
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  generations AudioGeneration[]
+
+  @@index([audioProjectId, orderIndex])
+  @@map("audio_scenes")
+}
+
+model AudioGeneration {
+  id         String   @id @default(uuid())
+  sceneId    String   @map("scene_id")
+  scene      AudioScene @relation(fields: [sceneId], references: [id], onDelete: Cascade)
+  jobId      String   @unique @map("job_id")
+  job        Job      @relation(fields: [jobId], references: [id])
+  providerId String?  @map("provider_id")
+  provider   AiProvider? @relation(fields: [providerId], references: [id])
+  modelId    String?  @map("model_id")
+  model      AiModel? @relation(fields: [modelId], references: [id])
+
+  storageKey      String?  @map("storage_key")
+  durationSeconds Decimal? @map("duration_seconds") @db.Decimal(10, 2)
+  status          JobStatus @default(QUEUED)
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@index([sceneId])
+  @@map("audio_generations")
+}
+
+/// Reusable across projects — a saved "Narrator" or "Villain" preset.
+model VoiceProfile {
+  id              String  @id @default(uuid())
+  ownerId         String? @map("owner_id") // null = system/platform-provided voice
+  owner           User?   @relation(fields: [ownerId], references: [id])
+  name            String
+  providerId      String  @map("provider_id")
+  provider        AiProvider @relation(fields: [providerId], references: [id])
+  providerVoiceId String  @map("provider_voice_id")
+
+  language String
+  accent   String?
+  gender   String?
+  style    String?
+  speed    Decimal @default(1.0) @db.Decimal(4, 2)
+  pitch    Decimal @default(0) @db.Decimal(4, 2)
+  isSystem Boolean @default(false) @map("is_system")
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  audioProjectDefaults AudioProject[]
+  scenes               AudioScene[]
+  presets              VoicePreset[]
+
+  @@index([providerId, language])
+  @@map("voice_profiles")
+}
+
+model VoicePreset {
+  id             String       @id @default(uuid())
+  voiceProfileId String       @map("voice_profile_id")
+  voiceProfile   VoiceProfile @relation(fields: [voiceProfileId], references: [id], onDelete: Cascade)
+  key            String
+  settings       Json         @default("{}")
+
+  @@map("voice_presets")
+}
+
+model AudioExport {
+  id             String     @id @default(uuid())
+  audioProjectId String     @map("audio_project_id")
+  audioProject   AudioProject @relation(fields: [audioProjectId], references: [id], onDelete: Cascade)
+  storageKey     String     @map("storage_key")
+  type           ExportType
+  sceneIds       String[]   @map("scene_ids")
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@map("audio_exports")
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// SUPPORT: NOTIFICATIONS, API KEYS, AUDIT, USAGE
+// ─────────────────────────────────────────────────────────────────────────
+
+model Notification {
+  id      String   @id @default(uuid())
+  userId  String   @map("user_id")
+  user    User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  type    String
+  payload Json     @default("{}")
+  readAt  DateTime? @map("read_at")
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@index([userId, readAt])
+  @@map("notifications")
+}
+
+model ApiKey {
+  id         String    @id @default(uuid())
+  userId     String    @map("user_id")
+  user       User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  name       String
+  keyHash    String    @unique @map("key_hash")
+  lastUsedAt DateTime? @map("last_used_at")
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@map("api_keys")
+}
+
+model AuditLog {
+  id         String   @id @default(uuid())
+  actorId    String?  @map("actor_id")
+  actor      User?    @relation(fields: [actorId], references: [id])
+  action     String
+  targetType String?  @map("target_type")
+  targetId   String?  @map("target_id")
+  metadata   Json     @default("{}")
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@index([actorId, createdAt])
+  @@index([targetType, targetId])
+  @@map("audit_logs")
+}
+
+model UsageRecord {
+  id       String  @id @default(uuid())
+  userId   String  @map("user_id")
+  user     User    @relation(fields: [userId], references: [id])
+  jobId    String? @map("job_id")
+  module   String
+  metric   String // e.g. "tts_characters", "image_generations"
+  quantity Decimal @db.Decimal(14, 4)
+  costUsd  Decimal @map("cost_usd") @db.Decimal(10, 6)
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@index([userId, module, createdAt])
+  @@map("usage_records")
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// PLATFORM CONFIG
+// ─────────────────────────────────────────────────────────────────────────
+
+model FeatureFlag {
+  id          String   @id @default(uuid())
+  key         String   @unique // "audio_v1" | "script_v1" | "image_v1" | ...
+  isEnabled   Boolean  @default(false) @map("is_enabled")
+  description String?
+
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@map("feature_flags")
+}

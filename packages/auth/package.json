@@ -1,0 +1,27 @@
+{
+  "name": "@platform/auth",
+  "version": "0.1.0",
+  "private": true,
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts",
+    "./rbac": "./src/rbac.ts",
+    "./bridge-token": "./src/bridge-token.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@platform/database": "file:../database",
+    "@auth/prisma-adapter": "^2.7.0",
+    "next-auth": "5.0.0-beta.25",
+    "bcryptjs": "^2.4.3",
+    "jsonwebtoken": "^9.0.2"
+  },
+  "devDependencies": {
+    "@types/bcryptjs": "^2.4.6",
+    "@types/jsonwebtoken": "^9.0.6",
+    "typescript": "^5.5.0"
+  }
+}
