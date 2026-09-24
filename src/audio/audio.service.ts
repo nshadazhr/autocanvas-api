@@ -14,6 +14,7 @@ import {
   type MergeableScene,
   type SceneStatus,
 } from "@modules/audio";
+import type { SceneUpdateEntryDto } from "./dto/bulk-update-scenes.dto";
 
 // ─────────────────────────────────────────────────────────────────────────
 // This is a direct port of apps/web/app/(app)/audio/actions.ts's business
@@ -114,6 +115,28 @@ export class AudioService {
     }
   }
 
+  /**
+   * Resolves a VoiceProfile *name* (what apps/web's Scenes table and its
+   * dummy-mode VOICE_CATALOG both call "voice") to a real VoiceProfile id,
+   * scoped to voices the caller can actually use (their own + system
+   * voices) — same scoping importScenesFromCsv already uses above. Throws
+   * a clear 400 instead of silently leaving a scene voiceless when the
+   * name doesn't match any real voice (e.g. a name from the dummy-mode
+   * VOICE_CATALOG that hasn't been created as a VoiceProfile row yet).
+   */
+  private async resolveVoiceProfileByName(user: BridgeTokenPayload, voiceName: string): Promise<string> {
+    const voice = (await prisma.voiceProfile.findFirst({
+      where: { name: voiceName, OR: [{ ownerId: user.sub }, { isSystem: true }] },
+      select: { id: true },
+    })) as { id: string } | null;
+    if (!voice) {
+      throw new BadRequestException(
+        `Voice "${voiceName}" was not found — add it as a Voice Profile first, or pick an existing one.`,
+      );
+    }
+    return voice.id;
+  }
+
   private async loadAudioProjectOrThrow(audioProjectId: string): Promise<AudioProjectRow> {
     try {
       return (await prisma.audioProject.findUniqueOrThrow({
@@ -141,7 +164,12 @@ export class AudioService {
     return projects as unknown as ProjectSummary[];
   }
 
-  async createAudioProject(user: BridgeTokenPayload, name: string): Promise<{ audioProjectId: string }> {
+  async createAudioProject(
+    user: BridgeTokenPayload,
+    name: string,
+    voice?: string,
+    language?: string,
+  ): Promise<{ audioProjectId: string }> {
     this.guard(() => requireAuthorized({ platformRole: user.role, isResourceOwner: true }, "project:create"));
 
     const trimmed = name.trim();
@@ -149,13 +177,23 @@ export class AudioService {
       throw new BadRequestException("Project name is required.");
     }
 
+    // `voice` names a VoiceProfile the same way it does everywhere else on
+    // this service — resolved up front so a bad name 400s before any row
+    // is written, instead of leaving a half-created project behind.
+    const defaultVoiceId = voice ? await this.resolveVoiceProfileByName(user, voice) : undefined;
+
     const project = await prisma.project.create({
       data: {
         ownerId: user.sub,
         type: "AUDIO",
         name: trimmed,
         status: "DRAFT",
-        audioProject: { create: {} },
+        audioProject: {
+          create: {
+            ...(defaultVoiceId ? { defaultVoiceId } : {}),
+            ...(language ? { language } : {}),
+          },
+        },
       },
       include: { audioProject: true },
     });
@@ -170,10 +208,19 @@ export class AudioService {
         where: { id: audioProjectId },
         include: {
           project: true,
+          // apps/web's Scenes table shows a Voice/Gender cell per scene and
+          // needs the project's fallback voice too (see
+          // resolveSceneVoiceProfileId) — both relations are included here
+          // so lib/backend-client.ts's mapping layer never needs a second
+          // round trip just to resolve a display name.
+          defaultVoice: true,
           exports: { orderBy: { createdAt: "desc" } },
           scenes: {
             orderBy: { orderIndex: "asc" },
-            include: { generations: { orderBy: { createdAt: "desc" }, take: 1 } },
+            include: {
+              voiceProfile: true,
+              generations: { orderBy: { createdAt: "desc" }, take: 1 },
+            },
           },
         },
       });
@@ -291,6 +338,131 @@ export class AudioService {
     }
 
     return { imported, rowErrors: parsed.errors.map((e) => `Row ${e.rowNumber}: ${e.message}`) };
+  }
+
+  /**
+   * Updates zero or more scene fields per entry, mirroring apps/web's dummy
+   * `bulkUpdateScenes` (Scenes table's "Save Changes"). Two real-schema
+   * differences from that dummy version, both because AudioScene has no
+   * speed/pitch/gender columns of its own — those live on VoiceProfile (see
+   * apply-voice.dto.ts's header comment):
+   *   1. `speaker` maps to the real `character` column.
+   *   2. `voice` (a VoiceProfile *name*) resolves to `voiceProfileId` via
+   *      resolveVoiceProfileByName; `gender`/`speed`/`pitch` in the same
+   *      entry are NOT written anywhere — they're derived, read-only
+   *      display values that come from whichever VoiceProfile a scene
+   *      resolves to, not independent per-scene overrides. (apps/web's
+   *      mapping layer in lib/backend-client.ts should stop rendering these
+   *      as editable once a project is backend-backed, to avoid a silent
+   *      no-op in the UI.)
+   */
+  async bulkUpdateScenes(
+    user: BridgeTokenPayload,
+    audioProjectId: string,
+    updates: SceneUpdateEntryDto[],
+  ): Promise<void> {
+    const audioProject = await this.loadAudioProjectOrThrow(audioProjectId);
+    this.guard(() =>
+      requireAuthorized(
+        { platformRole: user.role, isResourceOwner: audioProject.project.ownerId === user.sub },
+        "project:update",
+      ),
+    );
+
+    const sceneIds = new Set((audioProject.scenes as AudioSceneSummaryRow[]).map((s) => s.id));
+
+    for (const update of updates) {
+      if (!sceneIds.has(update.id)) {
+        throw new BadRequestException(`Scene "${update.id}" does not belong to this project.`);
+      }
+
+      // Hand-typed (not `Prisma.AudioSceneUpdateInput`) for the same reason
+      // every `*Row` interface up top is — see AudioProjectRow's comment.
+      const data: Record<string, unknown> = {};
+      if (update.title !== undefined) data.title = update.title;
+      if (update.text !== undefined) data.text = update.text;
+      if (update.speaker !== undefined) data.character = update.speaker;
+      if (update.style !== undefined) data.style = update.style;
+      if (update.emotion !== undefined) data.emotion = update.emotion;
+      if (update.voice !== undefined) {
+        data.voiceProfileId = update.voice ? await this.resolveVoiceProfileByName(user, update.voice) : null;
+      }
+      // gender/speed/pitch intentionally not persisted here — see method doc.
+
+      if (Object.keys(data).length > 0) {
+        await prisma.audioScene.update({ where: { id: update.id }, data });
+      }
+    }
+  }
+
+  /**
+   * Applies one voice (by name) + gender to every scene whose `character`
+   * (apps/web's "speaker") matches, mirroring the dummy
+   * `applyVoiceToSpeaker` bulk action. `gender` is accepted (matching the
+   * dummy signature apps/web already calls this with) but not persisted,
+   * for the same reason bulkUpdateScenes doesn't persist it above — it's
+   * intrinsic to the resolved VoiceProfile, not an independent scene
+   * attribute in the real schema.
+   */
+  async applyVoiceToSpeaker(
+    user: BridgeTokenPayload,
+    audioProjectId: string,
+    speaker: string,
+    voice: string,
+    _gender: "Male" | "Female",
+  ): Promise<{ affected: number }> {
+    const audioProject = await this.loadAudioProjectOrThrow(audioProjectId);
+    this.guard(() =>
+      requireAuthorized(
+        { platformRole: user.role, isResourceOwner: audioProject.project.ownerId === user.sub },
+        "project:update",
+      ),
+    );
+
+    const voiceProfileId = await this.resolveVoiceProfileByName(user, voice);
+    const result = await prisma.audioScene.updateMany({
+      where: { audioProjectId, character: speaker },
+      data: { voiceProfileId },
+    });
+    return { affected: result.count };
+  }
+
+  /**
+   * Reverts selected scenes to PENDING, mirroring the dummy
+   * `resetScenesToPending` bulk action ("Reset Selected to Pending"). Dummy
+   * mode nulled the scene's own `storageKey` directly; the real schema
+   * keeps storage keys on historical `AudioGeneration` rows instead (a
+   * scene can have several, one per generation job), so there's nothing to
+   * null on the scene itself — reverting `status` to PENDING is what makes
+   * the Scenes table stop showing a playable link (its "latest generation"
+   * lookup is status-gated the same way generateAllPendingScenes' own
+   * PENDING/FAILED filter is). Past AudioGeneration rows are left alone as
+   * history rather than deleted.
+   */
+  async resetScenesToPending(
+    user: BridgeTokenPayload,
+    audioProjectId: string,
+    sceneIds: string[],
+  ): Promise<{ affected: number }> {
+    const audioProject = await this.loadAudioProjectOrThrow(audioProjectId);
+    this.guard(() =>
+      requireAuthorized(
+        { platformRole: user.role, isResourceOwner: audioProject.project.ownerId === user.sub },
+        "project:update",
+      ),
+    );
+
+    const validIds = new Set((audioProject.scenes as AudioSceneSummaryRow[]).map((s) => s.id));
+    const targetIds = sceneIds.filter((id) => validIds.has(id));
+    if (targetIds.length === 0) {
+      throw new BadRequestException("None of the selected scenes belong to this project.");
+    }
+
+    const result = await prisma.audioScene.updateMany({
+      where: { audioProjectId, id: { in: targetIds } },
+      data: { status: "PENDING" },
+    });
+    return { affected: result.count };
   }
 
   private async planGeneration(sceneId: string) {

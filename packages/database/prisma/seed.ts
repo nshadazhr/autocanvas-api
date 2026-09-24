@@ -124,7 +124,83 @@ async function main() {
     },
   });
 
-  console.log("✅ Seed complete: plans, feature flags, AI providers/models, system voices.");
+  // ── Voice Profiles matching apps/web's dummy VOICE_CATALOG by name ──────
+  // audio.service.ts's resolveVoiceProfileByName() looks up a VoiceProfile
+  // by exact `name`. The Scenes table's Voice dropdown and "Apply Voice to
+  // Speaker" modal (apps/web's project-workspace.tsx) are still hardcoded
+  // against lib/dummy-data.ts's VOICE_CATALOG — that client component is
+  // intentionally NOT being changed as part of this pilot, so every one of
+  // those 7 names needs a real VoiceProfile row here or picking a voice
+  // from the UI 400s with "was not found". Pointed at the mock provider
+  // (not ElevenLabs) so local testing works without a real API key —
+  // characters run through mock_v1 return a silent clip instantly, same as
+  // the two system voices above.
+  const catalogVoices: { id: string; name: string; gender: "male" | "female" }[] = [
+    { id: "00000000-0000-0000-0000-000000000003", name: "Zephyr - Bright", gender: "female" },
+    { id: "00000000-0000-0000-0000-000000000004", name: "Achird - Friendly", gender: "male" },
+    { id: "00000000-0000-0000-0000-000000000005", name: "Sadaltager - Knc", gender: "male" },
+    { id: "00000000-0000-0000-0000-000000000006", name: "Orus - Firm", gender: "male" },
+    { id: "00000000-0000-0000-0000-000000000007", name: "Algenib - Gravell", gender: "male" },
+    { id: "00000000-0000-0000-0000-000000000008", name: "Aoede - Warm", gender: "female" },
+    { id: "00000000-0000-0000-0000-000000000009", name: "Callirrhoe - Energetic", gender: "female" },
+  ];
+
+  for (const voice of catalogVoices) {
+    await prisma.voiceProfile.upsert({
+      where: { id: voice.id },
+      update: {},
+      create: {
+        id: voice.id,
+        name: voice.name,
+        providerId: mockProvider.id,
+        providerVoiceId: voice.id,
+        language: "en-US",
+        gender: voice.gender,
+        style: "narration",
+        speed: 1.0,
+        pitch: 0,
+        isSystem: true,
+      },
+    });
+  }
+
+  // ── Demo user + credit account ──────────────────────────────────────────
+  // apps/web's dummy Credentials provider (packages/auth/src/config.ts)
+  // accepts ANY email/password and always mints a bridge token with
+  // `sub: "dummy-user-1"` — that's unchanged by this pilot (only Audio
+  // Studio's Server Actions now call this real backend; login itself is
+  // still dummy-mode). Every audio.service.ts query scopes by
+  // `user.sub`/`ownerId`, and generateSceneAudio/requestExport both require
+  // a CreditAccount row to exist for that id — without this seed entry,
+  // every real request 400s on "No credit account found for this user."
+  // the moment someone logs in and tries to generate audio.
+  const demoUser = await prisma.user.upsert({
+    where: { id: "dummy-user-1" },
+    update: {},
+    create: {
+      id: "dummy-user-1",
+      email: "dummy-user-1@autocanvas.local",
+      name: "Demo User",
+      role: "USER",
+    },
+  });
+
+  await prisma.creditAccount.upsert({
+    where: { userId: demoUser.id },
+    update: {},
+    create: {
+      userId: demoUser.id,
+      // Generous placeholder for local testing — real balances come from
+      // a subscription/purchase once Chunk 9's billing flow is wired to a
+      // live Stripe/Razorpay account (see the plans loop's comment above).
+      balance: 5000,
+      reserved: 0,
+    },
+  });
+
+  console.log(
+    "✅ Seed complete: plans, feature flags, AI providers/models, system voices (incl. VOICE_CATALOG matches), demo user + credits.",
+  );
 }
 
 main()

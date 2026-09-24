@@ -4,6 +4,7 @@ import {
   Delete,
   Get,
   Param,
+  Patch,
   Post,
   Query,
   UseGuards,
@@ -17,6 +18,9 @@ import { AddSceneDto } from "./dto/add-scene.dto";
 import { ImportScenesDto } from "./dto/import-scenes.dto";
 import { RequestExportDto } from "./dto/request-export.dto";
 import { SignedUrlQueryDto } from "./dto/signed-url-query.dto";
+import { BulkUpdateScenesDto } from "./dto/bulk-update-scenes.dto";
+import { ApplyVoiceDto } from "./dto/apply-voice.dto";
+import { ResetScenesDto } from "./dto/reset-scenes.dto";
 
 // One REST endpoint per Server Action in the pre-Chunk-10
 // apps/web/app/(app)/audio/actions.ts — see audio.service.ts's top comment
@@ -34,7 +38,7 @@ export class AudioController {
 
   @Post("projects")
   createProject(@CurrentUser() user: BridgeTokenPayload, @Body() dto: CreateAudioProjectDto) {
-    return this.audioService.createAudioProject(user, dto.name);
+    return this.audioService.createAudioProject(user, dto.name, dto.voice, dto.language);
   }
 
   @Get("projects/:audioProjectId")
@@ -69,6 +73,41 @@ export class AudioController {
     @Body() dto: ImportScenesDto,
   ) {
     return this.audioService.importScenesFromCsv(user, audioProjectId, dto.csvText);
+  }
+
+  // Three routes below have no equivalent in the pre-Chunk-10 controller —
+  // added alongside the dummy-mode -> real-backend Audio Studio rewire
+  // because the Scenes table's "Save Changes" / "Apply Voice to Speaker" /
+  // "Reset Selected to Pending" actions need somewhere to land. See
+  // audio.service.ts's matching methods for the real-schema field-mapping
+  // notes (character vs. speaker, VoiceProfile-level vs. per-scene
+  // gender/speed/pitch).
+  @Patch("projects/:audioProjectId/scenes")
+  async bulkUpdateScenes(
+    @CurrentUser() user: BridgeTokenPayload,
+    @Param("audioProjectId") audioProjectId: string,
+    @Body() dto: BulkUpdateScenesDto,
+  ) {
+    await this.audioService.bulkUpdateScenes(user, audioProjectId, dto.updates);
+    return { ok: true };
+  }
+
+  @Post("projects/:audioProjectId/apply-voice")
+  applyVoiceToSpeaker(
+    @CurrentUser() user: BridgeTokenPayload,
+    @Param("audioProjectId") audioProjectId: string,
+    @Body() dto: ApplyVoiceDto,
+  ) {
+    return this.audioService.applyVoiceToSpeaker(user, audioProjectId, dto.speaker, dto.voice, dto.gender);
+  }
+
+  @Post("projects/:audioProjectId/scenes/reset")
+  resetScenesToPending(
+    @CurrentUser() user: BridgeTokenPayload,
+    @Param("audioProjectId") audioProjectId: string,
+    @Body() dto: ResetScenesDto,
+  ) {
+    return this.audioService.resetScenesToPending(user, audioProjectId, dto.sceneIds);
   }
 
   @Post("scenes/:sceneId/generate")

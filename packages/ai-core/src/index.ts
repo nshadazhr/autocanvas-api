@@ -4,5 +4,35 @@
 // than reaching into providers/audio/* directly — that keeps the "no
 // vendor SDK outside providers/audio/*" rule enforceable by convention.
 
-export * from "./audio";
-export { registerBuiltInAudioProviders, resetBuiltInAudioProviderRegistration } from "./audio/bootstrap";
+// NOTE: deliberately NOT `export * from "./audio"` — combining a star
+// re-export with the named re-export from "./audio/bootstrap" below (which
+// transitively imports "./audio/registry", a module "./audio" also
+// re-exports) triggers a reproducible Node ESM bug where the star-exported
+// bindings get silently dropped at runtime, even though "./audio" loads
+// correctly in isolation. Explicit named re-exports sidestep it entirely.
+export type {
+	AudioProvider,
+	GenerateAudioInput,
+	GenerateAudioResult,
+	VoiceDescriptor,
+	ModelDescriptor,
+	EstimateAudioCostInput,
+	AudioCostEstimate,
+	AiModelLookup,
+	AiProviderActivityLookup
+} from './audio';
+export {
+	ProviderNotRegisteredError,
+	ProviderNotActiveError,
+	ModelNotFoundError,
+	ProviderRequestError,
+	USD_PER_CREDIT,
+	estimateCharacterBasedCost,
+	prismaAiModelLookup,
+	registerAudioProvider,
+	clearAudioProviderRegistry,
+	getAudioProvider,
+	listRegisteredAudioProviderKeys,
+	prismaAiProviderActivityLookup
+} from './audio';
+export { registerBuiltInAudioProviders, resetBuiltInAudioProviderRegistration } from './audio/bootstrap';

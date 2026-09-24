@@ -189,8 +189,28 @@ model User {
   jobs                 Job[]
   usageRecords         UsageRecord[]
   auditLogsAsActor     AuditLog[]
+  passwordResetTokens  PasswordResetToken[]
 
   @@map("users")
+}
+
+// Forgot-password flow. Only the SHA-256 hash of the raw token is ever
+// stored — the raw token only exists in the emailed link — so a DB leak
+// alone can't be used to reset anyone's password (same reasoning as never
+// storing plaintext passwords). `usedAt` makes tokens single-use; expired
+// or already-used rows are just left in place for audit rather than
+// deleted, and can be swept by a periodic job later.
+model PasswordResetToken {
+  id        String    @id @default(uuid())
+  userId    String    @map("user_id")
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tokenHash String    @unique @map("token_hash")
+  expiresAt DateTime  @map("expires_at")
+  usedAt    DateTime? @map("used_at")
+  createdAt DateTime  @default(now()) @map("created_at")
+
+  @@index([userId])
+  @@map("password_reset_tokens")
 }
 
 model Organization {
