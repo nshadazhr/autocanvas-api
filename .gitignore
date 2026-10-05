@@ -3,6 +3,29 @@
 /node_modules
 /build
 
+
+# Local SQLite database
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Environment files
+.env.*
+!.env.example
+
+# macOS archive files
+__MACOSX/
+._*
+
+# Optional AI tool files
+/.agents/
+/.cursor/
+/.claude/
+/.devin/
+/.windsurf/
+/skills-lock.json
+
 # TypeScript build cache
 *.tsbuildinfo
 
@@ -59,25 +82,3 @@ pids
 report.[0-9]*.[0-9]*.[0-9]*.[0-9]*.json
 
 /src/generated/prisma
-
-# Local SQLite database
-*.db
-*.db-journal
-*.db-wal
-*.db-shm
-
-# Environment files
-.env.*
-!.env.example
-
-# macOS archive files
-__MACOSX/
-._*
-
-# Optional AI tool files
-/.agents/
-/.cursor/
-/.claude/
-/.devin/
-/.windsurf/
-/skills-lock.json
