@@ -1,12 +1,31 @@
-import { Module } from "@nestjs/common";
-import { AudioModule } from "./audio/audio.module";
+import { Module } from '@nestjs/common';
+import { createObserveModule } from '@nestjs/observe';
+import { AppController } from './app.controller.js';
+import { AppService } from './app.service.js';
+import { AuthModule } from './auth/auth.module.js';
+import { UserModule } from './user/user.module.js';
+import { ConfigModule } from '@nestjs/config';
+import { ProfileModule } from './profile/profile.module.js';
 
-// Billing/Dashboard/Credits are explicitly OUT of scope for this pilot —
-// they stay as apps/web Server Actions calling packages directly, same as
-// apps/admin stays on direct DB access. Audio Studio is the only module
-// that talks to this backend today. Extending this app to a second module
-// later is: add `modules/<name>/<name>.module.ts`, import it here.
+export const { ObserveModule, ObserveInstrument } = createObserveModule();
+
 @Module({
-  imports: [AudioModule],
+  imports: [
+    // Distributed tracing, auto-correlated logs, request/job metrics, error
+    // telemetry, alarms, and more — out of the box. Sign up at https://observe.nestjs.com
+    // ObserveModule.forRoot({
+    //   appKey: 'YOUR_APP_KEY',
+    //   appSecret: 'YOUR_APP_SECRET',
+    //   serviceId: 'autocanvas-api',
+    // }),
+    ConfigModule.forRoot({
+      isGlobal: true,
+    }),
+    AuthModule,
+    UserModule,
+    ProfileModule,
+  ],
+  controllers: [AppController],
+  providers: [AppService],
 })
 export class AppModule {}
