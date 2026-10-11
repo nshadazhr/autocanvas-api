@@ -8,12 +8,15 @@ datasource db {
 }
 
 model User {
-  id         Int      @id @default(autoincrement())
-  email      String   @unique
-  name       String?
-  password   String
-  updated_at DateTime @updatedAt
-  created_at DateTime @default(now())
+  id                Int       @id @default(autoincrement())
+  email             String    @unique
+  name              String?
+  password          String?
+  updated_at        DateTime  @updatedAt
+  created_at        DateTime  @default(now())
+  email_verified_at DateTime?
+
+  identities AuthIdentity[]
 }
 
 model PendingRegistration {
@@ -29,4 +32,17 @@ model PendingRegistration {
   window_start  DateTime?
   created_at    DateTime  @default(now())
   updated_at    DateTime  @updatedAt
+}
+
+model AuthIdentity {
+  id                Int      @id @default(autoincrement())
+  userId            Int
+  provider          String
+  providerAccountId String
+  created_at        DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, providerAccountId])
+  @@unique([userId, provider])
 }

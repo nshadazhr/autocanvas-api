@@ -12,6 +12,7 @@ import { TokenService } from './services/token.service.js';
 import { OtpService } from './services/otp.service.js';
 import { EmailService } from './services/email.service.js';
 import { PendingRegistrationService } from './services/pending-registration.service.js';
+import { GoogleAuthService } from './services/google-auth.service.js';
 @Injectable()
 export class AuthService {
   constructor(
@@ -21,6 +22,7 @@ export class AuthService {
     private readonly tokenService: TokenService,
     private readonly otpService: OtpService,
     private readonly pendingRegistrationService: PendingRegistrationService,
+    private readonly googleAuthService: GoogleAuthService,
   ) {}
 
   async getUniqueEmail(email: string) {
@@ -38,8 +40,11 @@ export class AuthService {
   }
 
   async login(loginDto: LoginDto) {
-    const filteredUniqueEmail = await this.getUniqueEmail(loginDto.email);
-    if (!filteredUniqueEmail) {
+    const normalizedEmail = loginDto.email.trim().toLowerCase();
+
+    const filteredUniqueEmail = await this.getUniqueEmail(normalizedEmail);
+
+    if (!filteredUniqueEmail || !filteredUniqueEmail.password) {
       throw new UnauthorizedException('Invalid email or password');
     }
     const validPassword = await this.passwordHasher.verify(
@@ -95,7 +100,7 @@ export class AuthService {
       );
       throw new BadRequestException('Invalid OTP');
     }
-    
+
     const user = await this.pendingRegistrationService.createVerifiedUser(
       pending,
       this.otpService.MAX_OTP_ATTEMPTS,
@@ -133,7 +138,8 @@ export class AuthService {
         'RESEND_API_KEY is not configured',
       );
     }
-    const existingRegistrationPending = await this.pendingRegistrationService.findByEmail(email);
+    const existingRegistrationPending =
+      await this.pendingRegistrationService.findByEmail(email);
     // Resend must never create a new registration.
     if (!existingRegistrationPending && !registerDto) {
       throw new BadRequestException(
@@ -212,5 +218,27 @@ export class AuthService {
         'Unable to send verification email. Please try again',
       );
     }
+  }
+
+  async googleLogin(idToken: string) {
+    const user = await this.googleAuthService.findOrCreateGoogleUser(idToken);
+
+    const payload = {
+      id: user.id,
+      email: user.email,
+    };
+
+    const { access_token, refresh_token } =
+      await this.tokenService.generateTokens(payload);
+
+    return {
+      user: {
+        id: user.id,
+        name: user.name,
+        email: user.email,
+      },
+      access_token,
+      refresh_token,
+    };
   }
 }

@@ -12,6 +12,7 @@ import {
  import { AuthService } from './auth.service.js';
  import { AuthGuard } from './auth.guard.js';
  import type { Response } from 'express';
+ import { GoogleLoginDto } from './dto/google-login.dto.js';
  @Controller('auth')
  export class AuthController {
    authService: AuthService;
@@ -31,6 +32,26 @@ import {
    @Post('register')
    register(@Body() registerDto: RegisterDto) {
      return this.authService.register(registerDto);
+   }
+
+   @Post('google')
+   async googleLogin(
+     @Body() googleLoginDto: GoogleLoginDto,
+     @Res({ passthrough: true }) res: Response,
+   ) {
+     const { refresh_token, ...result } = await this.authService.googleLogin(
+       googleLoginDto.idToken,
+     );
+
+     res.cookie('refresh_token', refresh_token, {
+       httpOnly: true,
+       secure: process.env.NODE_ENV === 'production',
+       sameSite: 'lax',
+       maxAge: 24 * 60 * 60 * 1000,
+       path: '/',
+     });
+
+     return result;
    }
 
    @Post('resend-otp')

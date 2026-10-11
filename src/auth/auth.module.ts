@@ -11,6 +11,7 @@ import { TokenService } from './services/token.service.js';
 import { EmailService } from './services/email.service.js';
 import { OtpService } from './services/otp.service.js';
 import { PendingRegistrationService } from './services/pending-registration.service.js';
+import { GoogleAuthService } from './services/google-auth.service.js';
 @Module({
   imports: [
     UserModule,
@@ -30,6 +31,7 @@ import { PendingRegistrationService } from './services/pending-registration.serv
     Resend,
     OtpService,
     PendingRegistrationService,
+    GoogleAuthService,
   ],
 })
 export class AuthModule {}
