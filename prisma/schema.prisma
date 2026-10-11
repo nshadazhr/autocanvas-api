@@ -17,6 +17,7 @@ model User {
   email_verified_at DateTime?
 
   identities AuthIdentity[]
+  projects   Project[]
 }
 
 model PendingRegistration {
@@ -45,4 +46,18 @@ model AuthIdentity {
 
   @@unique([provider, providerAccountId])
   @@unique([userId, provider])
+}
+
+model Project {
+  id          Int     @id @default(autoincrement())
+  name        String
+  description String?
+  userId      Int
+
+  created_at DateTime @default(now())
+  updated_at DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
 }

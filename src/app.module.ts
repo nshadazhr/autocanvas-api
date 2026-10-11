@@ -6,19 +6,22 @@ import { AuthModule } from './auth/auth.module.js';
 import { UserModule } from './user/user.module.js';
 import { ConfigModule } from '@nestjs/config';
 import { ProfileModule } from './profile/profile.module.js';
-
+import { ScriptModule } from './script/script.module.js';
+import { ProjectsModule } from './projects/projects.module.js';
 export const { ObserveModule, ObserveInstrument } = createObserveModule();
 
 @Module({
-  imports: [
-    ConfigModule.forRoot({
-      isGlobal: true,
-    }),
-    AuthModule,
-    UserModule,
-    ProfileModule,
-  ],
-  controllers: [AppController],
-  providers: [AppService],
+	imports: [
+		ConfigModule.forRoot({
+			isGlobal: true
+		}),
+		AuthModule,
+		UserModule,
+		ProfileModule,
+		ScriptModule,
+		ProjectsModule
+	],
+	controllers: [AppController],
+	providers: [AppService]
 })
 export class AppModule {}

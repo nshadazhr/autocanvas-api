@@ -13,25 +13,25 @@ import { OtpService } from './services/otp.service.js';
 import { PendingRegistrationService } from './services/pending-registration.service.js';
 import { GoogleAuthService } from './services/google-auth.service.js';
 @Module({
-  imports: [
-    UserModule,
-    JwtModule.register({
-      global: true,
-      secret: jwtConstants.secret,
-      signOptions: { expiresIn: '60s' },
-    }),
-  ],
-  controllers: [AuthController],
-  providers: [
-    AuthService,
-    TokenService,
-    EmailService,
-    PasswordHasher,
-    PrismaService,
-    Resend,
-    OtpService,
-    PendingRegistrationService,
-    GoogleAuthService,
-  ],
+	imports: [
+		UserModule,
+		JwtModule.register({
+			global: true,
+			secret: jwtConstants.secret,
+			signOptions: { expiresIn: '15m' }
+		})
+	],
+	controllers: [AuthController],
+	providers: [
+		AuthService,
+		TokenService,
+		EmailService,
+		PasswordHasher,
+		PrismaService,
+		Resend,
+		OtpService,
+		PendingRegistrationService,
+		GoogleAuthService
+	]
 })
 export class AuthModule {}
