@@ -8,6 +8,10 @@ import { ConfigModule } from '@nestjs/config';
 import { ProfileModule } from './profile/profile.module.js';
 import { ScriptModule } from './script/script.module.js';
 import { ProjectsModule } from './projects/projects.module.js';
+import { AudioStoriesModule } from './audio-stories/audio-stories.module.js';
+import { AiModule } from './ai/ai.module.js';
+import { VoicesModule } from './voices/voices.module.js';
+import { AudioGenerationModule } from './audio-generation/audio-generation.module.js';
 export const { ObserveModule, ObserveInstrument } = createObserveModule();
 
 @Module({
@@ -19,7 +23,11 @@ export const { ObserveModule, ObserveInstrument } = createObserveModule();
 		UserModule,
 		ProfileModule,
 		ScriptModule,
-		ProjectsModule
+		ProjectsModule,
+		AudioStoriesModule,
+		AiModule,
+		VoicesModule,
+		AudioGenerationModule
 	],
 	controllers: [AppController],
 	providers: [AppService]

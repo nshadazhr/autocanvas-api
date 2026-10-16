@@ -7,6 +7,10 @@ datasource db {
   provider = "postgresql"
 }
 
+// ==========================================
+// USER & AUTHENTICATION
+// ==========================================
+
 model User {
   id                Int       @id @default(autoincrement())
   email             String    @unique
@@ -18,6 +22,11 @@ model User {
 
   identities AuthIdentity[]
   projects   Project[]
+  scripts    Script[]
+
+  // Audio Studio
+  audioStories AudioStory[]
+  audioJobs    AudioGenerationJob[]
 }
 
 model PendingRegistration {
@@ -48,16 +57,323 @@ model AuthIdentity {
   @@unique([userId, provider])
 }
 
+// ==========================================
+// EXISTING PROJECTS
+// ==========================================
+
 model Project {
-  id          Int     @id @default(autoincrement())
+  id          Int      @id @default(autoincrement())
   name        String
   description String?
   userId      Int
+  created_at  DateTime @default(now())
+  updated_at  DateTime @updatedAt
 
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  scripts ProjectScript[]
+
+  @@index([userId])
+}
+
+model Script {
+  id         Int      @id @default(autoincrement())
+  title      String
+  content    String   @default("")
+  userId     Int
   created_at DateTime @default(now())
   updated_at DateTime @updatedAt
 
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)
 
+  projects ProjectScript[]
+
   @@index([userId])
+}
+
+model ProjectScript {
+  projectId Int
+  scriptId  Int
+
+  sortOrder Int      @default(0)
+  added_at  DateTime @default(now())
+
+  project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  script Script @relation(fields: [scriptId], references: [id], onDelete: Cascade)
+
+  @@id([projectId, scriptId])
+  @@index([scriptId])
+}
+
+// ==========================================
+// AUDIO STUDIO - STORY
+// ==========================================
+
+model AudioStory {
+  id                Int                 @id @default(autoincrement())
+  title             String
+  content           String              @default("")
+  userId            Int
+  status            String              @default("DRAFT")
+  analysisStatus    AudioAnalysisStatus @default(PENDING)
+  analysisError     String?
+  analyzed_at       DateTime?
+  created_at        DateTime            @default(now())
+  updated_at        DateTime            @updatedAt
+  analysisResult    Json?
+  analyzedAt        DateTime?
+  analysisStartedAt DateTime?
+  analysisAttemptId String?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  characters AudioCharacter[]
+  scenes     AudioScene[]
+  jobs       AudioGenerationJob[]
+  assets     AudioAsset[]
+
+  @@index([userId])
+}
+
+// ==========================================
+// AUDIO STUDIO - CHARACTERS
+// ==========================================
+
+model AudioCharacter {
+  id         Int      @id @default(autoincrement())
+  storyId    Int
+  name       String
+  gender     String?
+  voiceId    Int?
+  created_at DateTime @default(now())
+  updated_at DateTime @updatedAt
+
+  story AudioStory @relation(fields: [storyId], references: [id], onDelete: Cascade)
+
+  voice Voice? @relation(fields: [voiceId], references: [id], onDelete: SetNull)
+
+  scenes AudioScene[]
+
+  @@unique([storyId, name])
+  @@unique([id, storyId])
+  @@index([voiceId])
+}
+
+// ==========================================
+// AUDIO STUDIO - SCENES
+// ==========================================
+
+model AudioScene {
+  id              Int      @id @default(autoincrement())
+  storyId         Int
+  characterId     Int?
+  sceneOrder      Int
+  externalSceneId String?
+  title           String?
+  speakerName     String?
+  text            String
+  language        String   @default("hi")
+  emotion         String?
+  style           String?
+  voiceOverrideId Int?
+  created_at      DateTime @default(now())
+  updated_at      DateTime @updatedAt
+
+  story AudioStory @relation(fields: [storyId], references: [id], onDelete: Cascade)
+
+  character AudioCharacter? @relation(fields: [characterId, storyId], references: [id, storyId], onDelete: NoAction, onUpdate: Cascade)
+
+  voiceOverride Voice? @relation("SceneVoiceOverride", fields: [voiceOverrideId], references: [id], onDelete: SetNull)
+
+  audios   SceneAudio[]
+  jobItems AudioGenerationJobItem[]
+
+  @@unique([storyId, sceneOrder])
+  @@unique([id, storyId])
+  @@index([characterId, storyId])
+  @@index([voiceOverrideId])
+}
+
+// ==========================================
+// UNIFIED VOICE LIBRARY
+// ==========================================
+
+model Voice {
+  id          Int      @id @default(autoincrement())
+  name        String
+  gender      String?
+  ageCategory String?
+  description String?
+  style       String?
+  languages   String[] @default([])
+  previewUrl  String?
+  isActive    Boolean  @default(true)
+  created_at  DateTime @default(now())
+  updated_at  DateTime @updatedAt
+
+  providerMapping VoiceProviderMapping?
+  characters      AudioCharacter[]
+  sceneAudios     SceneAudio[]
+  sceneOverrides  AudioScene[]          @relation("SceneVoiceOverride")
+
+  @@index([isActive])
+}
+
+// ==========================================
+// PRIVATE PROVIDER MAPPING
+// ==========================================
+
+model VoiceProviderMapping {
+  id              Int      @id @default(autoincrement())
+  voiceId         Int      @unique
+  provider        String
+  providerVoiceId String
+  model           String
+  settings        Json?
+  created_at      DateTime @default(now())
+  updated_at      DateTime @updatedAt
+
+  voice Voice @relation(fields: [voiceId], references: [id], onDelete: Cascade)
+
+  @@index([provider])
+}
+
+// ==========================================
+// AUDIO GENERATION JOBS
+// ==========================================
+
+model AudioGenerationJob {
+  id              Int            @id @default(autoincrement())
+  storyId         Int
+  userId          Int
+  status          AudioJobStatus @default(PENDING)
+  totalScenes     Int            @default(0)
+  completedScenes Int            @default(0)
+  failedScenes    Int            @default(0)
+  started_at      DateTime?
+  completed_at    DateTime?
+  created_at      DateTime       @default(now())
+  updated_at      DateTime       @updatedAt
+
+  story AudioStory @relation(fields: [storyId], references: [id], onDelete: Cascade)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  items AudioGenerationJobItem[]
+
+  @@unique([id, storyId])
+  @@index([storyId])
+  @@index([userId, status])
+}
+
+// ==========================================
+// INDIVIDUAL SCENE GENERATION TASKS
+// ==========================================
+
+model AudioGenerationJobItem {
+  id               Int                @id @default(autoincrement())
+  jobId            Int
+  sceneId          Int
+  storyId          Int
+  status           AudioJobItemStatus @default(PENDING)
+  attempts         Int                @default(0)
+  error            String?
+  textSnapshot     String?
+  voiceIdSnapshot  Int?
+  settingsSnapshot Json?
+  nextRetryAt      DateTime?
+  lastErrorAt      DateTime?
+  started_at       DateTime?
+  completed_at     DateTime?
+  created_at       DateTime           @default(now())
+  updated_at       DateTime           @updatedAt
+
+  job AudioGenerationJob @relation(fields: [jobId, storyId], references: [id, storyId], onDelete: Cascade)
+
+  scene AudioScene @relation(fields: [sceneId, storyId], references: [id, storyId], onDelete: NoAction)
+
+  audio SceneAudio?
+
+  @@unique([jobId, sceneId])
+  @@index([status, nextRetryAt])
+  @@index([sceneId, storyId])
+}
+
+// ==========================================
+// GENERATED SCENE AUDIO
+// ==========================================
+
+model SceneAudio {
+  id               Int      @id @default(autoincrement())
+  sceneId          Int
+  jobItemId        Int?     @unique
+  voiceId          Int
+  provider         String
+  providerVoiceId  String
+  model            String
+  textSnapshot     String
+  settingsSnapshot Json?
+  filePath         String
+  format           String   @default("wav")
+  durationMs       Int?
+  created_at       DateTime @default(now())
+  fileSizeBytes    BigInt?
+  mimeType         String?
+
+  scene AudioScene @relation(fields: [sceneId], references: [id], onDelete: Cascade)
+
+  voice Voice @relation(fields: [voiceId], references: [id], onDelete: Restrict)
+
+  jobItem AudioGenerationJobItem? @relation(fields: [jobItemId], references: [id], onDelete: SetNull)
+
+  @@index([sceneId])
+  @@index([voiceId])
+}
+
+// ==========================================
+// MERGED / EXPORTED AUDIO ASSETS
+// ==========================================
+
+model AudioAsset {
+  id            Int      @id @default(autoincrement())
+  storyId       Int
+  type          String
+  filePath      String
+  format        String   @default("wav")
+  durationMs    Int?
+  created_at    DateTime @default(now())
+  fileSizeBytes BigInt?
+  mimeType      String?
+
+  story AudioStory @relation(fields: [storyId], references: [id], onDelete: Cascade)
+
+  @@index([storyId])
+}
+
+enum AudioAnalysisStatus {
+  PENDING
+  PROCESSING
+  COMPLETED
+  FAILED
+}
+
+enum AudioJobStatus {
+  PENDING
+  PROCESSING
+  WAITING
+  COMPLETED
+  PARTIAL
+  FAILED
+  CANCELLED
+}
+
+enum AudioJobItemStatus {
+  PENDING
+  PROCESSING
+  WAITING
+  COMPLETED
+  FAILED
+  SKIPPED
+  CANCELLED
 }

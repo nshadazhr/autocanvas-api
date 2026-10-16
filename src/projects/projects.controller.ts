@@ -5,14 +5,7 @@ import { AuthGuard } from '../auth/auth.guard.js';
 import { ProjectsService } from './projects.service.js';
 import { CreateProjectDto } from './dto/create-project.dto.js';
 import { UpdateProjectDto } from './dto/update-project.dto.js';
-
-interface AuthenticatedRequest extends Request {
-	user: {
-		id: number;
-		email: string;
-	};
-}
-
+import type { AuthenticatedRequest } from '../common/interfaces/authenticated-request.interface.js';
 @Controller('projects')
 @UseGuards(AuthGuard)
 export class ProjectsController {
