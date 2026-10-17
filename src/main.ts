@@ -11,7 +11,13 @@ async function bootstrap() {
 		instrument: ObserveInstrument
 	});
 
-	app.useGlobalPipes(new ValidationPipe());
+	app.useGlobalPipes(
+		new ValidationPipe({
+			whitelist: true,
+			forbidNonWhitelisted: true,
+			transform: true
+		})
+	);
 
 	app.enableCors({
 		origin: [process.env.REQUEST_ORIGIN_PORT ? process.env.REQUEST_ORIGIN_PORT : 'http://localhost:3000'],

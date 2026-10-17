@@ -12,6 +12,7 @@ import { AudioStoriesModule } from './audio-stories/audio-stories.module.js';
 import { AiModule } from './ai/ai.module.js';
 import { VoicesModule } from './voices/voices.module.js';
 import { AudioGenerationModule } from './audio-generation/audio-generation.module.js';
+import { AnimationModule } from './animation/animation.module.js';
 export const { ObserveModule, ObserveInstrument } = createObserveModule();
 
 @Module({
@@ -27,7 +28,8 @@ export const { ObserveModule, ObserveInstrument } = createObserveModule();
 		AudioStoriesModule,
 		AiModule,
 		VoicesModule,
-		AudioGenerationModule
+		AudioGenerationModule,
+		AnimationModule
 	],
 	controllers: [AppController],
 	providers: [AppService]
