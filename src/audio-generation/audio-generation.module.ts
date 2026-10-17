@@ -4,9 +4,11 @@ import { PrismaService } from '../prisma/prisma.service.js';
 import { AudioGenerationController } from './audio-generation.controller.js';
 import { audioGenerationService } from './audio-generation.service.js';
 import { GeminiKeyManagerService } from './providers/gemini-key-manager.service.js';
+import { SingleVoiceService } from './single-voice.service.js';
+import { SingleVoiceController } from './single-voice.controller.js';
 
 @Module({
-	controllers: [AudioGenerationController],
-	providers: [GeminiTtsService, GeminiKeyManagerService, audioGenerationService, PrismaService]
+	controllers: [AudioGenerationController, SingleVoiceController],
+	providers: [GeminiTtsService, GeminiKeyManagerService, audioGenerationService, SingleVoiceService, PrismaService]
 })
 export class AudioGenerationModule {}
