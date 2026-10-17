@@ -1,0 +1,11 @@
+{
+	"editor.defaultFormatter": "esbenp.prettier-vscode",
+	"editor.formatOnSave": true,
+	"editor.tabSize": 4,
+	"editor.insertSpaces": false,
+	"[prisma]": {
+		"editor.defaultFormatter": "Prisma.prisma"
+	},
+	"typescript.suggest.autoImports": true,
+	"javascript.suggest.autoImports": true
+}

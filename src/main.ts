@@ -3,35 +3,40 @@ import { AppModule, ObserveInstrument } from './app.module.js';
 import { ValidationPipe } from '@nestjs/common';
 import { DocumentBuilder, SwaggerModule } from '@nestjs/swagger';
 import cookieParser from 'cookie-parser';
+import { NestExpressApplication } from '@nestjs/platform-express';
+import { join } from 'node:path';
 
-async function bootstrap() {  
-  
-  const app = await NestFactory.create(AppModule, {
-    instrument: ObserveInstrument,
-  });
+async function bootstrap() {
+	const app = await NestFactory.create<NestExpressApplication>(AppModule, {
+		instrument: ObserveInstrument
+	});
 
-  app.useGlobalPipes(new ValidationPipe());
+	app.useGlobalPipes(new ValidationPipe());
 
-  app.enableCors({
-    origin: ['http://localhost:3000'],
-    methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization'],
-    credentials: true,
-  });
-  
-  app.use(cookieParser());
+	app.enableCors({
+		origin: [process.env.REQUEST_ORIGIN_PORT ? process.env.REQUEST_ORIGIN_PORT : 'http://localhost:3000'],
+		methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+		allowedHeaders: ['Content-Type', 'Authorization'],
+		credentials: true
+	});
 
-  const config = new DocumentBuilder()
-    .setTitle('Autocanvas API Docs')
-    .setDescription('Autocanvas API Docs Descrition')
-    .setVersion('1.0')
-    .addTag('autocanvas')
-    .build();
+	app.use(cookieParser());
 
-  const documentFactory = () => SwaggerModule.createDocument(app, config);
+	app.useStaticAssets(join(process.cwd(), 'uploads'), {
+		prefix: '/uploads/'
+	});
 
-  SwaggerModule.setup('swagger/json', app, documentFactory);
+	const config = new DocumentBuilder()
+		.setTitle('Autocanvas API Docs')
+		.setDescription('Autocanvas API Docs Descrition')
+		.setVersion('1.0')
+		.addTag('autocanvas')
+		.build();
 
-  await app.listen(process.env.PORT ?? 3000);
+	const documentFactory = () => SwaggerModule.createDocument(app, config);
+
+	SwaggerModule.setup('swagger/json', app, documentFactory);
+
+	await app.listen(process.env.PORT ?? 4000);
 }
 await bootstrap();

@@ -3,6 +3,7 @@ import {
   IsNotEmpty,
   IsString,
   IsStrongPassword,
+  Matches,
 } from 'class-validator';
 
 export class RegisterDto {
@@ -23,4 +24,19 @@ export class LoginDto {
 
   @IsString()
   password: string;
+}
+
+export class VerifyOtpDto {
+  @IsEmail()
+  email: string;
+
+  @IsString()
+  @Matches(/^\d{6}$/, {
+    message: 'OTP must be a 6-digit number',
+  })
+  otp: string;
+}
+export class ResendOtpDto {
+  @IsEmail()
+  email: string;
 }
