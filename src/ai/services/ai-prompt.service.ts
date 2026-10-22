@@ -1,10 +1,11 @@
 import { Injectable, NotFoundException } from '@nestjs/common';
 import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 @Injectable()
 export class AiPromptService {
-	private readonly promptDirectory = join(process.cwd(), 'src', 'ai', 'prompts');
+	private readonly promptDirectory = fileURLToPath(new URL('../prompts/', import.meta.url));
 
 	async getPrompt(key: string): Promise<string> {
 		// Future: load active prompt from PostgreSQL
