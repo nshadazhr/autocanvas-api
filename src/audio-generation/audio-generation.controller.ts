@@ -5,11 +5,14 @@ import { Res, Headers, HttpStatus, StreamableFile, BadRequestException } from '@
 import type { Response } from 'express';
 import { createReadStream } from 'node:fs';
 import { AuthGuard } from '../auth/auth.guard.js';
-
+import { StorageService } from '../storage/storage.service.js';
 @Controller('audio-generation')
 @UseGuards(AuthGuard)
 export class AudioGenerationController {
-	constructor(private readonly audioGenerationService: audioGenerationService) {}
+	constructor(
+		private readonly audioGenerationService: audioGenerationService,
+		private readonly storageService: StorageService
+	) {}
 
 	@Post('stories/:storyId/jobs')
 	async createJob(@Param('storyId', ParseIntPipe) storyId: number, @Req() req: AuthenticatedRequest) {
@@ -43,15 +46,19 @@ export class AudioGenerationController {
 	) {
 		const audio = await this.audioGenerationService.getAudioFile(audioId, req.user.id);
 
-		const { absolutePath, fileSize, mimeType } = audio;
+		const metadata = await this.storageService.getMetadata(audio.filePath);
+		const fileSize = metadata.size;
 
-		res.setHeader('Content-Type', mimeType);
+		res.setHeader('Content-Type', audio.mimeType);
 		res.setHeader('Accept-Ranges', 'bytes');
 		res.setHeader('Cache-Control', 'private, no-store');
 
 		if (!range) {
+			const fullFile = await this.storageService.getFile(audio.filePath);
+
 			res.setHeader('Content-Length', fileSize);
-			return new StreamableFile(createReadStream(absolutePath));
+
+			return new StreamableFile(fullFile.stream);
 		}
 
 		const match = /^bytes=(\d*)-(\d*)$/.exec(range);
@@ -86,11 +93,16 @@ export class AudioGenerationController {
 
 		end = Math.min(end, fileSize - 1);
 
+		const rangedFile = await this.storageService.getFile(audio.filePath, {
+			start,
+			end
+		});
+
 		res.status(HttpStatus.PARTIAL_CONTENT);
 		res.setHeader('Content-Range', `bytes ${start}-${end}/${fileSize}`);
 		res.setHeader('Content-Length', end - start + 1);
 
-		return new StreamableFile(createReadStream(absolutePath, { start, end }));
+		return new StreamableFile(rangedFile.stream);
 	}
 
 	@Get('exports/:assetId/download')
@@ -99,14 +111,18 @@ export class AudioGenerationController {
 		@Req() req: AuthenticatedRequest,
 		@Res({ passthrough: true }) res: Response
 	): Promise<StreamableFile> {
+		// Verify ownership and retrieve file metadata
 		const file = await this.audioGenerationService.getExportedAudioFile(assetId, req.user.id);
 
+		// Read exported WAV from Local or Supabase
+		const storedFile = await this.storageService.getFile(file.filePath);
+
 		res.setHeader('Content-Type', file.mimeType);
-		res.setHeader('Content-Length', file.fileSize);
+		res.setHeader('Content-Length', storedFile.size);
 		res.setHeader('Content-Disposition', `attachment; filename="${file.filename}"`);
 		res.setHeader('Cache-Control', 'private, no-store');
 
-		return new StreamableFile(createReadStream(file.absolutePath));
+		return new StreamableFile(storedFile.stream);
 	}
 
 	@Get('stories/:storyId/audio-history')
