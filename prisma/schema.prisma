@@ -201,43 +201,29 @@ model AudioScene {
 // ==========================================
 
 model Voice {
-  id          Int      @id @default(autoincrement())
-  name        String
-  gender      String?
-  ageCategory String?
-  description String?
-  style       String?
-  languages   String[] @default([])
-  previewUrl  String?
-  isActive    Boolean  @default(true)
-  created_at  DateTime @default(now())
-  updated_at  DateTime @updatedAt
-
-  providerMapping VoiceProviderMapping?
-  characters      AudioCharacter[]
-  sceneAudios     SceneAudio[]
-  sceneOverrides  AudioScene[]          @relation("SceneVoiceOverride")
-
-  @@index([isActive])
-}
-
-// ==========================================
-// PRIVATE PROVIDER MAPPING
-// ==========================================
-
-model VoiceProviderMapping {
-  id              Int      @id @default(autoincrement())
-  voiceId         Int      @unique
+  id              Int     @id @default(autoincrement())
+  name            String
+  displayName     String?
   provider        String
   providerVoiceId String
   model           String
-  settings        Json?
-  created_at      DateTime @default(now())
-  updated_at      DateTime @updatedAt
 
-  voice Voice @relation(fields: [voiceId], references: [id], onDelete: Cascade)
+  gender      String?
+  ageCategory String?
+  description String?
+  previewUrl  String?
 
+  isActive   Boolean  @default(true)
+  created_at DateTime @default(now())
+  updated_at DateTime @updatedAt
+
+  characters     AudioCharacter[]
+  sceneAudios    SceneAudio[]
+  sceneOverrides AudioScene[]     @relation("SceneVoiceOverride")
+
+  @@unique([provider, providerVoiceId])
   @@index([provider])
+  @@index([isActive])
 }
 
 // ==========================================

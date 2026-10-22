@@ -153,4 +153,88 @@ export class AiService {
 
 		return response;
 	}
+
+	async getGeminiStudioVoices() {
+		const ai = new GoogleGenAI({
+			apiKey: process.env.GEMINI_API_KEY!
+		});
+
+		// Keep your existing studioVoices array of 30 voices unchanged
+		const studioVoices = [
+			{ geminiVoiceName: 'Puck', indianVoiceName: 'Aarav' },
+			{ geminiVoiceName: 'Charon', indianVoiceName: 'Vikram' },
+			{ geminiVoiceName: 'Fenrir', indianVoiceName: 'Rudra' },
+			{ geminiVoiceName: 'Orus', indianVoiceName: 'Pratap' },
+			{ geminiVoiceName: 'Algenib', indianVoiceName: 'Raghav' },
+			{ geminiVoiceName: 'Algieba', indianVoiceName: 'Mohan' },
+			{ geminiVoiceName: 'Schedar', indianVoiceName: 'Suresh' },
+			{ geminiVoiceName: 'Achird', indianVoiceName: 'Rahul' },
+			{ geminiVoiceName: 'Zubenelgenubi', indianVoiceName: 'Karan' },
+			{ geminiVoiceName: 'Sadachbia', indianVoiceName: 'Aditya' },
+			{ geminiVoiceName: 'Sadaltager', indianVoiceName: 'Devendra' },
+			{ geminiVoiceName: 'Alnilam', indianVoiceName: 'Arjun' },
+			{ geminiVoiceName: 'Rasalgethi', indianVoiceName: 'Mahendra' },
+			{ geminiVoiceName: 'Enceladus', indianVoiceName: 'Kabir' },
+			{ geminiVoiceName: 'Iapetus', indianVoiceName: 'Vivek' },
+			{ geminiVoiceName: 'Umbriel', indianVoiceName: 'Rohit' },
+
+			{ geminiVoiceName: 'Kore', indianVoiceName: 'Priya' },
+			{ geminiVoiceName: 'Zephyr', indianVoiceName: 'Anjali' },
+			{ geminiVoiceName: 'Leda', indianVoiceName: 'Riya' },
+			{ geminiVoiceName: 'Aoede', indianVoiceName: 'Kavya' },
+			{ geminiVoiceName: 'Callirrhoe', indianVoiceName: 'Neha' },
+			{ geminiVoiceName: 'Autonoe', indianVoiceName: 'Ishita' },
+			{ geminiVoiceName: 'Despina', indianVoiceName: 'Meera' },
+			{ geminiVoiceName: 'Erinome', indianVoiceName: 'Nisha' },
+			{ geminiVoiceName: 'Laomedeia', indianVoiceName: 'Pooja' },
+			{ geminiVoiceName: 'Achernar', indianVoiceName: 'Sneha' },
+			{ geminiVoiceName: 'Gacrux', indianVoiceName: 'Savitri' },
+			{ geminiVoiceName: 'Pulcherrima', indianVoiceName: 'Shreya' },
+			{ geminiVoiceName: 'Vindemiatrix', indianVoiceName: 'Radha' },
+			{ geminiVoiceName: 'Sulafat', indianVoiceName: 'Sunita' }
+		];
+
+		const allGeminiVoices = [];
+		let pageToken: string | undefined;
+
+		do {
+			const response = await ai.voices.list({
+				page_size: 1000,
+				...(pageToken ? { page_token: pageToken } : {})
+			});
+
+			allGeminiVoices.push(...(response.voices ?? []));
+			pageToken = response.next_page_token;
+		} while (pageToken);
+
+		const studioVoiceMap = new Map(studioVoices.map(voice => [voice.geminiVoiceName.toLowerCase(), voice]));
+
+		const filteredVoices = allGeminiVoices.flatMap(voice => {
+			if (voice.type !== 'prebuilt' || !voice.display_name) {
+				return [];
+			}
+
+			const studio = studioVoiceMap.get(voice.display_name.toLowerCase());
+
+			if (!studio) {
+				return [];
+			}
+
+			return [
+				{
+					...voice,
+					geminiVoiceName: studio.geminiVoiceName,
+					indianVoiceName: studio.indianVoiceName
+				}
+			];
+		});
+
+		if (filteredVoices.length !== studioVoices.length) {
+			throw new Error(
+				`Gemini voice sync incomplete: Expected ${studioVoices.length}, found ${filteredVoices.length}`
+			);
+		}
+
+		return filteredVoices;
+	}
 }
