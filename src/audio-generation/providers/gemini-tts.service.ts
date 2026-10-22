@@ -15,6 +15,24 @@ export class GeminiTtsService {
 		}
 
 		const response = await this.generateWithAvailableKey(text, voiceName, model);
+		console.log(
+			'GEMINI RESPONSE DEBUG:',
+			JSON.stringify(
+				{
+					candidates: response.candidates?.map(candidate => ({
+						finishReason: candidate.finishReason,
+						parts: candidate.content?.parts?.map(part => ({
+							hasAudio: !!part.inlineData?.data,
+							mimeType: part.inlineData?.mimeType,
+							text: part.text
+						}))
+					})),
+					promptFeedback: response.promptFeedback
+				},
+				null,
+				2
+			)
+		);
 
 		const audioPart = response.candidates?.[0]?.content?.parts?.find(part => part.inlineData?.data);
 
@@ -26,7 +44,19 @@ export class GeminiTtsService {
 
 		const mimeType = audioPart?.inlineData?.mimeType;
 
-		if (mimeType !== 'audio/L16;codec=pcm;rate=24000') {
+		// FIX: Accept supported Gemini PCM MIME formats
+		const normalizedMimeType = mimeType?.toLowerCase().replace(/\s+/g, '');
+
+		const mimeParts = normalizedMimeType?.split(';') ?? [];
+		const audioType = mimeParts[0];
+		const parameters = mimeParts.slice(1);
+
+		const isValidPcm =
+			audioType === 'audio/l16' &&
+			parameters.includes('rate=24000') &&
+			parameters.every(param => param === 'rate=24000' || param === 'channels=1' || param === 'codec=pcm');
+
+		if (!isValidPcm) {
 			throw new Error(`Unexpected audio format: ${mimeType}`);
 		}
 

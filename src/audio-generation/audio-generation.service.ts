@@ -12,6 +12,8 @@ import { mergeWavBuffers } from './utils/wav-merge.util.js';
 import { ZipArchive } from 'archiver';
 import { PassThrough } from 'node:stream';
 import { ConfigService } from '@nestjs/config';
+import { buildStylePrompt } from './providers/gemini-tts-prompt.builder.js';
+import { classifyGeminiTtsError, shouldRetryWithNeutralPrompt } from './utils/gemini-tts-error.util.js';
 @Injectable()
 export class audioGenerationService implements OnModuleInit, OnModuleDestroy {
 	constructor(
@@ -61,24 +63,17 @@ export class audioGenerationService implements OnModuleInit, OnModuleDestroy {
 		}
 
 		const voice = await this.prisma.voice.findUnique({
-			where: { id: voiceId },
-			include: {
-				providerMapping: true
-			}
+			where: { id: voiceId }
 		});
 
 		if (!voice || !voice.isActive) {
 			throw new BadRequestException(`Voice ${voiceId} is unavailable or inactive`);
 		}
 
-		if (!voice.providerMapping) {
-			throw new BadRequestException(`Provider mapping missing for voice ${voiceId}`);
-		}
-
 		return {
 			scene,
 			voice,
-			mapping: voice.providerMapping
+			mapping: { provider: voice.provider, providerVoiceId: voice.providerVoiceId, model: voice.model }
 		};
 	}
 
@@ -108,12 +103,11 @@ export class audioGenerationService implements OnModuleInit, OnModuleDestroy {
 		}
 
 		const voice = await this.prisma.voice.findUnique({
-			where: { id: voiceId },
-			include: { providerMapping: true }
+			where: { id: voiceId }
 		});
 
-		if (!voice || !voice.providerMapping) {
-			throw new BadRequestException(`Voice ${voiceId} or provider mapping unavailable`);
+		if (!voice || !voice.isActive) {
+			throw new BadRequestException(`Voice ${voiceId} unavailable or inactive`);
 		}
 
 		const saved =
@@ -132,22 +126,60 @@ export class audioGenerationService implements OnModuleInit, OnModuleDestroy {
 						model: saved.model,
 						settings: saved.settings ?? null
 					}
-				: voice.providerMapping;
+				: {
+						provider: voice.provider,
+						providerVoiceId: voice.providerVoiceId,
+						model: voice.model,
+						settings: null
+					};
 		const generationText = textSnapshot ?? scene.text;
-
 		if (!generationText.trim()) {
 			throw new BadRequestException('Scene text is empty');
 		}
 
-		if (mapping.provider?.trim().toUpperCase() !== 'GOOGLE') {
+		if (!['GOOGLE', 'GEMINI'].includes(mapping.provider?.trim().toUpperCase() ?? '')) {
 			throw new BadRequestException(`Unsupported TTS provider: ${mapping.provider}`);
 		}
 
-		const wavBuffer = await this.geminiTtsService.generateSpeech(
-			generationText,
-			mapping.providerVoiceId,
-			mapping.model
-		);
+		const promptOptions = {
+			text: generationText,
+			speaker: scene.speakerName ?? scene.character?.name,
+			style: scene.style,
+			emotion: scene.emotion,
+			languageLabel: scene.language
+		};
+
+		const prompt = buildStylePrompt(promptOptions);
+
+		console.log('GEMINI FINAL PROMPT:\n', prompt);
+
+		let wavBuffer: Buffer;
+
+		try {
+			// First attempt: original style and emotion
+			wavBuffer = await this.geminiTtsService.generateSpeech(prompt, mapping.providerVoiceId, mapping.model);
+		} catch (error) {
+			const errorType = classifyGeminiTtsError(error);
+
+			if (!shouldRetryWithNeutralPrompt(error)) {
+				throw error;
+			}
+
+			console.warn(`Scene ${sceneId}: Gemini TTS ${errorType}. Retrying with neutral prompt.`);
+
+			const fallbackPrompt = buildStylePrompt({
+				...promptOptions,
+				neutralFallback: true
+			});
+
+			wavBuffer = await this.geminiTtsService.generateSpeech(
+				fallbackPrompt,
+				mapping.providerVoiceId,
+				mapping.model
+			);
+
+			console.log(`Scene ${sceneId}: Neutral fallback succeeded.`);
+		}
 
 		const directory = join(process.cwd(), 'uploads', 'audio-stories', String(scene.storyId));
 
@@ -195,16 +227,8 @@ export class audioGenerationService implements OnModuleInit, OnModuleDestroy {
 				scenes: {
 					orderBy: { sceneOrder: 'asc' },
 					include: {
-						character: {
-							include: {
-								voice: {
-									include: { providerMapping: true }
-								}
-							}
-						},
-						voiceOverride: {
-							include: { providerMapping: true }
-						}
+						character: { include: { voice: true } },
+						voiceOverride: true
 					}
 				}
 			}
@@ -228,7 +252,7 @@ export class audioGenerationService implements OnModuleInit, OnModuleDestroy {
 						textSnapshot: scene.text,
 						voiceIdSnapshot: scene.voiceOverrideId ?? scene.character?.voiceId ?? null,
 						settingsSnapshot: (() => {
-							const mapping = (scene.voiceOverride ?? scene.character?.voice)?.providerMapping;
+							const mapping = scene.voiceOverride ?? scene.character?.voice;
 
 							if (!mapping) return undefined;
 
@@ -236,7 +260,7 @@ export class audioGenerationService implements OnModuleInit, OnModuleDestroy {
 								provider: mapping.provider,
 								providerVoiceId: mapping.providerVoiceId,
 								model: mapping.model,
-								settings: mapping.settings
+								settings: null
 							};
 						})(),
 
@@ -283,18 +307,10 @@ export class audioGenerationService implements OnModuleInit, OnModuleDestroy {
 						character: {
 							select: {
 								voiceId: true,
-								voice: {
-									select: {
-										providerMapping: true
-									}
-								}
+								voice: true
 							}
 						},
-						voiceOverride: {
-							select: {
-								providerMapping: true
-							}
-						}
+						voiceOverride: true
 					}
 				}
 			}
@@ -308,7 +324,7 @@ export class audioGenerationService implements OnModuleInit, OnModuleDestroy {
 
 		const voiceId = scene.voiceOverrideId ?? scene.character?.voiceId ?? null;
 
-		const mapping = (scene.voiceOverride ?? scene.character?.voice)?.providerMapping;
+		const mapping = scene.voiceOverride ?? scene.character?.voice;
 
 		const job = await this.prisma.audioGenerationJob.create({
 			data: {
@@ -326,7 +342,7 @@ export class audioGenerationService implements OnModuleInit, OnModuleDestroy {
 											provider: mapping.provider,
 											providerVoiceId: mapping.providerVoiceId,
 											model: mapping.model,
-											settings: mapping.settings
+											settings: null
 										}
 									}
 								: {}),
