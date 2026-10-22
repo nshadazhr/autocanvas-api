@@ -2,6 +2,8 @@ import { Injectable, InternalServerErrorException, NotFoundException } from '@ne
 import { ConfigService } from '@nestjs/config';
 import { createClient, type SupabaseClient } from '@supabase/supabase-js';
 import { Readable } from 'node:stream';
+import WebSocket from 'ws';
+import type { SupabaseClientOptions } from '@supabase/supabase-js';
 
 import type {
 	StorageAdapter,
@@ -10,6 +12,12 @@ import type {
 	StorageReadOptions,
 	StorageMetadata
 } from '../storage.interface.js';
+
+type RealtimeTransport = NonNullable<
+  NonNullable<SupabaseClientOptions<'public'>['realtime']>['transport']
+>;
+
+const SupabaseWebSocketTransport = WebSocket as unknown as RealtimeTransport;
 
 @Injectable()
 export class SupabaseStorageProvider implements StorageAdapter {
@@ -32,7 +40,7 @@ export class SupabaseStorageProvider implements StorageAdapter {
 							persistSession: false
 						},
 						realtime: {
-							transport: WebSocket
+							transport: SupabaseWebSocketTransport
 						}
 					})
 				: null;
