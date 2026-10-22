@@ -23,12 +23,16 @@ export class SupabaseStorageProvider implements StorageAdapter {
 		this.bucket = this.configService.get<string>('SUPABASE_STORAGE_BUCKET') || 'autocanvas-audio';
 
 		// Local mode mein Supabase credentials required nahi hain.
+
 		this.client =
 			url && key
 				? createClient(url, key, {
 						auth: {
 							autoRefreshToken: false,
 							persistSession: false
+						},
+						realtime: {
+							transport: WebSocket
 						}
 					})
 				: null;
