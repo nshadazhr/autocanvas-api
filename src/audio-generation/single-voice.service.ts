@@ -1,19 +1,11 @@
 import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
-
 import { PrismaService } from '../prisma/prisma.service.js';
 import { GeminiTtsService } from './providers/gemini-tts.service.js';
 import { buildStylePrompt } from './providers/gemini-tts-prompt.builder.js';
-
 import { shouldRetryWithNeutralPrompt } from './utils/gemini-tts-error.util.js';
-
 import { mergeWavBuffers } from './utils/wav-merge.util.js';
-
-import { mkdir, stat, writeFile } from 'node:fs/promises';
-
 import { randomUUID } from 'node:crypto';
-
-import { resolve, join, relative, isAbsolute, sep } from 'node:path';
-
+import { StorageService } from '../storage/storage.service.js';
 interface SpeechSegment {
 	text: string;
 	emotion?: string;
@@ -42,7 +34,8 @@ const SPEAKING_STYLES = ['Narrative', 'Storytelling', 'Conversational', 'Dramati
 export class SingleVoiceService {
 	constructor(
 		private readonly prisma: PrismaService,
-		private readonly tts: GeminiTtsService
+		private readonly tts: GeminiTtsService,
+		private readonly storageService: StorageService
 	) {}
 
 	async create(userId: number, title: string, content: string) {
@@ -319,15 +312,13 @@ export class SingleVoiceService {
 
 			const wav = parts.length === 1 ? parts[0] : mergeWavBuffers(parts, 180);
 
-			const folder = resolve(process.cwd(), 'uploads', 'audio-stories', String(storyId), 'single');
-
-			await mkdir(folder, {
-				recursive: true
-			});
-
 			const filename = `${randomUUID()}.wav`;
 
-			await writeFile(join(folder, filename), wav);
+			const filePath = await this.storageService.upload({
+				key: `audio-stories/${storyId}/single/${filename}`,
+				buffer: wav,
+				contentType: 'audio/wav'
+			});
 
 			const byteRate = wav.readUInt32LE(28);
 			const dataSize = wav.readUInt32LE(40);
@@ -336,7 +327,7 @@ export class SingleVoiceService {
 				data: {
 					storyId,
 					type: 'SINGLE_VOICE',
-					filePath: join('uploads', 'audio-stories', String(storyId), 'single', filename),
+					filePath: filePath,
 					mimeType: 'audio/wav',
 					format: 'wav',
 					fileSizeBytes: BigInt(wav.length),
@@ -385,23 +376,6 @@ export class SingleVoiceService {
 			throw new NotFoundException('Audio not found');
 		}
 
-		const root = resolve(process.cwd(), 'uploads', 'audio-stories', String(storyId), 'single');
-
-		const path = resolve(process.cwd(), audio.filePath);
-
-		const rel = relative(root, path);
-
-		if (!rel || rel === '..' || rel.startsWith(`..${sep}`) || isAbsolute(rel)) {
-			throw new NotFoundException('Audio not found');
-		}
-
-		const info = await stat(path).catch(() => {
-			throw new NotFoundException('Audio file missing');
-		});
-
-		return {
-			path,
-			size: info.size
-		};
+		return this.storageService.getFile(audio.filePath);
 	}
 }

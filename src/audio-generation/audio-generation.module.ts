@@ -6,8 +6,10 @@ import { audioGenerationService } from './audio-generation.service.js';
 import { GeminiKeyManagerService } from './providers/gemini-key-manager.service.js';
 import { SingleVoiceService } from './single-voice.service.js';
 import { SingleVoiceController } from './single-voice.controller.js';
+import { StorageModule } from '../storage/storage.module.js';
 
 @Module({
+	imports: [StorageModule],
 	controllers: [AudioGenerationController, SingleVoiceController],
 	providers: [GeminiTtsService, GeminiKeyManagerService, audioGenerationService, SingleVoiceService, PrismaService]
 })

@@ -14,12 +14,15 @@ import { PassThrough } from 'node:stream';
 import { ConfigService } from '@nestjs/config';
 import { buildStylePrompt } from './providers/gemini-tts-prompt.builder.js';
 import { classifyGeminiTtsError, shouldRetryWithNeutralPrompt } from './utils/gemini-tts-error.util.js';
+import { StorageService } from '../storage/storage.service.js';
+import { Readable } from 'node:stream';
 @Injectable()
 export class audioGenerationService implements OnModuleInit, OnModuleDestroy {
 	constructor(
 		private readonly prisma: PrismaService,
 		private readonly geminiTtsService: GeminiTtsService,
-		private readonly configService: ConfigService
+		private readonly configService: ConfigService,
+		private readonly storageService: StorageService
 	) {
 		this.maxRecoveryAttempts = this.readPositiveEnv('AUDIO_MAX_RECOVERY_ATTEMPTS', 3);
 		this.recoveryRetryDelayMs = this.readPositiveEnv('AUDIO_RECOVERY_RETRY_DELAY_MS', 60_000);
@@ -181,16 +184,15 @@ export class audioGenerationService implements OnModuleInit, OnModuleDestroy {
 			console.log(`Scene ${sceneId}: Neutral fallback succeeded.`);
 		}
 
-		const directory = join(process.cwd(), 'uploads', 'audio-stories', String(scene.storyId));
-
-		await mkdir(directory, { recursive: true });
-
 		const filename = `${scene.id}-${randomUUID()}.wav`;
-		const absolutePath = join(directory, filename);
 
-		await writeFile(absolutePath, wavBuffer);
+		const storageKey = `audio-stories/${scene.storyId}/${filename}`;
 
-		const relativePath = join('uploads', 'audio-stories', String(scene.storyId), filename);
+		const filePath = await this.storageService.upload({
+			key: storageKey,
+			buffer: wavBuffer,
+			contentType: 'audio/wav'
+		});
 
 		const audio = await this.prisma.sceneAudio.create({
 			data: {
@@ -201,7 +203,7 @@ export class audioGenerationService implements OnModuleInit, OnModuleDestroy {
 				model: mapping.model,
 				textSnapshot: generationText,
 				settingsSnapshot: mapping.settings ?? undefined,
-				filePath: relativePath,
+				filePath: filePath,
 				format: 'wav',
 				mimeType: 'audio/wav',
 				fileSizeBytes: BigInt(wavBuffer.length),
@@ -801,35 +803,8 @@ export class audioGenerationService implements OnModuleInit, OnModuleDestroy {
 			throw new NotFoundException('Audio not found');
 		}
 
-		const { resolve, relative, isAbsolute } = await import('node:path');
-		const { stat } = await import('node:fs/promises');
-
-		const uploadsRoot = resolve(process.cwd(), 'uploads');
-		const absolutePath = resolve(process.cwd(), audio.filePath);
-		const relativePath = relative(uploadsRoot, absolutePath);
-
-		if (
-			relativePath === '..' ||
-			relativePath.startsWith(`..${(await import('node:path')).sep}`) ||
-			isAbsolute(relativePath)
-		) {
-			throw new NotFoundException('Audio file not found');
-		}
-
-		let fileStat;
-		try {
-			fileStat = await stat(absolutePath);
-		} catch {
-			throw new NotFoundException('Audio file not found');
-		}
-
-		if (!fileStat.isFile()) {
-			throw new NotFoundException('Audio file not found');
-		}
-
 		return {
-			absolutePath,
-			fileSize: fileStat.size,
+			filePath: audio.filePath,
 			mimeType: audio.mimeType || 'audio/wav',
 			filename: `${audio.id}.wav`
 		};
@@ -942,10 +917,15 @@ export class audioGenerationService implements OnModuleInit, OnModuleDestroy {
 		for (const scene of story.scenes) {
 			const audioId = scene.audios[0].id;
 
-			// Reuse existing ownership and file validation.
+			// Ownership verification
 			const audioFile = await this.getAudioFile(audioId, userId);
 
-			buffers.push(await readFile(audioFile.absolutePath));
+			// Read from Local or Supabase Storage
+			const storedFile = await this.storageService.getFile(audioFile.filePath);
+
+			const audioBuffer = await this.streamToBuffer(storedFile.stream);
+
+			buffers.push(audioBuffer);
 		}
 
 		const mergedBuffer = mergeWavBuffers(buffers, 300);
@@ -955,22 +935,21 @@ export class audioGenerationService implements OnModuleInit, OnModuleDestroy {
 
 		const durationMs = Math.round((dataSize / byteRate) * 1000);
 
-		const directory = resolve(process.cwd(), 'uploads', 'audio-stories', String(storyId), 'exports');
-
-		await mkdir(directory, { recursive: true });
-
 		const filename = `story-${storyId}-${randomUUID()}.wav`;
-		const absolutePath = join(directory, filename);
 
-		await writeFile(absolutePath, mergedBuffer);
+		const storageKey = `audio-stories/${storyId}/exports/${filename}`;
 
-		const relativePath = join('uploads', 'audio-stories', String(storyId), 'exports', filename);
+		const filePath = await this.storageService.upload({
+			key: storageKey,
+			buffer: mergedBuffer,
+			contentType: 'audio/wav'
+		});
 
 		const asset = await this.prisma.audioAsset.create({
 			data: {
 				storyId,
 				type: 'COMBINED_AUDIO',
-				filePath: relativePath,
+				filePath: filePath,
 				format: 'wav',
 				mimeType: 'audio/wav',
 				fileSizeBytes: BigInt(mergedBuffer.length),
@@ -1008,40 +987,27 @@ export class audioGenerationService implements OnModuleInit, OnModuleDestroy {
 			throw new NotFoundException('Exported audio not found');
 		}
 
-		const { resolve, relative, isAbsolute, sep } = await import('node:path');
+		// Verify that this asset belongs to its story's export directory.
+		const expectedPrefix = `audio-stories/${asset.storyId}/exports/`;
 
-		const { stat } = await import('node:fs/promises');
+		const normalizedPath = asset.filePath.replace(/\\/g, '/');
 
-		const exportsRoot = resolve(process.cwd(), 'uploads', 'audio-stories', String(asset.storyId), 'exports');
-
-		const absolutePath = resolve(process.cwd(), asset.filePath);
-		const relativePath = relative(exportsRoot, absolutePath);
+		const storageKey = normalizedPath.replace(/^(local|supabase):\/\//, '').replace(/^uploads\//, '');
 
 		if (
-			relativePath === '' ||
-			relativePath === '..' ||
-			relativePath.startsWith(`..${sep}`) ||
-			isAbsolute(relativePath)
+			!storageKey.startsWith(expectedPrefix) ||
+			!storageKey.slice(expectedPrefix.length) ||
+			storageKey.split('/').includes('..')
 		) {
 			throw new NotFoundException('Exported audio file not found');
 		}
 
-		let fileStat;
-
-		try {
-			fileStat = await stat(absolutePath);
-		} catch {
-			throw new NotFoundException('Exported audio file not found');
-		}
-
-		if (!fileStat.isFile()) {
-			throw new NotFoundException('Exported audio file not found');
-		}
+		const metadata = await this.storageService.getMetadata(asset.filePath);
 
 		return {
-			absolutePath,
-			fileSize: fileStat.size,
-			mimeType: asset.mimeType || 'audio/wav',
+			filePath: asset.filePath,
+			fileSize: metadata.size,
+			mimeType: asset.mimeType || metadata.contentType,
 			filename: `story-${asset.storyId}-export-${asset.id}.wav`
 		};
 	}
@@ -1084,13 +1050,16 @@ export class audioGenerationService implements OnModuleInit, OnModuleDestroy {
 			throw new BadRequestException(`Audio missing for ${missingScenes.length} scene(s)`);
 		}
 
-		// Validate all files before starting the ZIP response.
-		const files: { path: string; name: string }[] = [];
+		// Verify ownership and file existence before ZIP streaming.
+		const files: { filePath: string; name: string }[] = [];
+
 		for (const [index, scene] of story.scenes.entries()) {
 			const audioFile = await this.getAudioFile(scene.audios[0].id, userId);
 
+			await this.storageService.getMetadata(audioFile.filePath);
+
 			files.push({
-				path: audioFile.absolutePath,
+				filePath: audioFile.filePath,
 				name: `scene-${String(index + 1).padStart(3, '0')}.wav`
 			});
 		}
@@ -1105,20 +1074,36 @@ export class audioGenerationService implements OnModuleInit, OnModuleDestroy {
 			stream.destroy(error);
 		});
 
-		// Prevent an unhandled archive error.
 		archive.on('error', (error: Error) => {
 			stream.destroy(error);
 		});
 
 		archive.pipe(stream);
 
-		for (const file of files) {
-			archive.file(file.path, {
-				name: file.name
-			});
-		}
+		// Prepare archive asynchronously so the HTTP stream can start.
+		void (async () => {
+			for (const file of files) {
+				if (stream.destroyed) {
+					break;
+				}
 
-		void archive.finalize().catch((error: unknown) => {
+				const storedFile = await this.storageService.getFile(file.filePath);
+
+				storedFile.stream.on('error', (error: Error) => {
+					archive.abort();
+					stream.destroy(error);
+				});
+
+				archive.append(storedFile.stream, {
+					name: file.name
+				});
+			}
+
+			if (!stream.destroyed) {
+				await archive.finalize();
+			}
+		})().catch((error: unknown) => {
+			archive.abort();
 			stream.destroy(error instanceof Error ? error : new Error(String(error)));
 		});
 
@@ -1234,5 +1219,15 @@ export class audioGenerationService implements OnModuleInit, OnModuleDestroy {
 		});
 
 		return true;
+	}
+
+	private async streamToBuffer(stream: Readable): Promise<Buffer> {
+		const chunks: Buffer[] = [];
+
+		for await (const chunk of stream) {
+			chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+		}
+
+		return Buffer.concat(chunks);
 	}
 }

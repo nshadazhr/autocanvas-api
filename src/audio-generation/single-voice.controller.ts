@@ -1,7 +1,6 @@
 import { Body, Controller, Get, Param, ParseIntPipe, Post, Req, Res, StreamableFile, UseGuards } from '@nestjs/common';
 
 import type { Response } from 'express';
-import { createReadStream } from 'node:fs';
 
 import { IsInt, IsNotEmpty, IsOptional, IsString, MaxLength, Min } from 'class-validator';
 
@@ -65,10 +64,10 @@ export class SingleVoiceController {
 	) {
 		const file = await this.single.file(storyId, audioId, req.user.id);
 
-		res.setHeader('Content-Type', 'audio/wav');
+		res.setHeader('Content-Type', file.contentType);
 		res.setHeader('Content-Length', file.size);
 		res.setHeader('Cache-Control', 'private, no-store');
 
-		return new StreamableFile(createReadStream(file.path));
+		return new StreamableFile(file.stream);
 	}
 }
