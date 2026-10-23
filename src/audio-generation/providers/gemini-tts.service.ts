@@ -1,3 +1,5 @@
+import { safeAiError } from '../../ai/usage/safe-ai-error.js';
+import { AiUsageService } from '../../ai/usage/ai-usage.service.js';
 import { Injectable, Logger } from '@nestjs/common';
 import { GeminiKeyManagerService } from './gemini-key-manager.service.js';
 import wavefile from 'wavefile';
@@ -6,33 +8,18 @@ import { GeminiKeysUnavailableError } from '../errors/gemini-keys-unavailable.er
 const { WaveFile } = wavefile;
 @Injectable()
 export class GeminiTtsService {
-	constructor(private readonly keyManager: GeminiKeyManagerService) {}
+	constructor(
+		private readonly keyManager: GeminiKeyManagerService,
+		private readonly usage: AiUsageService
+	) {}
 	private readonly logger = new Logger(GeminiTtsService.name);
 
-	async generateSpeech(text: string, voiceName: string, model: string): Promise<Buffer> {
+	async generateSpeech(text: string, voiceName: string, model: string, context: { userId: number }): Promise<Buffer> {
 		if (!text.trim()) {
 			throw new Error('Speech text cannot be empty');
 		}
 
-		const response = await this.generateWithAvailableKey(text, voiceName, model);
-		console.log(
-			'GEMINI RESPONSE DEBUG:',
-			JSON.stringify(
-				{
-					candidates: response.candidates?.map(candidate => ({
-						finishReason: candidate.finishReason,
-						parts: candidate.content?.parts?.map(part => ({
-							hasAudio: !!part.inlineData?.data,
-							mimeType: part.inlineData?.mimeType,
-							text: part.text
-						}))
-					})),
-					promptFeedback: response.promptFeedback
-				},
-				null,
-				2
-			)
-		);
+		const response = await this.generateWithAvailableKey(text, voiceName, model, context.userId);
 
 		const audioPart = response.candidates?.[0]?.content?.parts?.find(part => part.inlineData?.data);
 
@@ -78,7 +65,7 @@ export class GeminiTtsService {
 		return Buffer.from(wav.toBuffer());
 	}
 
-	private async generateWithAvailableKey(text: string, voiceName: string, model: string) {
+	private async generateWithAvailableKey(text: string, voiceName: string, model: string, userId: number) {
 		const maxAttempts = this.keyManager.getKeyCount();
 
 		for (let attempt = 0; attempt < maxAttempts; attempt++) {
@@ -108,23 +95,25 @@ export class GeminiTtsService {
 			const { client, index } = selectedKey;
 
 			try {
-				return await client.models.generateContent({
-					model,
-					contents: [
-						{
-							role: 'user',
-							parts: [{ text }]
-						}
-					],
-					config: {
-						responseModalities: ['AUDIO'],
-						speechConfig: {
-							voiceConfig: {
-								prebuiltVoiceConfig: { voiceName }
+				return await this.usage.execute(userId, 'tts', text.length, () =>
+					client.models.generateContent({
+						model,
+						contents: [
+							{
+								role: 'user',
+								parts: [{ text }]
+							}
+						],
+						config: {
+							responseModalities: ['AUDIO'],
+							speechConfig: {
+								voiceConfig: {
+									prebuiltVoiceConfig: { voiceName }
+								}
 							}
 						}
-					}
-				});
+					})
+				);
 			} catch (error: unknown) {
 				const status = this.getErrorStatus(error);
 
@@ -134,7 +123,7 @@ export class GeminiTtsService {
 						`Gemini key #${index + 1} returned 429; ` +
 							`dailyQuotaDetected=${this.isDailyQuotaError(message)}; ` +
 							`retryDelayMs=${this.getRetryDelay(error)}; ` +
-							`message=${message}`
+							`message=${safeAiError(error)}`
 					);
 
 					if (this.isDailyQuotaError(message)) {

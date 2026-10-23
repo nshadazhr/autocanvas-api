@@ -23,9 +23,19 @@ export class AudioGenerationController {
 		return job;
 	}
 
+	@Get('stories/:storyId/jobs/latest')
+	getLatestJob(@Param('storyId', ParseIntPipe) storyId: number, @Req() req: AuthenticatedRequest) {
+		return this.audioGenerationService.getLatestStoryJob(storyId, req.user.id);
+	}
+
 	@Get('jobs/:jobId')
 	getJob(@Param('jobId', ParseIntPipe) jobId: number, @Req() req: AuthenticatedRequest) {
 		return this.audioGenerationService.getGenerationJob(jobId, req.user.id);
+	}
+
+	@Post('jobs/:jobId/cancel')
+	cancelJob(@Param('jobId', ParseIntPipe) jobId: number, @Req() req: AuthenticatedRequest) {
+		return this.audioGenerationService.cancelGenerationJob(jobId, req.user.id);
 	}
 
 	@Post('jobs/:jobId/retry')

@@ -1,4 +1,5 @@
-import { Controller, Get, Post, UseGuards } from '@nestjs/common';
+import type { AuthenticatedRequest } from '../common/interfaces/authenticated-request.interface.js';
+import { Controller, Get, Post, UseGuards, Req } from '@nestjs/common';
 import { VoicesService } from './voices.service.js';
 import { AuthGuard } from '../auth/auth.guard.js';
 import { AiService } from '../ai/ai.service.js';
@@ -17,7 +18,8 @@ export class VoicesController {
 	}
 
 	@Post()
-	async syncGeminiVoices() {
-		return this.voicesService.importGeminiVoices(this.aiService.getGeminiStudioVoices.bind(this.aiService));
+	async syncGeminiVoices(@Req() req: AuthenticatedRequest) {
+		this.aiService.assertDiagnosticsAccess(req.user.id);
+		return this.voicesService.importGeminiVoices(() => this.aiService.getGeminiStudioVoices(req.user.id));
 	}
 }

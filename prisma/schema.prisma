@@ -27,6 +27,7 @@ model User {
   // Audio Studio
   audioStories      AudioStory[]
   audioJobs         AudioGenerationJob[]
+  analysisJobs      StoryAnalysisJob[]
   animationProjects AnimationProject[]
 }
 
@@ -133,6 +134,7 @@ model AudioStory {
   scenes     AudioScene[]
   jobs       AudioGenerationJob[]
   assets     AudioAsset[]
+  analysisJobs StoryAnalysisJob[]
 
   @@index([userId])
 }
@@ -393,4 +395,54 @@ model AnimationScene {
   project    AnimationProject @relation(fields: [projectId], references: [id], onDelete: Cascade)
 
   @@index([projectId, sortOrder])
+}
+
+// Durable analysis work and shared provider-usage accounting.
+enum StoryAnalysisJobStatus {
+  QUEUED
+  PROCESSING
+  WAITING
+  COMPLETED
+  FAILED
+  CANCELLED
+}
+
+model StoryAnalysisJob {
+  id              String @id @default(uuid())
+  storyId         Int
+  userId          Int
+  contentHash     String
+  contentSnapshot String
+  status          StoryAnalysisJobStatus @default(QUEUED)
+  attempts        Int @default(0)
+  nextRetryAt     DateTime?
+  leaseToken      String?
+  leaseExpiresAt  DateTime?
+  errorCode       String?
+  errorMessage    String?
+  source          String?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+  completedAt     DateTime?
+  story AudioStory @relation(fields: [storyId], references: [id], onDelete: Cascade)
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  @@index([status, nextRetryAt])
+  @@index([userId, status])
+  @@index([storyId, createdAt])
+}
+
+model AiUsageBucket {
+  key       String @id
+  requests  Int @default(0)
+  units     Int @default(0)
+  expiresAt DateTime
+}
+
+model AiRequestLease {
+  id        String @id @default(uuid())
+  userId    Int
+  kind      String
+  expiresAt DateTime
+  @@index([expiresAt])
+  @@index([userId, expiresAt])
 }

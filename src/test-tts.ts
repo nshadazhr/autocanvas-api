@@ -12,10 +12,15 @@ async function main() {
 	try {
 		const aiService = app.get(AiService);
 
+		const userId = Number(process.env.AI_DIAGNOSTIC_TEST_USER_ID);
+		if (!Number.isSafeInteger(userId) || userId <= 0)
+			throw new Error('Set AI_DIAGNOSTIC_TEST_USER_ID to an authorized user');
+		aiService.assertDiagnosticsAccess(userId);
 		const response = await aiService.generateSpeech(
 			'माँ, मैं गाँव में पिज़्ज़ा की दुकान खोलना चाहता हूँ।',
 			'Zephyr',
-			'gemini-2.5-flash-preview-tts'
+			'gemini-2.5-flash-preview-tts',
+			userId
 		);
 
 		console.log('TTS request completed:', {
@@ -55,6 +60,6 @@ async function main() {
 }
 
 main().catch(error => {
-	console.error('TTS test failed:', error);
+	console.error('TTS test failed');
 	process.exitCode = 1;
 });

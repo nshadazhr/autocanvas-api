@@ -1,10 +1,13 @@
-import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
+import { AiCapacityError } from '../ai/usage/ai-capacity.error.js';
+import { safeAiError } from '../ai/usage/safe-ai-error.js';
+import { BadRequestException, Injectable, NotFoundException, OnModuleInit, OnModuleDestroy } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service.js';
 import { GeminiTtsService } from './providers/gemini-tts.service.js';
 import { buildStylePrompt } from './providers/gemini-tts-prompt.builder.js';
 import { shouldRetryWithNeutralPrompt } from './utils/gemini-tts-error.util.js';
 import { mergeWavBuffers } from './utils/wav-merge.util.js';
-import { randomUUID } from 'node:crypto';
+import { randomUUID, createHash } from 'node:crypto';
+import { withStoryLock } from './utils/audio-story-lock.js';
 import { StorageService } from '../storage/storage.service.js';
 interface SpeechSegment {
 	text: string;
@@ -31,7 +34,9 @@ const EMOTION_TAGS = [
 const SPEAKING_STYLES = ['Narrative', 'Storytelling', 'Conversational', 'Dramatic', 'Professional', 'Calm'] as const;
 
 @Injectable()
-export class SingleVoiceService {
+export class SingleVoiceService implements OnModuleInit, OnModuleDestroy {
+	private timer: ReturnType<typeof setInterval> | null = null;
+	private scanning = false;
 	constructor(
 		private readonly prisma: PrismaService,
 		private readonly tts: GeminiTtsService,
@@ -93,6 +98,7 @@ export class SingleVoiceService {
 		const config = story.analysisResult as {
 			voiceId?: number;
 			style?: string;
+			completedRevision?: string;
 		} | null;
 
 		return {
@@ -102,6 +108,12 @@ export class SingleVoiceService {
 			status: story.status,
 			voiceId: config?.voiceId ?? null,
 			style: config?.style ?? null,
+			error: story.analysisError,
+			audioIsCurrent:
+				!!audio &&
+				(config?.completedRevision
+					? config.completedRevision === this.revision(story.content, config.voiceId ?? 0, config.style)
+					: story.status === 'SINGLE_COMPLETED'),
 			audio: audio
 				? {
 						id: audio.id,
@@ -112,83 +124,137 @@ export class SingleVoiceService {
 		};
 	}
 
-	async generate(storyId: number, userId: number, voiceId: number, style?: string) {
-		const story = await this.owned(storyId, userId);
+	async cancel(storyId: number, userId: number) {
+		await withStoryLock(this.prisma, storyId, async tx => {
+			const story = await tx.audioStory.findFirst({ where: { id: storyId, userId } });
+			if (!story?.status.startsWith('SINGLE_')) throw new NotFoundException('Single Voice project not found');
+			if (!['SINGLE_PENDING', 'SINGLE_PROCESSING'].includes(story.status)) return;
+			await tx.audioStory.update({
+				where: { id: storyId },
+				data: { status: 'SINGLE_CANCELLED', analysisAttemptId: null, analysisError: null }
+			});
+		});
+		return this.get(storyId, userId);
+	}
 
-		if (story.status === 'SINGLE_PROCESSING') {
-			throw new BadRequestException('Generation is already running');
-		}
-
-		if (!Number.isSafeInteger(voiceId) || voiceId <= 0) {
-			throw new BadRequestException('Select a voice');
-		}
-
+	async generate(
+		storyId: number,
+		userId: number,
+		voiceId: number,
+		style?: string,
+		draft?: { title?: string; content?: string }
+	) {
 		const selectedStyle = style?.trim() || '';
-
-		if (selectedStyle && !SPEAKING_STYLES.some(item => item.toLowerCase() === selectedStyle.toLowerCase())) {
+		if (selectedStyle && !SPEAKING_STYLES.some(item => item.toLowerCase() === selectedStyle.toLowerCase()))
 			throw new BadRequestException('Invalid speaking style');
-		}
-
 		const normalizedStyle = SPEAKING_STYLES.find(item => item.toLowerCase() === selectedStyle.toLowerCase());
-
-		const voice = await this.prisma.voice.findUnique({
-			where: {
-				id: voiceId
-			}
-		});
-
-		if (!voice?.isActive || !['GOOGLE', 'GEMINI'].includes(voice.provider.toUpperCase())) {
-			throw new BadRequestException('Voice is unavailable');
-		}
-
-		console.log('SINGLE VOICE DEBUG:', {
-			storyId,
-			requestedVoiceId: voiceId,
-			databaseVoiceId: voice.id,
-			voiceName: voice.name,
-			provider: voice.provider,
-			providerVoiceId: voice.providerVoiceId,
-			model: voice.model,
-			selectedStyle: normalizedStyle ?? 'Natural'
-		});
-
-		if (!story.content.trim() || story.content.length > 12000) {
-			throw new BadRequestException('Script must be 1–12,000 characters');
-		}
-
-		const segments = this.parseEmotionSegments(story.content);
-
-		if (segments.length === 0) {
-			throw new BadRequestException('Script has no speakable text');
-		}
-
-		const changed = await this.prisma.audioStory.updateMany({
-			where: {
-				id: storyId,
-				userId,
-				status: {
-					not: 'SINGLE_PROCESSING'
+		await withStoryLock(this.prisma, storyId, async tx => {
+			const story = await tx.audioStory.findFirst({ where: { id: storyId, userId } });
+			if (!story?.status.startsWith('SINGLE_')) throw new NotFoundException('Single Voice project not found');
+			if (['SINGLE_PENDING', 'SINGLE_PROCESSING'].includes(story.status))
+				throw new BadRequestException('Generation is already running');
+			const content = draft?.content?.trim() ?? story.content;
+			if (!content || content.length > 12000 || this.parseEmotionSegments(content).length === 0)
+				throw new BadRequestException('Script must contain speakable text and be at most 12,000 characters');
+			const voice = await tx.voice.findUnique({ where: { id: voiceId } });
+			if (!voice?.isActive || !['GOOGLE', 'GEMINI'].includes(voice.provider.toUpperCase()))
+				throw new BadRequestException('Voice is unavailable');
+			const previous = story.analysisResult as Record<string, any> | null;
+			await tx.audioStory.update({
+				where: { id: storyId },
+				data: {
+					title: draft?.title?.trim() || story.title,
+					content,
+					status: 'SINGLE_PENDING',
+					analysisError: null,
+					analysisResult: {
+						mode: 'single',
+						voiceId,
+						style: normalizedStyle ?? null,
+						completedRevision: previous?.completedRevision ?? null
+					}
 				}
-			},
-			data: {
-				status: 'SINGLE_PROCESSING',
-				analysisResult: {
-					mode: 'single',
-					voiceId,
-					style: normalizedStyle ?? null
-				}
-			}
+			});
 		});
+		void this.processPending(storyId).catch(error => console.error('Single Voice dispatch failed', error));
+		return { status: 'SINGLE_PENDING' };
+	}
 
-		if (changed.count !== 1) {
-			throw new BadRequestException('Generation is already running');
+	private async processPending(storyId: number) {
+		const attemptId = randomUUID();
+		const claimed = await this.prisma.audioStory.updateMany({
+			where: { id: storyId, status: 'SINGLE_PENDING' },
+			data: { status: 'SINGLE_PROCESSING', analysisAttemptId: attemptId }
+		});
+		if (claimed.count !== 1) return;
+		const heartbeat = setInterval(() => {
+			void this.prisma.audioStory
+				.updateMany({
+					where: { id: storyId, status: 'SINGLE_PROCESSING', analysisAttemptId: attemptId },
+					data: { updated_at: new Date() }
+				})
+				.catch(error => console.error('Single Voice heartbeat failed', error));
+		}, 30_000);
+		heartbeat.unref();
+		try {
+			const story = await this.prisma.audioStory.findUnique({ where: { id: storyId } });
+			const config = story?.analysisResult as { voiceId?: number; style?: string } | null;
+			const voice = config?.voiceId
+				? await this.prisma.voice.findUnique({ where: { id: config.voiceId } })
+				: null;
+			if (!story || !voice?.isActive) throw new BadRequestException('Voice is unavailable');
+			await this.run(
+				storyId,
+				this.parseEmotionSegments(story.content),
+				voice.providerVoiceId,
+				voice.model,
+				config?.style ?? undefined,
+				attemptId,
+				story.userId
+			);
+		} catch (error) {
+			await this.prisma.audioStory.updateMany({
+				where: { id: storyId, status: 'SINGLE_PROCESSING', analysisAttemptId: attemptId },
+				data: {
+					status: 'SINGLE_FAILED',
+					analysisError: safeAiError(error)
+				}
+			});
+		} finally {
+			clearInterval(heartbeat);
 		}
+	}
 
-		void this.run(storyId, segments, voice.providerVoiceId, voice.model, normalizedStyle);
+	private async resumePending() {
+		if (this.scanning) return;
+		this.scanning = true;
+		try {
+			// Only stale processors are recovered; healthy replicas refresh updated_at.
+			await this.prisma.audioStory.updateMany({
+				where: { status: 'SINGLE_PROCESSING', updated_at: { lt: new Date(Date.now() - 5 * 60_000) } },
+				data: { status: 'SINGLE_FAILED', analysisError: 'Generation was interrupted. Please retry.' }
+			});
+			const pending = await this.prisma.audioStory.findMany({
+				where: { status: 'SINGLE_PENDING' },
+				select: { id: true }
+			});
+			for (const story of pending)
+				void this.processPending(story.id).catch(error => console.error('Single Voice dispatch failed', error));
+		} finally {
+			this.scanning = false;
+		}
+	}
 
-		return {
-			status: 'SINGLE_PROCESSING'
-		};
+	async onModuleInit() {
+		await this.resumePending();
+		this.timer = setInterval(() => {
+			void this.resumePending().catch(error => console.error('Single Voice recovery failed', error));
+		}, 30_000);
+		this.timer.unref();
+	}
+
+	onModuleDestroy() {
+		if (this.timer) clearInterval(this.timer);
 	}
 
 	private parseEmotionSegments(text: string): SpeechSegment[] {
@@ -272,7 +338,10 @@ export class SingleVoiceService {
 		segment: SpeechSegment,
 		voiceName: string,
 		model: string,
-		style?: string
+		userId: number,
+		style: string | undefined,
+		storyId: number,
+		attemptId: string
 	): Promise<Buffer> {
 		const promptOptions = {
 			text: segment.text,
@@ -283,12 +352,19 @@ export class SingleVoiceService {
 		const prompt = style || segment.emotion ? buildStylePrompt(promptOptions) : segment.text;
 
 		try {
-			return await this.tts.generateSpeech(prompt, voiceName, model);
+			return await this.tts.generateSpeech(prompt, voiceName, model, { userId });
 		} catch (error) {
 			if (!shouldRetryWithNeutralPrompt(error)) {
 				throw error;
 			}
 
+			if (
+				!(await this.prisma.audioStory.findFirst({
+					where: { id: storyId, status: 'SINGLE_PROCESSING', analysisAttemptId: attemptId },
+					select: { id: true }
+				}))
+			)
+				throw new Error('Generation cancelled');
 			console.warn('Single Voice: Safety error. Retrying with neutral prompt.');
 
 			const fallbackPrompt = buildStylePrompt({
@@ -296,20 +372,55 @@ export class SingleVoiceService {
 				neutralFallback: true
 			});
 
-			return this.tts.generateSpeech(fallbackPrompt, voiceName, model);
+			return this.tts.generateSpeech(fallbackPrompt, voiceName, model, { userId });
 		}
 	}
 
-	private async run(storyId: number, segments: SpeechSegment[], voiceName: string, model: string, style?: string) {
+	private async run(
+		storyId: number,
+		segments: SpeechSegment[],
+		voiceName: string,
+		model: string,
+		style: string | undefined,
+		attemptId: string,
+		userId: number
+	) {
 		try {
 			const parts: Buffer[] = [];
 
 			for (const segment of segments) {
-				const wav = await this.generateSegment(segment, voiceName, model, style);
+				let wav: Buffer;
+				for (;;) {
+					const owner = await this.prisma.audioStory.findFirst({
+						where: { id: storyId, status: 'SINGLE_PROCESSING', analysisAttemptId: attemptId },
+						select: { id: true }
+					});
+					if (!owner) return;
+					try {
+						wav = await this.generateSegment(segment, voiceName, model, userId, style, storyId, attemptId);
+						break;
+					} catch (error) {
+						if (!(error instanceof AiCapacityError)) throw error;
+						// Keep completed chunks while the shared provider budget is busy.
+						await new Promise(resolve =>
+							setTimeout(
+								resolve,
+								Math.min(30_000, Math.max(100, error.nextRetryAt.getTime() - Date.now()))
+							)
+						);
+					}
+				}
 
 				parts.push(wav);
 			}
 
+			if (
+				!(await this.prisma.audioStory.findFirst({
+					where: { id: storyId, status: 'SINGLE_PROCESSING', analysisAttemptId: attemptId },
+					select: { id: true }
+				}))
+			)
+				return;
 			const wav = parts.length === 1 ? parts[0] : mergeWavBuffers(parts, 180);
 
 			const filename = `${randomUUID()}.wav`;
@@ -323,42 +434,57 @@ export class SingleVoiceService {
 			const byteRate = wav.readUInt32LE(28);
 			const dataSize = wav.readUInt32LE(40);
 
-			await this.prisma.audioAsset.create({
-				data: {
-					storyId,
-					type: 'SINGLE_VOICE',
-					filePath: filePath,
-					mimeType: 'audio/wav',
-					format: 'wav',
-					fileSizeBytes: BigInt(wav.length),
-					durationMs: byteRate ? Math.round((dataSize / byteRate) * 1000) : null
-				}
-			});
-
-			await this.prisma.audioStory.update({
-				where: {
-					id: storyId
-				},
-				data: {
-					status: 'SINGLE_COMPLETED'
-				}
+			await withStoryLock(this.prisma, storyId, async tx => {
+				const story = await tx.audioStory.findFirst({
+					where: { id: storyId, status: 'SINGLE_PROCESSING', analysisAttemptId: attemptId }
+				});
+				if (!story) return;
+				const config = story.analysisResult as { voiceId: number; style?: string };
+				await tx.audioAsset.create({
+					data: {
+						storyId,
+						type: 'SINGLE_VOICE',
+						filePath,
+						mimeType: 'audio/wav',
+						format: 'wav',
+						fileSizeBytes: BigInt(wav.length),
+						durationMs: byteRate ? Math.round((dataSize / byteRate) * 1000) : null
+					}
+				});
+				await tx.audioStory.update({
+					where: { id: storyId },
+					data: {
+						status: 'SINGLE_COMPLETED',
+						analysisError: null,
+						analysisAttemptId: null,
+						analysisResult: {
+							...config,
+							completedRevision: this.revision(story.content, config.voiceId, config.style)
+						}
+					}
+				});
 			});
 		} catch (error) {
 			// Keep the previously completed asset accessible
 			// when regeneration fails.
 			await this.prisma.audioStory
-				.update({
-					where: {
-						id: storyId
-					},
+				.updateMany({
+					where: { id: storyId, status: 'SINGLE_PROCESSING', analysisAttemptId: attemptId },
 					data: {
-						status: 'SINGLE_FAILED'
+						status: 'SINGLE_FAILED',
+						analysisError: safeAiError(error)
 					}
 				})
 				.catch(() => undefined);
 
 			console.error(`Single Voice generation failed for story ${storyId}`, error);
 		}
+	}
+
+	private revision(content: string, voiceId: number, style?: string | null) {
+		return createHash('sha256')
+			.update(JSON.stringify([content, voiceId, style ?? null]))
+			.digest('hex');
 	}
 
 	async file(storyId: number, audioId: number, userId: number) {
