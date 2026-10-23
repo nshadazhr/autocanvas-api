@@ -1,3 +1,4 @@
+import { AiUsageModule } from '../ai/usage/ai-usage.module.js';
 import { Module } from '@nestjs/common';
 import { GeminiTtsService } from './providers/gemini-tts.service.js';
 import { PrismaService } from '../prisma/prisma.service.js';
@@ -9,7 +10,7 @@ import { SingleVoiceController } from './single-voice.controller.js';
 import { StorageModule } from '../storage/storage.module.js';
 
 @Module({
-	imports: [StorageModule],
+	imports: [AiUsageModule, StorageModule],
 	controllers: [AudioGenerationController, SingleVoiceController],
 	providers: [GeminiTtsService, GeminiKeyManagerService, audioGenerationService, SingleVoiceService, PrismaService]
 })

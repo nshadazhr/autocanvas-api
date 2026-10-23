@@ -1,4 +1,16 @@
-import { Body, Controller, Delete, Get, Param, ParseIntPipe, Patch, Post, Req, UseGuards } from '@nestjs/common';
+import {
+	Body,
+	Controller,
+	Delete,
+	Get,
+	Param,
+	ParseIntPipe,
+	Patch,
+	Post,
+	Req,
+	UseGuards,
+	HttpCode
+} from '@nestjs/common';
 import { AuthGuard } from '../auth/auth.guard.js';
 import { AudioStoriesService } from './audio-stories.service.js';
 import { CreateAudioStoryDto } from './dto/create-audio-story.dto.js';
@@ -36,8 +48,23 @@ export class AudioStoriesController {
 	}
 
 	@Post(':id/analyze')
+	@HttpCode(202)
 	analyze(@Param('id', ParseIntPipe) id: number, @Req() req: AuthenticatedRequest) {
 		return this.audioStoriesService.analyze(id, req.user.id);
+	}
+
+	@Get(':id/analysis-jobs/latest')
+	latestAnalysis(@Param('id', ParseIntPipe) id: number, @Req() req: AuthenticatedRequest) {
+		return this.audioStoriesService.getLatestAnalysisJob(id, req.user.id);
+	}
+
+	@Post(':id/analysis-jobs/:jobId/cancel')
+	cancelAnalysis(
+		@Param('id', ParseIntPipe) id: number,
+		@Param('jobId') jobId: string,
+		@Req() req: AuthenticatedRequest
+	) {
+		return this.audioStoriesService.cancelAnalysis(id, req.user.id, jobId);
 	}
 
 	@Patch(':id/cast')

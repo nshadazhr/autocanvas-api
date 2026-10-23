@@ -1,3 +1,6 @@
+import { sceneDownloadFilename } from './utils/scene-download-filename.js';
+import { safeAiError } from '../ai/usage/safe-ai-error.js';
+import { AiCapacityError } from '../ai/usage/ai-capacity.error.js';
 import { Injectable, BadRequestException, NotFoundException } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service.js';
 import { GeminiTtsService } from './providers/gemini-tts.service.js';
@@ -16,6 +19,8 @@ import { buildStylePrompt } from './providers/gemini-tts-prompt.builder.js';
 import { classifyGeminiTtsError, shouldRetryWithNeutralPrompt } from './utils/gemini-tts-error.util.js';
 import { StorageService } from '../storage/storage.service.js';
 import { Readable } from 'node:stream';
+import { assertNoActiveJob, withStoryLock } from './utils/audio-story-lock.js';
+import { isCurrentSceneAudio, sceneAudioRevision } from './utils/scene-audio-revision.js';
 @Injectable()
 export class audioGenerationService implements OnModuleInit, OnModuleDestroy {
 	constructor(
@@ -80,19 +85,27 @@ export class audioGenerationService implements OnModuleInit, OnModuleDestroy {
 		};
 	}
 
-	async generateSpeech(text: string, voiceName: string, model: string): Promise<Buffer> {
-		return this.geminiTtsService.generateSpeech(text, voiceName, model);
-	}
-
 	async generateSceneAudio(
 		sceneId: number,
 		textSnapshot?: string,
 		voiceIdSnapshot?: number | null,
-		settingsSnapshot?: unknown
+		settingsSnapshot?: unknown,
+		jobItemId?: number,
+		owner?: { jobId: number; startedAt: Date }
 	) {
+		if (jobItemId) {
+			const existing = await this.prisma.sceneAudio.findUnique({ where: { jobItemId } });
+			if (existing)
+				return {
+					id: existing.id,
+					sceneId: existing.sceneId,
+					filePath: existing.filePath,
+					durationMs: existing.durationMs
+				};
+		}
 		const scene = await this.prisma.audioScene.findUnique({
 			where: { id: sceneId },
-			include: { character: true }
+			include: { character: true, story: { select: { userId: true } } }
 		});
 
 		if (!scene) {
@@ -152,15 +165,26 @@ export class audioGenerationService implements OnModuleInit, OnModuleDestroy {
 			languageLabel: scene.language
 		};
 
+		const assertOwner = async () => {
+			if (
+				owner &&
+				!(await this.prisma.audioGenerationJob.findFirst({
+					where: { id: owner.jobId, status: 'PROCESSING', started_at: owner.startedAt },
+					select: { id: true }
+				}))
+			)
+				throw new Error('Generation ownership expired');
+		};
 		const prompt = buildStylePrompt(promptOptions);
-
-		console.log('GEMINI FINAL PROMPT:\n', prompt);
 
 		let wavBuffer: Buffer;
 
 		try {
 			// First attempt: original style and emotion
-			wavBuffer = await this.geminiTtsService.generateSpeech(prompt, mapping.providerVoiceId, mapping.model);
+			await assertOwner();
+			wavBuffer = await this.geminiTtsService.generateSpeech(prompt, mapping.providerVoiceId, mapping.model, {
+				userId: scene.story.userId
+			});
 		} catch (error) {
 			const errorType = classifyGeminiTtsError(error);
 
@@ -170,6 +194,7 @@ export class audioGenerationService implements OnModuleInit, OnModuleDestroy {
 
 			console.warn(`Scene ${sceneId}: Gemini TTS ${errorType}. Retrying with neutral prompt.`);
 
+			await assertOwner();
 			const fallbackPrompt = buildStylePrompt({
 				...promptOptions,
 				neutralFallback: true
@@ -178,12 +203,14 @@ export class audioGenerationService implements OnModuleInit, OnModuleDestroy {
 			wavBuffer = await this.geminiTtsService.generateSpeech(
 				fallbackPrompt,
 				mapping.providerVoiceId,
-				mapping.model
+				mapping.model,
+				{ userId: scene.story.userId }
 			);
 
 			console.log(`Scene ${sceneId}: Neutral fallback succeeded.`);
 		}
 
+		await assertOwner();
 		const filename = `${scene.id}-${randomUUID()}.wav`;
 
 		const storageKey = `audio-stories/${scene.storyId}/${filename}`;
@@ -194,21 +221,33 @@ export class audioGenerationService implements OnModuleInit, OnModuleDestroy {
 			contentType: 'audio/wav'
 		});
 
-		const audio = await this.prisma.sceneAudio.create({
-			data: {
-				sceneId: scene.id,
-				voiceId: voice.id,
-				provider: mapping.provider,
-				providerVoiceId: mapping.providerVoiceId,
-				model: mapping.model,
-				textSnapshot: generationText,
-				settingsSnapshot: mapping.settings ?? undefined,
-				filePath: filePath,
-				format: 'wav',
-				mimeType: 'audio/wav',
-				fileSizeBytes: BigInt(wavBuffer.length),
-				durationMs: Math.round(((wavBuffer.length - 44) / (24000 * 2)) * 1000)
-			}
+		const audio = await this.prisma.$transaction(async tx => {
+			if (owner) await tx.$queryRaw`SELECT id FROM "AudioGenerationJob" WHERE id = ${owner.jobId} FOR UPDATE`;
+			if (
+				owner &&
+				!(await tx.audioGenerationJob.findFirst({
+					where: { id: owner.jobId, status: 'PROCESSING', started_at: owner.startedAt },
+					select: { id: true }
+				}))
+			)
+				throw new Error('Generation ownership expired');
+			return tx.sceneAudio.create({
+				data: {
+					sceneId: scene.id,
+					jobItemId,
+					voiceId: voice.id,
+					provider: mapping.provider,
+					providerVoiceId: mapping.providerVoiceId,
+					model: mapping.model,
+					textSnapshot: generationText,
+					settingsSnapshot: { revision: sceneAudioRevision(scene, { id: voice.id, ...mapping }) },
+					filePath: filePath,
+					format: 'wav',
+					mimeType: 'audio/wav',
+					fileSizeBytes: BigInt(wavBuffer.length),
+					durationMs: Math.round(((wavBuffer.length - 44) / (24000 * 2)) * 1000)
+				}
+			});
 		});
 
 		return {
@@ -219,135 +258,130 @@ export class audioGenerationService implements OnModuleInit, OnModuleDestroy {
 		};
 	}
 
-	async createGenerationJob(storyId: number, userId: number) {
-		const story = await this.prisma.audioStory.findFirst({
-			where: {
-				id: storyId,
-				userId
-			},
-			include: {
-				scenes: {
-					orderBy: { sceneOrder: 'asc' },
-					include: {
-						character: { include: { voice: true } },
-						voiceOverride: true
-					}
-				}
-			}
-		});
-
-		if (!story) {
-			throw new NotFoundException('Audio story not found');
+	private validateSceneVoice(scene: {
+		text: string;
+		voiceOverride?: { isActive: boolean; provider: string; providerVoiceId: string; model: string } | null;
+		character?: {
+			voice?: { isActive: boolean; provider: string; providerVoiceId: string; model: string } | null;
+		} | null;
+	}) {
+		const voice = scene.voiceOverride ?? scene.character?.voice;
+		if (!scene.text.trim()) throw new BadRequestException('Scene text is empty');
+		if (
+			!voice?.isActive ||
+			!['GOOGLE', 'GEMINI'].includes(voice.provider.trim().toUpperCase()) ||
+			!voice.providerVoiceId ||
+			!voice.model
+		) {
+			throw new BadRequestException('Assign an active, supported voice to every scene before generating audio');
 		}
-
-		if (story.scenes.length === 0) {
-			throw new BadRequestException('Story has no scenes');
-		}
-
-		const job = await this.prisma.audioGenerationJob.create({
-			data: {
-				storyId,
-				userId,
-				totalScenes: story.scenes.length,
-				items: {
-					create: story.scenes.map(scene => ({
-						textSnapshot: scene.text,
-						voiceIdSnapshot: scene.voiceOverrideId ?? scene.character?.voiceId ?? null,
-						settingsSnapshot: (() => {
-							const mapping = scene.voiceOverride ?? scene.character?.voice;
-
-							if (!mapping) return undefined;
-
-							return {
-								provider: mapping.provider,
-								providerVoiceId: mapping.providerVoiceId,
-								model: mapping.model,
-								settings: null
-							};
-						})(),
-
-						scene: {
-							connect: {
-								id_storyId: {
-									id: scene.id,
-									storyId
-								}
-							}
-						}
-					}))
-				}
-			},
-			include: {
-				items: true
-			}
-		});
-
-		return {
-			id: job.id,
-			storyId: job.storyId,
-			status: job.status,
-			totalScenes: job.totalScenes,
-			completedScenes: job.completedScenes,
-			failedScenes: job.failedScenes
-		};
 	}
 
-	async createSingleSceneJob(storyId: number, sceneId: number, userId: number) {
-		const story = await this.prisma.audioStory.findFirst({
-			where: {
-				id: storyId,
-				userId
-			},
-			select: {
-				id: true,
-				scenes: {
-					where: { id: sceneId },
-					select: {
-						id: true,
-						text: true,
-						voiceOverrideId: true,
-						character: {
-							select: {
-								voiceId: true,
-								voice: true
-							}
-						},
-						voiceOverride: true
+	async cancelGenerationJob(jobId: number, userId: number) {
+		const owned = await this.prisma.audioGenerationJob.findFirst({
+			where: { id: jobId, userId },
+			select: { storyId: true }
+		});
+		if (!owned) throw new NotFoundException('Audio generation job not found');
+		await withStoryLock(this.prisma, owned.storyId, async tx => {
+			await tx.$queryRaw`SELECT id FROM "AudioGenerationJob" WHERE id = ${jobId} FOR UPDATE`;
+			const job = await tx.audioGenerationJob.findFirst({ where: { id: jobId, userId } });
+			if (!job || !['PENDING', 'PROCESSING', 'WAITING'].includes(job.status)) return;
+			const items = await tx.audioGenerationJobItem.findMany({ where: { jobId }, include: { audio: true } });
+			// A scene whose audio committed just before cancellation remains completed.
+			for (const item of items) {
+				if (!['PENDING', 'PROCESSING', 'WAITING'].includes(item.status)) continue;
+				await tx.audioGenerationJobItem.update({
+					where: { id: item.id },
+					data: {
+						status: item.audio ? 'COMPLETED' : 'CANCELLED',
+						error: null,
+						nextRetryAt: null,
+						completed_at: new Date()
+					}
+				});
+			}
+			const completedScenes = await tx.audioGenerationJobItem.count({ where: { jobId, status: 'COMPLETED' } });
+			const failedScenes = await tx.audioGenerationJobItem.count({ where: { jobId, status: 'FAILED' } });
+			await tx.audioGenerationJob.update({
+				where: { id: jobId },
+				data: { status: 'CANCELLED', completedScenes, failedScenes, completed_at: new Date() }
+			});
+		});
+		return this.getGenerationJob(jobId, userId);
+	}
+
+	async getLatestStoryJob(storyId: number, userId: number) {
+		const story = await this.prisma.audioStory.findFirst({ where: { id: storyId, userId }, select: { id: true } });
+		if (!story) throw new NotFoundException('Audio story not found');
+		const active = await this.prisma.audioGenerationJob.findFirst({
+			where: { storyId, userId, status: { in: ['PENDING', 'PROCESSING', 'WAITING'] } },
+			orderBy: { id: 'desc' }
+		});
+		const latest =
+			active ??
+			(await this.prisma.audioGenerationJob.findFirst({ where: { storyId, userId }, orderBy: { id: 'desc' } }));
+		return latest ? this.getGenerationJob(latest.id, userId) : null;
+	}
+
+	async createGenerationJob(storyId: number, userId: number) {
+		return withStoryLock(this.prisma, storyId, async tx => {
+			const story = await tx.audioStory.findFirst({
+				where: {
+					id: storyId,
+					userId
+				},
+				include: {
+					scenes: {
+						where: { sceneOrder: { gt: 0 } },
+						orderBy: { sceneOrder: 'asc' },
+						include: {
+							character: { include: { voice: true } },
+							voiceOverride: true
+						}
 					}
 				}
+			});
+
+			if (!story) {
+				throw new NotFoundException('Audio story not found');
 			}
-		});
 
-		if (!story || story.scenes.length === 0) {
-			throw new NotFoundException('Scene not found');
-		}
+			await assertNoActiveJob(tx, storyId);
+			if (
+				story.status.startsWith('SINGLE_') ||
+				story.analysisStatus !== 'COMPLETED' ||
+				!(story.analysisResult as { validation?: { valid?: boolean } } | null)?.validation?.valid
+			)
+				throw new BadRequestException('Complete story analysis before generating audio');
+			for (const scene of story.scenes) this.validateSceneVoice(scene);
 
-		const scene = story.scenes[0];
+			if (story.scenes.length === 0) {
+				throw new BadRequestException('Story has no scenes');
+			}
 
-		const voiceId = scene.voiceOverrideId ?? scene.character?.voiceId ?? null;
-
-		const mapping = scene.voiceOverride ?? scene.character?.voice;
-
-		const job = await this.prisma.audioGenerationJob.create({
-			data: {
-				storyId,
-				userId,
-				totalScenes: 1,
-				items: {
-					create: [
-						{
+			const job = await tx.audioGenerationJob.create({
+				data: {
+					storyId,
+					userId,
+					totalScenes: story.scenes.length,
+					items: {
+						create: story.scenes.map(scene => ({
 							textSnapshot: scene.text,
-							voiceIdSnapshot: voiceId,
-							...(mapping
-								? {
-										settingsSnapshot: {
-											provider: mapping.provider,
-											providerVoiceId: mapping.providerVoiceId,
-											model: mapping.model,
-											settings: null
-										}
-									}
-								: {}),
+							voiceIdSnapshot: scene.voiceOverrideId ?? scene.character?.voiceId ?? null,
+							settingsSnapshot: (() => {
+								const mapping = scene.voiceOverride ?? scene.character?.voice;
+
+								if (!mapping) return undefined;
+
+								return {
+									provider: mapping.provider,
+									providerVoiceId: mapping.providerVoiceId,
+									model: mapping.model,
+									settings: null
+								};
+							})(),
+
 							scene: {
 								connect: {
 									id_storyId: {
@@ -356,23 +390,120 @@ export class audioGenerationService implements OnModuleInit, OnModuleDestroy {
 									}
 								}
 							}
-						}
-					]
+						}))
+					}
+				},
+				include: {
+					items: true
 				}
-			}
-		});
+			});
 
-		return {
-			id: job.id,
-			storyId: job.storyId,
-			status: job.status,
-			totalScenes: job.totalScenes,
-			completedScenes: job.completedScenes,
-			failedScenes: job.failedScenes
-		};
+			return {
+				id: job.id,
+				storyId: job.storyId,
+				status: job.status,
+				totalScenes: job.totalScenes,
+				completedScenes: job.completedScenes,
+				failedScenes: job.failedScenes
+			};
+		});
+	}
+
+	async createSingleSceneJob(storyId: number, sceneId: number, userId: number) {
+		return withStoryLock(this.prisma, storyId, async tx => {
+			const story = await tx.audioStory.findFirst({
+				where: {
+					id: storyId,
+					userId
+				},
+				select: {
+					id: true,
+					analysisStatus: true,
+					status: true,
+					scenes: {
+						where: { id: sceneId, sceneOrder: { gt: 0 } },
+						select: {
+							id: true,
+							text: true,
+							voiceOverrideId: true,
+							character: {
+								select: {
+									voiceId: true,
+									voice: true
+								}
+							},
+							voiceOverride: true
+						}
+					}
+				}
+			});
+
+			if (!story || story.scenes.length === 0) {
+				throw new NotFoundException('Scene not found');
+			}
+
+			await assertNoActiveJob(tx, storyId);
+			if (story.status.startsWith('SINGLE_') || story.analysisStatus !== 'COMPLETED')
+				throw new BadRequestException('Complete story analysis before generating audio');
+			const scene = story.scenes[0];
+			this.validateSceneVoice(scene);
+
+			const voiceId = scene.voiceOverrideId ?? scene.character?.voiceId ?? null;
+
+			const mapping = scene.voiceOverride ?? scene.character?.voice;
+
+			const job = await tx.audioGenerationJob.create({
+				data: {
+					storyId,
+					userId,
+					totalScenes: 1,
+					items: {
+						create: [
+							{
+								textSnapshot: scene.text,
+								voiceIdSnapshot: voiceId,
+								...(mapping
+									? {
+											settingsSnapshot: {
+												provider: mapping.provider,
+												providerVoiceId: mapping.providerVoiceId,
+												model: mapping.model,
+												settings: null
+											}
+										}
+									: {}),
+								scene: {
+									connect: {
+										id_storyId: {
+											id: scene.id,
+											storyId
+										}
+									}
+								}
+							}
+						]
+					}
+				}
+			});
+
+			return {
+				id: job.id,
+				storyId: job.storyId,
+				status: job.status,
+				totalScenes: job.totalScenes,
+				completedScenes: job.completedScenes,
+				failedScenes: job.failedScenes
+			};
+		});
 	}
 
 	async processGenerationJob(jobId: number) {
+		const startedAt = new Date();
+		const ownsJob = async () =>
+			!!(await this.prisma.audioGenerationJob.findFirst({
+				where: { id: jobId, status: 'PROCESSING', started_at: startedAt },
+				select: { id: true }
+			}));
 		const claimed = await this.prisma.audioGenerationJob.updateMany({
 			where: {
 				id: jobId,
@@ -380,7 +511,7 @@ export class audioGenerationService implements OnModuleInit, OnModuleDestroy {
 			},
 			data: {
 				status: 'PROCESSING',
-				started_at: new Date(),
+				started_at: startedAt,
 				completed_at: null
 			}
 		});
@@ -389,133 +520,170 @@ export class audioGenerationService implements OnModuleInit, OnModuleDestroy {
 			return;
 		}
 
-		const job = await this.prisma.audioGenerationJob.findUnique({
-			where: { id: jobId },
-			include: {
-				items: { orderBy: { id: 'asc' } }
-			}
-		});
-
-		if (!job) {
-			throw new NotFoundException('Audio generation job not found');
-		}
-
-		for (const item of job.items) {
-			if (item.status === 'COMPLETED' || item.status === 'FAILED') {
-				continue;
-			}
-
-			if (item.status === 'WAITING') {
-				const now = new Date();
-
-				if (!item.nextRetryAt || item.nextRetryAt > now) {
-					await this.updateJobProgress(jobId);
-
-					await this.prisma.audioGenerationJob.update({
-						where: { id: jobId },
-						data: { status: 'WAITING' }
-					});
-
-					return;
-				}
-			}
-
-			const itemClaim = await this.prisma.audioGenerationJobItem.updateMany({
-				where: {
-					id: item.id,
-					status: { in: ['PENDING', 'WAITING'] }
-				},
-				data: {
-					status: 'PROCESSING',
-					attempts: { increment: 1 },
-					started_at: new Date(),
-					nextRetryAt: null,
-					completed_at: null
+		const heartbeat = setInterval(() => {
+			void this.prisma.audioGenerationJob
+				.updateMany({
+					where: { id: jobId, status: 'PROCESSING', started_at: startedAt },
+					data: { updated_at: new Date() }
+				})
+				.catch(error => console.error('Audio job heartbeat failed', error));
+		}, 30_000);
+		heartbeat.unref();
+		try {
+			const job = await this.prisma.audioGenerationJob.findUnique({
+				where: { id: jobId, status: 'PROCESSING', started_at: startedAt },
+				include: {
+					items: { orderBy: { id: 'asc' } }
 				}
 			});
 
-			if (itemClaim.count !== 1) {
-				continue;
+			if (!job) {
+				throw new NotFoundException('Audio generation job not found');
 			}
 
-			try {
-				const audio = await this.generateSceneAudio(
-					item.sceneId,
-					item.textSnapshot ?? undefined,
-					item.voiceIdSnapshot,
-					item.settingsSnapshot
-				);
-				await this.prisma.audioGenerationJobItem.update({
-					where: { id: item.id },
-					data: {
-						status: 'COMPLETED',
-						error: null,
-						nextRetryAt: null,
-						completed_at: new Date(),
-						audio: {
-							connect: { id: audio.id }
-						}
-					}
-				});
-			} catch (error: unknown) {
-				if (error instanceof GeminiKeysUnavailableError) {
-					const nextRetryAt = error.nextRetryAt;
-
-					if (!nextRetryAt) {
-						throw new Error('Gemini keys unavailable without a retry time');
-					}
-
-					// Avoid immediate retry loops.
-					const safeRetryAt = new Date(Math.max(nextRetryAt.getTime(), Date.now() + 1000));
-
-					await this.prisma.audioGenerationJobItem.update({
-						where: { id: item.id },
-						data: {
-							status: 'WAITING',
-							error: error.message,
-							lastErrorAt: new Date(),
-							nextRetryAt: safeRetryAt,
-							attempts: { decrement: 1 }
-						}
-					});
-
-					await this.updateJobProgress(jobId);
-
-					await this.prisma.audioGenerationJob.update({
-						where: { id: jobId },
-						data: { status: 'WAITING' }
-					});
-
-					return;
+			for (const item of job.items) {
+				if (!(await ownsJob())) return;
+				if (item.status === 'COMPLETED' || item.status === 'FAILED') {
+					continue;
 				}
 
-				await this.prisma.audioGenerationJobItem.update({
-					where: { id: item.id },
+				if (item.status === 'WAITING') {
+					const now = new Date();
+
+					if (!item.nextRetryAt || item.nextRetryAt > now) {
+						await this.updateJobProgress(jobId);
+
+						await this.prisma.audioGenerationJob.updateMany({
+							where: { id: jobId, status: 'PROCESSING', started_at: startedAt },
+							data: { status: 'WAITING' }
+						});
+
+						return;
+					}
+				}
+
+				const itemClaim = await this.prisma.audioGenerationJobItem.updateMany({
+					where: {
+						id: item.id,
+						job: { id: jobId, status: 'PROCESSING', started_at: startedAt },
+						status: { in: ['PENDING', 'WAITING'] }
+					},
 					data: {
-						status: 'FAILED',
-						error: error instanceof Error ? error.message : 'Unknown audio generation error',
-						lastErrorAt: new Date(),
-						completed_at: new Date()
+						status: 'PROCESSING',
+						attempts: { increment: 1 },
+						started_at: new Date(),
+						nextRetryAt: null,
+						completed_at: null
 					}
 				});
+
+				if (itemClaim.count !== 1) {
+					continue;
+				}
+
+				try {
+					const audio = await this.generateSceneAudio(
+						item.sceneId,
+						item.textSnapshot ?? undefined,
+						item.voiceIdSnapshot,
+						item.settingsSnapshot,
+						item.id,
+						{ jobId, startedAt }
+					);
+					if (!(await ownsJob())) return;
+					await this.prisma.audioGenerationJobItem.updateMany({
+						where: { id: item.id, job: { id: jobId, status: 'PROCESSING', started_at: startedAt } },
+						data: {
+							status: 'COMPLETED',
+							error: null,
+							nextRetryAt: null,
+							completed_at: new Date()
+						}
+					});
+				} catch (error: unknown) {
+					if (!(await ownsJob())) return;
+					if (error instanceof GeminiKeysUnavailableError || error instanceof AiCapacityError) {
+						const nextRetryAt = error.nextRetryAt;
+
+						if (!nextRetryAt) {
+							throw new Error('Gemini keys unavailable without a retry time');
+						}
+
+						// Avoid immediate retry loops.
+						const safeRetryAt = new Date(Math.max(nextRetryAt.getTime(), Date.now() + 1000));
+
+						await this.prisma.audioGenerationJobItem.updateMany({
+							where: { id: item.id, job: { id: jobId, status: 'PROCESSING', started_at: startedAt } },
+							data: {
+								status: 'WAITING',
+								error: safeAiError(error),
+								lastErrorAt: new Date(),
+								nextRetryAt: safeRetryAt,
+								attempts: { decrement: 1 }
+							}
+						});
+
+						await this.updateJobProgress(jobId);
+
+						await this.prisma.audioGenerationJob.updateMany({
+							where: { id: jobId, status: 'PROCESSING', started_at: startedAt },
+							data: { status: 'WAITING' }
+						});
+
+						return;
+					}
+
+					const transient =
+						['NETWORK', 'NO_AUDIO'].includes(classifyGeminiTtsError(error)) ||
+						/\b(?:500|502|503|504)\b/.test(error instanceof Error ? error.message : '');
+					if (transient && item.attempts + 1 < this.maxRecoveryAttempts) {
+						await this.prisma.audioGenerationJobItem.updateMany({
+							where: { id: item.id, job: { id: jobId, status: 'PROCESSING', started_at: startedAt } },
+							data: {
+								status: 'WAITING',
+								error: safeAiError(error),
+								lastErrorAt: new Date(),
+								nextRetryAt: new Date(Date.now() + this.recoveryRetryDelayMs * 2 ** item.attempts)
+							}
+						});
+						await this.updateJobProgress(jobId);
+						await this.prisma.audioGenerationJob.updateMany({
+							where: { id: jobId, status: 'PROCESSING', started_at: startedAt },
+							data: { status: 'WAITING' }
+						});
+						return;
+					}
+
+					await this.prisma.audioGenerationJobItem.updateMany({
+						where: { id: item.id, job: { id: jobId, status: 'PROCESSING', started_at: startedAt } },
+						data: {
+							status: 'FAILED',
+							error: safeAiError(error),
+							lastErrorAt: new Date(),
+							completed_at: new Date()
+						}
+					});
+				}
+
+				await this.updateJobProgress(jobId);
 			}
 
-			await this.updateJobProgress(jobId);
+			const progress = await this.updateJobProgress(jobId);
+
+			const finalStatus = progress.failed === 0 ? 'COMPLETED' : progress.completed === 0 ? 'FAILED' : 'PARTIAL';
+
+			return this.prisma.audioGenerationJob.updateMany({
+				where: { id: jobId, status: 'PROCESSING', started_at: startedAt },
+				data: {
+					status: finalStatus,
+					completedScenes: progress.completed,
+					failedScenes: progress.failed,
+					completed_at: new Date()
+				}
+			});
+		} finally {
+			clearInterval(heartbeat);
 		}
-
-		const progress = await this.updateJobProgress(jobId);
-
-		const finalStatus = progress.failed === 0 ? 'COMPLETED' : progress.completed === 0 ? 'FAILED' : 'PARTIAL';
-
-		return this.prisma.audioGenerationJob.update({
-			where: { id: jobId },
-			data: {
-				status: finalStatus,
-				completedScenes: progress.completed,
-				failedScenes: progress.failed,
-				completed_at: new Date()
-			}
-		});
 	}
 
 	async getGenerationJob(jobId: number, userId: number) {
@@ -564,63 +732,15 @@ export class audioGenerationService implements OnModuleInit, OnModuleDestroy {
 
 	startGenerationInBackground(jobId: number): void {
 		setImmediate(() => {
-			void this.processGenerationJob(jobId).catch(async (error: unknown) => {
-				console.error(`Audio generation job ${jobId} failed unexpectedly:`, error);
-
-				try {
-					await this.prisma.$transaction(async tx => {
-						const processingItems = await tx.audioGenerationJobItem.findMany({
-							where: {
-								jobId,
-								status: 'PROCESSING'
-							},
-							select: {
-								id: true,
-								attempts: true
-							}
-						});
-
-						for (const item of processingItems) {
-							const exhausted = item.attempts >= this.maxRecoveryAttempts;
-
-							await tx.audioGenerationJobItem.update({
-								where: { id: item.id },
-								data: exhausted
-									? {
-											status: 'FAILED',
-											error: 'Recovery retry limit exceeded',
-											nextRetryAt: null,
-											completed_at: new Date()
-										}
-									: {
-											status: 'WAITING',
-											error: 'Unexpected processing interruption',
-											nextRetryAt: new Date(Date.now() + this.recoveryRetryDelayMs)
-										}
-							});
-						}
-
-						await tx.audioGenerationJob.updateMany({
-							where: {
-								id: jobId,
-								status: 'PROCESSING'
-							},
-							data: {
-								status: 'WAITING'
-							}
-						});
-					});
-					await this.finalizeJobIfFinished(jobId);
-				} catch (recoveryError: unknown) {
-					console.error(`Failed to recover audio job ${jobId}:`, recoveryError);
-				}
+			void this.processGenerationJob(jobId).catch(error => {
+				console.error(`Audio generation job ${jobId} interrupted; stale-job recovery will retry it:`, error);
 			});
 		});
 	}
 
 	async recoverInterruptedJobs() {
 		const interruptedJobs = await this.prisma.audioGenerationJob.findMany({
-			where: { status: 'PROCESSING' },
+			where: { status: 'PROCESSING', updated_at: { lt: new Date(Date.now() - 5 * 60_000) } },
 			select: {
 				id: true,
 				items: {
@@ -635,6 +755,11 @@ export class audioGenerationService implements OnModuleInit, OnModuleDestroy {
 
 		for (const job of interruptedJobs) {
 			await this.prisma.$transaction(async tx => {
+				const claimed = await tx.audioGenerationJob.updateMany({
+					where: { id: job.id, status: 'PROCESSING', updated_at: { lt: new Date(Date.now() - 5 * 60_000) } },
+					data: { status: 'WAITING' }
+				});
+				if (claimed.count !== 1) return;
 				for (const item of job.items) {
 					const exhausted = item.attempts >= this.maxRecoveryAttempts;
 
@@ -737,51 +862,89 @@ export class audioGenerationService implements OnModuleInit, OnModuleDestroy {
 			throw new NotFoundException('Audio generation job not found');
 		}
 
-		if (!['FAILED', 'PARTIAL'].includes(job.status)) {
-			throw new BadRequestException('Only FAILED or PARTIAL jobs can be retried');
-		}
+		return withStoryLock(this.prisma, job.storyId, async tx => {
+			await assertNoActiveJob(tx, job.storyId);
+			const story = await tx.audioStory.findFirst({ where: { id: job.storyId, userId } });
+			if (story?.analysisStatus !== 'COMPLETED')
+				throw new BadRequestException('Complete story analysis before retrying');
+			if (!['FAILED', 'PARTIAL'].includes(job.status)) {
+				throw new BadRequestException('Only FAILED or PARTIAL jobs can be retried');
+			}
 
-		const failedItems = job.items.filter(item => item.status === 'FAILED');
+			const failedItems = job.items.filter(item => item.status === 'FAILED');
 
-		if (failedItems.length === 0) {
-			throw new BadRequestException('No failed scenes to retry');
-		}
+			if (failedItems.length === 0) {
+				throw new BadRequestException('No failed scenes to retry');
+			}
 
-		// Create a new job for failed scenes only.
-		// Keep the original job and its completed audio unchanged.
-		const retryJob = await this.prisma.audioGenerationJob.create({
-			data: {
-				storyId: job.storyId,
-				userId,
-				totalScenes: failedItems.length,
-				items: {
-					create: failedItems.map(item => ({
-						textSnapshot: item.textSnapshot,
-						voiceIdSnapshot: item.voiceIdSnapshot,
+			for (const item of failedItems) {
+				const scene = await tx.audioScene.findFirst({
+					where: { id: item.sceneId, storyId: job.storyId, sceneOrder: { gt: 0 } },
+					include: { character: { include: { voice: true } }, voiceOverride: true }
+				});
+				if (
+					!scene ||
+					scene.text !== item.textSnapshot ||
+					(scene.voiceOverrideId ?? scene.character?.voiceId) !== item.voiceIdSnapshot
+				)
+					throw new BadRequestException(
+						'Script or voice has changed. Generate new audio instead of retrying this job.'
+					);
+				this.validateSceneVoice(scene);
+				const mapping = scene.voiceOverride ?? scene.character?.voice;
+				const snapshot = item.settingsSnapshot as {
+					provider?: string;
+					providerVoiceId?: string;
+					model?: string;
+				} | null;
+				if (
+					snapshot &&
+					mapping &&
+					(snapshot.provider !== mapping.provider ||
+						snapshot.providerVoiceId !== mapping.providerVoiceId ||
+						snapshot.model !== mapping.model)
+				)
+					throw new BadRequestException(
+						'Voice settings have changed. Generate new audio instead of retrying this job.'
+					);
+			}
 
-						...(item.settingsSnapshot != null ? { settingsSnapshot: item.settingsSnapshot } : {}),
+			// Create a new job for failed scenes only.
+			// Keep the original job and its completed audio unchanged.
+			const retryJob = await tx.audioGenerationJob.create({
+				data: {
+					storyId: job.storyId,
+					userId,
+					totalScenes: failedItems.length,
+					items: {
+						create: failedItems.map(item => ({
+							textSnapshot: item.textSnapshot,
+							voiceIdSnapshot: item.voiceIdSnapshot,
 
-						scene: {
-							connect: {
-								id_storyId: {
-									id: item.sceneId,
-									storyId: job.storyId
+							...(item.settingsSnapshot != null ? { settingsSnapshot: item.settingsSnapshot } : {}),
+
+							scene: {
+								connect: {
+									id_storyId: {
+										id: item.sceneId,
+										storyId: job.storyId
+									}
 								}
 							}
-						}
-					}))
+						}))
+					}
 				}
-			}
-		});
+			});
 
-		return {
-			id: retryJob.id,
-			storyId: retryJob.storyId,
-			status: retryJob.status,
-			totalScenes: retryJob.totalScenes,
-			completedScenes: retryJob.completedScenes,
-			failedScenes: retryJob.failedScenes
-		};
+			return {
+				id: retryJob.id,
+				storyId: retryJob.storyId,
+				status: retryJob.status,
+				totalScenes: retryJob.totalScenes,
+				completedScenes: retryJob.completedScenes,
+				failedScenes: retryJob.failedScenes
+			};
+		});
 	}
 
 	async getAudioFile(audioId: number, userId: number) {
@@ -795,7 +958,8 @@ export class audioGenerationService implements OnModuleInit, OnModuleDestroy {
 			select: {
 				id: true,
 				filePath: true,
-				mimeType: true
+				mimeType: true,
+				scene: { select: { sceneOrder: true, title: true, text: true } }
 			}
 		});
 
@@ -806,7 +970,7 @@ export class audioGenerationService implements OnModuleInit, OnModuleDestroy {
 		return {
 			filePath: audio.filePath,
 			mimeType: audio.mimeType || 'audio/wav',
-			filename: `${audio.id}.wav`
+			filename: sceneDownloadFilename(audio.scene.sceneOrder, audio.scene.title, audio.scene.text)
 		};
 	}
 
@@ -819,7 +983,9 @@ export class audioGenerationService implements OnModuleInit, OnModuleDestroy {
 			select: {
 				id: true,
 				title: true,
+				analysisStatus: true,
 				scenes: {
+					where: { sceneOrder: { gt: 0 } },
 					orderBy: {
 						sceneOrder: 'asc'
 					},
@@ -829,12 +995,34 @@ export class audioGenerationService implements OnModuleInit, OnModuleDestroy {
 						title: true,
 						speakerName: true,
 						text: true,
+						style: true,
+						emotion: true,
+						language: true,
+						updated_at: true,
+						character: { include: { voice: true } },
+						voiceOverride: true,
+						jobItems: {
+							orderBy: { id: 'desc' },
+							take: 1,
+							select: {
+								id: true,
+								sceneId: true,
+								status: true,
+								attempts: true,
+								error: true,
+								nextRetryAt: true
+							}
+						},
 						audios: {
 							orderBy: [{ created_at: 'desc' }, { id: 'desc' }],
 							select: {
 								id: true,
 								sceneId: true,
 								voiceId: true,
+								provider: true,
+								providerVoiceId: true,
+								model: true,
+								settingsSnapshot: true,
 								format: true,
 								durationMs: true,
 								created_at: true,
@@ -856,47 +1044,43 @@ export class audioGenerationService implements OnModuleInit, OnModuleDestroy {
 			throw new NotFoundException('Audio story not found');
 		}
 
+		const currentScenes = (story.analysisStatus === 'COMPLETED' ? story.scenes : []).map(scene => ({
+			...scene,
+			audios: scene.audios.filter(audio =>
+				isCurrentSceneAudio(scene, scene.voiceOverride ?? scene.character?.voice ?? null, audio)
+			)
+		}));
+
 		return {
 			storyId: story.id,
 			title: story.title,
-			totalScenes: story.scenes.length,
-			generatedScenes: story.scenes.filter(scene => scene.audios.length > 0).length,
-			scenes: story.scenes.map(scene => ({
+			totalScenes: currentScenes.length,
+			generatedScenes: currentScenes.filter(scene => scene.audios.length > 0).length,
+			scenes: currentScenes.map(scene => ({
 				id: scene.id,
 				sceneOrder: scene.sceneOrder,
 				title: scene.title,
 				speakerName: scene.speakerName,
 				text: scene.text,
+				assignedVoice: (() => {
+					const voice = scene.voiceOverride ?? scene.character?.voice;
+					return voice ? { id: voice.id, name: voice.name } : null;
+				})(),
+				downloadFilename: sceneDownloadFilename(scene.sceneOrder, scene.title, scene.text),
 				latestAudio: scene.audios[0] ?? null,
+				lastGeneration: scene.jobItems[0] ?? null,
 				audioVersions: scene.audios
 			}))
 		};
 	}
 
 	async exportStoryWav(storyId: number, userId: number) {
-		const story = await this.prisma.audioStory.findFirst({
-			where: { id: storyId, userId },
-			select: {
-				id: true,
-				scenes: {
-					orderBy: { sceneOrder: 'asc' },
-					include: {
-						character: true
-					},
-					select: {
-						id: true,
-						audios: {
-							orderBy: [{ created_at: 'desc' }, { id: 'desc' }],
-							take: 1,
-							select: {
-								id: true,
-								filePath: true
-							}
-						}
-					}
-				}
-			}
-		});
+		const history = await this.getStoryAudioHistory(storyId, userId);
+		const story = {
+			...history,
+			id: history.storyId,
+			scenes: history.scenes.map(scene => ({ ...scene, audios: scene.latestAudio ? [scene.latestAudio] : [] }))
+		};
 
 		if (!story) {
 			throw new NotFoundException('Audio story not found');
@@ -1013,28 +1197,12 @@ export class audioGenerationService implements OnModuleInit, OnModuleDestroy {
 	}
 
 	async downloadStoryAudioZip(storyId: number, userId: number) {
-		const story = await this.prisma.audioStory.findFirst({
-			where: {
-				id: storyId,
-				userId
-			},
-			select: {
-				id: true,
-				scenes: {
-					orderBy: { sceneOrder: 'asc' },
-					select: {
-						id: true,
-						audios: {
-							orderBy: [{ created_at: 'desc' }, { id: 'desc' }],
-							take: 1,
-							select: {
-								id: true
-							}
-						}
-					}
-				}
-			}
-		});
+		const history = await this.getStoryAudioHistory(storyId, userId);
+		const story = {
+			...history,
+			id: history.storyId,
+			scenes: history.scenes.map(scene => ({ ...scene, audios: scene.latestAudio ? [scene.latestAudio] : [] }))
+		};
 
 		if (!story) {
 			throw new NotFoundException('Audio story not found');
@@ -1053,14 +1221,14 @@ export class audioGenerationService implements OnModuleInit, OnModuleDestroy {
 		// Verify ownership and file existence before ZIP streaming.
 		const files: { filePath: string; name: string }[] = [];
 
-		for (const [index, scene] of story.scenes.entries()) {
+		for (const scene of story.scenes) {
 			const audioFile = await this.getAudioFile(scene.audios[0].id, userId);
 
 			await this.storageService.getMetadata(audioFile.filePath);
 
 			files.push({
 				filePath: audioFile.filePath,
-				name: `scene-${String(index + 1).padStart(3, '0')}.wav`
+				name: scene.downloadFilename
 			});
 		}
 
@@ -1123,8 +1291,8 @@ export class audioGenerationService implements OnModuleInit, OnModuleDestroy {
 			})
 		]);
 
-		await this.prisma.audioGenerationJob.update({
-			where: { id: jobId },
+		await this.prisma.audioGenerationJob.updateMany({
+			where: { id: jobId, status: { not: 'CANCELLED' } },
 			data: {
 				completedScenes: completed,
 				failedScenes: failed
@@ -1142,6 +1310,12 @@ export class audioGenerationService implements OnModuleInit, OnModuleDestroy {
 		this.retryScanRunning = true;
 
 		try {
+			await this.recoverInterruptedJobs();
+			const pending = await this.prisma.audioGenerationJob.findMany({
+				where: { status: 'PENDING' },
+				select: { id: true }
+			});
+			for (const job of pending) this.startGenerationInBackground(job.id);
 			const now = new Date();
 
 			const jobs = await this.prisma.audioGenerationJob.findMany({

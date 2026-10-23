@@ -42,7 +42,7 @@ export class GeminiKeyManagerService {
 		const today = this.getPacificDate();
 
 		this.keys = [...new Set(configuredKeys)].map(apiKey => ({
-			client: new GoogleGenAI({ apiKey }),
+			client: new GoogleGenAI({ apiKey, httpOptions: { timeout: 90_000 } }),
 			cooldownUntil: 0,
 			disabled: false,
 			requestTimes: [],

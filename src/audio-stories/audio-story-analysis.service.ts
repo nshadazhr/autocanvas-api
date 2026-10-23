@@ -4,7 +4,7 @@ import { AiService } from '../ai/ai.service.js';
 export class AudioStoryAnalysisService {
 	constructor(private readonly aiService: AiService) {}
 
-	async analyze(content: string) {
-		return this.aiService.analyzeStory(content);
+	async analyze(content: string, userId: number) {
+		return this.aiService.analyzeStory(content, userId);
 	}
 }

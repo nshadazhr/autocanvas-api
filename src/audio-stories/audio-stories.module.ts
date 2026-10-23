@@ -1,3 +1,4 @@
+import { AiUsageModule } from '../ai/usage/ai-usage.module.js';
 import { Module } from '@nestjs/common';
 import { AiModule } from '../ai/ai.module.js';
 import { AudioStoriesController } from './audio-stories.controller.js';
@@ -8,7 +9,7 @@ import { StoryParserService } from './services/story-parser.service.js';
 import { StoryAnalysisValidatorService } from './services/story-analysis-validator.service.js';
 
 @Module({
-	imports: [AiModule],
+	imports: [AiUsageModule, AiModule],
 	controllers: [AudioStoriesController],
 	providers: [
 		AudioStoriesService,

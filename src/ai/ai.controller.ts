@@ -9,14 +9,14 @@ export class AiController {
 	constructor(private readonly aiService: AiService) {}
 
 	@Get('test')
-	async testGemini() {
+	async testGemini(@Req() req: AuthenticatedRequest) {
 		return {
-			message: await this.aiService.testGemini()
+			message: await this.aiService.testGemini(req.user.id)
 		};
 	}
 
 	@Get('models')
-	async listModels() {
-		return this.aiService.listModels();
+	async listModels(@Req() req: AuthenticatedRequest) {
+		return this.aiService.listModels(req.user.id);
 	}
 }

@@ -1,3 +1,5 @@
+import { AiUsageService } from './usage/ai-usage.service.js';
+import { ForbiddenException } from '@nestjs/common';
 import { Injectable } from '@nestjs/common';
 import { GoogleGenAI } from '@google/genai';
 import { ConfigService } from '@nestjs/config';
@@ -10,135 +12,135 @@ export class AiService {
 
 	constructor(
 		private readonly configService: ConfigService,
-		private readonly aiPromptService: AiPromptService
+		private readonly aiPromptService: AiPromptService,
+		private readonly usage: AiUsageService
 	) {
 		const apiKey = process.env.GEMINI_API_KEY;
 
 		this.gemini = new GoogleGenAI({
-			apiKey
+			apiKey,
+			httpOptions: { timeout: 90_000 }
 		});
 	}
 
-	async testGemini() {
-		const maxAttempts = 3;
-
-		for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-			try {
-				const response = await this.gemini.models.generateContent({
-					model: process.env.GEMINI_MODEL || 'gemini-3.5-flash',
-					contents: 'Reply with exactly: Gemini connected'
-				});
-
-				return response.text;
-			} catch (error: any) {
-				const status = error.status ?? error.code;
-
-				if (status !== 503 || attempt === maxAttempts) {
-					throw error;
-				}
-
-				const delay = 1000 * Math.pow(2, attempt - 1);
-
-				console.log(`Gemini unavailable. Retry ${attempt}/${maxAttempts - 1} after ${delay}ms`);
-
-				await new Promise(resolve => setTimeout(resolve, delay));
-			}
-		}
+	assertDiagnosticsAccess(userId: number) {
+		const allowed = (this.configService.get<string>('AI_DIAGNOSTICS_USER_IDS') ?? '')
+			.split(',')
+			.map(value => Number(value.trim()))
+			.filter(value => value > 0);
+		if (!allowed.includes(userId))
+			throw new ForbiddenException('AI diagnostics are restricted to configured administrators');
 	}
 
-	async listModels() {
-		const models = [];
-
-		const response = await this.gemini.models.list();
-
-		for await (const model of response) {
-			models.push({
-				name: model.name,
-				displayName: model.displayName,
-				supportedActions: model.supportedActions
+	async testGemini(userId: number) {
+		this.assertDiagnosticsAccess(userId);
+		return this.usage.execute(userId, 'diagnostics', 40, async () => {
+			const response = await this.gemini.models.generateContent({
+				model: this.configService.get<string>('GEMINI_MODEL', 'gemini-3.5-flash'),
+				contents: 'Reply with exactly: Gemini connected'
 			});
-		}
-
-		return models;
+			return response.text;
+		});
 	}
 
-	async analyzeStory(content: string): Promise<StoryAnalysisResult> {
+	async listModels(userId: number) {
+		this.assertDiagnosticsAccess(userId);
+		return this.usage.execute(userId, 'diagnostics', 1, async () => {
+			const models = [];
+			for await (const model of await this.gemini.models.list())
+				models.push({
+					name: model.name,
+					displayName: model.displayName,
+					supportedActions: model.supportedActions
+				});
+			return models;
+		});
+	}
+
+	async analyzeStory(content: string, userId: number): Promise<StoryAnalysisResult> {
 		const model = this.configService.get<string>('GEMINI_MODEL', 'gemini-3.5-flash');
 		const systemInstruction = await this.aiPromptService.getPrompt('story-analysis');
-		const response = await this.gemini.models.generateContent({
-			model,
-			contents: content,
-			config: {
-				systemInstruction: systemInstruction,
-				responseMimeType: 'application/json',
-				responseSchema: {
-					type: Type.OBJECT,
-					properties: {
-						characters: {
-							type: Type.ARRAY,
-							items: {
-								type: Type.OBJECT,
-								properties: {
-									name: { type: Type.STRING },
-									gender: { type: Type.STRING }
-								},
-								required: ['name', 'gender']
+		const response = await this.usage.execute(userId, 'analysis', content.length, () =>
+			this.gemini.models.generateContent({
+				model,
+				contents: content,
+				config: {
+					systemInstruction: systemInstruction,
+					maxOutputTokens: 16_384,
+					responseMimeType: 'application/json',
+					responseSchema: {
+						type: Type.OBJECT,
+						properties: {
+							characters: {
+								type: Type.ARRAY,
+								items: {
+									type: Type.OBJECT,
+									properties: {
+										name: { type: Type.STRING },
+										gender: { type: Type.STRING }
+									},
+									required: ['name', 'gender']
+								}
+							},
+							scenes: {
+								type: Type.ARRAY,
+								items: {
+									type: Type.OBJECT,
+									properties: {
+										sceneOrder: { type: Type.INTEGER },
+										speakerName: { type: Type.STRING },
+										text: { type: Type.STRING },
+										language: { type: Type.STRING },
+										emotion: { type: Type.STRING },
+										style: { type: Type.STRING }
+									},
+									required: ['sceneOrder', 'speakerName', 'text', 'language', 'emotion', 'style']
+								}
 							}
 						},
-						scenes: {
-							type: Type.ARRAY,
-							items: {
-								type: Type.OBJECT,
-								properties: {
-									sceneOrder: { type: Type.INTEGER },
-									speakerName: { type: Type.STRING },
-									text: { type: Type.STRING },
-									language: { type: Type.STRING },
-									emotion: { type: Type.STRING },
-									style: { type: Type.STRING }
-								},
-								required: ['sceneOrder', 'speakerName', 'text', 'language', 'emotion', 'style']
-							}
-						}
-					},
-					required: ['characters', 'scenes']
+						required: ['characters', 'scenes']
+					}
 				}
-			}
-		});
+			})
+		);
 
 		if (!response.text) {
 			throw new Error('Gemini returned an empty analysis response');
 		}
 
-		const result: unknown = JSON.parse(response.text);
-
-		return StoryAnalysisSchema.parse(result);
+		try {
+			return StoryAnalysisSchema.parse(JSON.parse(response.text));
+		} catch {
+			throw Object.assign(new Error('AI returned invalid analysis data'), { code: 'INVALID_ANALYSIS_RESPONSE' });
+		}
 	}
 
-	async generateSpeech(text: string, voiceName: string, model: string) {
+	async generateSpeech(text: string, voiceName: string, model: string, userId: number) {
 		if (!text.trim()) {
 			throw new Error('Speech text cannot be empty');
 		}
 
-		const response = await this.gemini.models.generateContent({
-			model,
-			contents: [
-				{
-					role: 'user',
-					parts: [{ text }]
-				}
-			],
-			config: {
-				responseModalities: ['AUDIO'],
-				speechConfig: {
-					voiceConfig: {
-						prebuiltVoiceConfig: {
-							voiceName
+		const response = await this.usage.execute(userId, 'tts', text.length, () =>
+			this.gemini.models.generateContent({
+				model,
+				contents: [
+					{
+						role: 'user',
+						parts: [{ text }]
+					}
+				],
+				config: {
+					responseModalities: ['AUDIO'],
+					speechConfig: {
+						voiceConfig: {
+							prebuiltVoiceConfig: {
+								voiceName
+							}
 						}
 					}
 				}
-			}
-		});
+			})
+		);
 
 		const parts = response.candidates?.[0]?.content?.parts ?? [];
 
@@ -154,9 +156,11 @@ export class AiService {
 		return response;
 	}
 
-	async getGeminiStudioVoices() {
+	async getGeminiStudioVoices(userId: number) {
+		this.assertDiagnosticsAccess(userId);
 		const ai = new GoogleGenAI({
-			apiKey: process.env.GEMINI_API_KEY!
+			apiKey: process.env.GEMINI_API_KEY!,
+			httpOptions: { timeout: 90_000 }
 		});
 
 		// Keep your existing studioVoices array of 30 voices unchanged
@@ -198,10 +202,12 @@ export class AiService {
 		let pageToken: string | undefined;
 
 		do {
-			const response = await ai.voices.list({
-				page_size: 1000,
-				...(pageToken ? { page_token: pageToken } : {})
-			});
+			const response = await this.usage.execute(userId, 'diagnostics', 1, () =>
+				ai.voices.list({
+					page_size: 1000,
+					...(pageToken ? { page_token: pageToken } : {})
+				})
+			);
 
 			allGeminiVoices.push(...(response.voices ?? []));
 			pageToken = response.next_page_token;

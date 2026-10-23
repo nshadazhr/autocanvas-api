@@ -29,6 +29,16 @@ class GenerateSingleVoiceDto {
 	@IsString()
 	@MaxLength(50)
 	style?: string;
+
+	@IsOptional()
+	@IsString()
+	@MaxLength(120)
+	title?: string;
+
+	@IsOptional()
+	@IsString()
+	@MaxLength(12000)
+	content?: string;
 }
 
 @Controller('audio-generation/single')
@@ -46,13 +56,21 @@ export class SingleVoiceController {
 		return this.single.get(id, req.user.id);
 	}
 
+	@Post('stories/:storyId/cancel')
+	cancel(@Param('storyId', ParseIntPipe) id: number, @Req() req: AuthenticatedRequest) {
+		return this.single.cancel(id, req.user.id);
+	}
+
 	@Post('stories/:storyId/generate')
 	generate(
 		@Param('storyId', ParseIntPipe) id: number,
 		@Body() dto: GenerateSingleVoiceDto,
 		@Req() req: AuthenticatedRequest
 	) {
-		return this.single.generate(id, req.user.id, dto.voiceId, dto.style);
+		return this.single.generate(id, req.user.id, dto.voiceId, dto.style, {
+			title: dto.title,
+			content: dto.content
+		});
 	}
 
 	@Get('stories/:storyId/audio/:audioId')
