@@ -17,28 +17,6 @@ export class AiUsageService {
 		return Number.isSafeInteger(value) && value > 0 ? value : fallback;
 	}
 
-	async consumeSubmission(tx: Prisma.TransactionClient, userId: number, kind: string) {
-		await tx.$queryRaw`SELECT 1 FROM pg_advisory_xact_lock(73125, 0)`;
-		await this.consume(
-			tx,
-			[
-				{
-					scope: `${kind}:submit:user:${userId}`,
-					window: 60_000,
-					maxRequests: this.limit('AI_SUBMISSIONS_PER_MINUTE', 3),
-					maxUnits: Number.MAX_SAFE_INTEGER
-				},
-				{
-					scope: `${kind}:submit:user:${userId}`,
-					window: 86_400_000,
-					maxRequests: this.limit('AI_SUBMISSIONS_PER_DAY', 30),
-					maxUnits: Number.MAX_SAFE_INTEGER
-				}
-			],
-			0
-		);
-	}
-
 	private async consume(
 		tx: Prisma.TransactionClient,
 		rules: { scope: string; window: number; maxRequests: number; maxUnits: number }[],
@@ -69,6 +47,9 @@ export class AiUsageService {
 			throw new BadRequestException('An authenticated user is required for AI requests');
 		if (!Number.isSafeInteger(units) || units < 0 || units > this.limit('AI_MAX_REQUEST_CHARACTERS', 40_000))
 			throw new BadRequestException('AI request is too large');
+		// Analysis has no application request/day/character budgets or AI concurrency caps.
+		// Authentication and request-size validation above still apply.
+		if (kind === 'analysis') return action();
 		const leaseId = randomUUID();
 		await this.prisma.$transaction(
 			async tx => {

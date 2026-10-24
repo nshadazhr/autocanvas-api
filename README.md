@@ -1,16 +1,16 @@
 # AutoCanvas API
 
-NestJS backend for the separate AutoCanvas user/admin applications. PostgreSQL + Prisma store application data and job/session state. Background analysis/audio scanners run inside the Nest process. Storage is accessed through a provider adapter.
+NestJS backend for the separate AutoCanvas user/admin applications. PostgreSQL + Prisma store application data and job/session state. Audio generation scanners run inside the Nest process; analysis uses in-process work with busy-server retries without periodic scanning. Storage is accessed through a provider adapter.
 
 ## Documentation map
 
-| Document | Purpose |
-| --- | --- |
+| Document                                             | Purpose                                                                                            |
+| ---------------------------------------------------- | -------------------------------------------------------------------------------------------------- |
 | [Admin/user auth and superadmin](docs/admin-auth.md) | Simple flow, file map, permissions, sessions, bootstrap, optional features and security decisions. |
-| [API overview](docs/api-overview.md) | Current route families, client contracts and response/error conventions. |
-| [Audio and analysis flow](docs/audio-flow.md) | Job states, retries, cancellation, usage limits and relevant service files. |
-| [Storage and download names](docs/storage.md) | Actual local/Supabase layout, playback/export behavior and pending storage work. |
-| [Operations and troubleshooting](docs/operations.md) | Setup, migration/build/test commands and operating boundaries. |
+| [API overview](docs/api-overview.md)                 | Current route families, client contracts and response/error conventions.                           |
+| [Audio and analysis flow](docs/audio-flow.md)        | Job states, retries, cancellation, usage limits and relevant service files.                        |
+| [Storage and download names](docs/storage.md)        | Actual local/Supabase layout, playback/export behavior and pending storage work.                   |
+| [Operations and troubleshooting](docs/operations.md) | Setup, migration/build/test commands and operating boundaries.                                     |
 
 For the three-repository architecture and user UI, see `autocanvas-web/docs/architecture.md` and its README in the frontend repository. Admin frontend status lives in the `autocanvas-admin` README.
 

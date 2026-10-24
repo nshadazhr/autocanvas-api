@@ -58,8 +58,9 @@ Controller: `src/audio-stories/audio-stories.controller.ts`.
 | GET /audio-stories/:id                              | Story details, analysis result/status and latest analysis job metadata.               |
 | PATCH /audio-stories/:id                            | Edit title/content; changed content invalidates analysis and cancels active analysis. |
 | DELETE /audio-stories/:id                           | Delete the owned database story; do not assume this garbage-collects remote files.    |
-| POST /audio-stories/:id/analyze                     | HTTP 202: create/reuse a durable analysis job.                                        |
+| POST /audio-stories/:id/analyze                     | HTTP 202: create/reuse an analysis attempt.                                           |
 | GET /audio-stories/:id/analysis-jobs/latest         | Latest owned analysis job metadata.                                                   |
+| GET /audio-stories/:id/analysis-jobs/:jobId/wait    | Wait for the owned attempt to finish; private/no-store, no polling.                   |
 | POST /audio-stories/:id/analysis-jobs/:jobId/cancel | Cancel active analysis; fence late results.                                           |
 | GET /audio-stories/:id/cast                         | Current character/voice assignments.                                                  |
 | PATCH /audio-stories/:id/cast                       | Persist character voice assignments.                                                  |

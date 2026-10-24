@@ -9,7 +9,8 @@ import {
 	Post,
 	Req,
 	UseGuards,
-	HttpCode
+	HttpCode,
+	Header
 } from '@nestjs/common';
 import { AuthGuard } from '../auth/auth.guard.js';
 import { AudioStoriesService } from './audio-stories.service.js';
@@ -56,6 +57,16 @@ export class AudioStoriesController {
 	@Get(':id/analysis-jobs/latest')
 	latestAnalysis(@Param('id', ParseIntPipe) id: number, @Req() req: AuthenticatedRequest) {
 		return this.audioStoriesService.getLatestAnalysisJob(id, req.user.id);
+	}
+
+	@Get(':id/analysis-jobs/:jobId/wait')
+	@Header('Cache-Control', 'private, no-store')
+	waitForAnalysis(
+		@Param('id', ParseIntPipe) id: number,
+		@Param('jobId') jobId: string,
+		@Req() req: AuthenticatedRequest
+	) {
+		return this.audioStoriesService.waitForAnalysis(id, req.user.id, jobId);
 	}
 
 	@Post(':id/analysis-jobs/:jobId/cancel')
