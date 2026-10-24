@@ -1,17 +1,26 @@
+import { AuthOriginGuard } from './services/auth-origin.guard.js';
+import { LoginRateGuard } from './services/login-rate.guard.js';
 import { Body, Controller, Get, Post, UseGuards, Request, Res, UnauthorizedException } from '@nestjs/common';
 
 import { LoginDto, RegisterDto, VerifyOtpDto, ResendOtpDto } from './dto/register.dto.js';
 
 import { AuthService } from './auth.service.js';
-import { AuthGuard } from './auth.guard.js';
+import { AuthGuard, AdminAuthGuard } from './auth.guard.js';
 import type { Response } from 'express';
 import { GoogleLoginDto } from './dto/google-login.dto.js';
+import { AdminGuard } from './services/admin.guard.js';
 
 @Controller('auth')
+@UseGuards(AuthOriginGuard)
 export class AuthController {
 	constructor(private readonly authService: AuthService) {}
 
-	private handleRefreshTokenCookie(res: Response, action: 'set' | 'clear', refreshToken?: string): void {
+	private handleRefreshTokenCookie(
+		res: Response,
+		action: 'set' | 'clear',
+		refreshToken?: string,
+		cookieName: 'refresh_token' | 'admin_refresh_token' = 'refresh_token'
+	): void {
 		const isProduction = process.env.NODE_ENV === 'production';
 
 		const cookieOptions = {
@@ -26,12 +35,12 @@ export class AuthController {
 				throw new Error('Refresh token is required');
 			}
 
-			res.cookie('refresh_token', refreshToken, {
+			res.cookie(cookieName, refreshToken, {
 				...cookieOptions,
 				maxAge: 24 * 60 * 60 * 1000
 			});
 		} else {
-			res.clearCookie('refresh_token', cookieOptions);
+			res.clearCookie(cookieName, cookieOptions);
 		}
 	}
 
@@ -68,11 +77,25 @@ export class AuthController {
 		};
 	}
 
+	@UseGuards(LoginRateGuard)
 	@Post('login')
 	async login(@Body() loginDto: LoginDto, @Res({ passthrough: true }) res: Response) {
 		const result = await this.authService.login(loginDto);
 
 		this.handleRefreshTokenCookie(res, 'set', result.refresh_token);
+
+		return {
+			user: result.user,
+			access_token: result.access_token
+		};
+	}
+
+	@UseGuards(LoginRateGuard)
+	@Post('admin/login')
+	async adminLogin(@Body() loginDto: LoginDto, @Res({ passthrough: true }) res: Response) {
+		const result = await this.authService.login(loginDto, true);
+
+		this.handleRefreshTokenCookie(res, 'set', result.refresh_token, 'admin_refresh_token');
 
 		return {
 			user: result.user,
@@ -91,12 +114,43 @@ export class AuthController {
 		return this.authService.refreshAccessToken(refreshToken);
 	}
 
+	@Post('admin/refresh')
+	async adminRefresh(@Request() req: any) {
+		const refreshToken = req.cookies?.admin_refresh_token;
+
+		if (!refreshToken) {
+			throw new UnauthorizedException('Admin refresh token not found');
+		}
+
+		return this.authService.refreshAdminAccessToken(refreshToken);
+	}
+
+	@UseGuards(AdminAuthGuard, AdminGuard)
+	@Get('admin/check')
+	checkAdmin(@Request() req: any) {
+		return {
+			success: true,
+			user: req.adminUser
+		};
+	}
+
 	@Post('logout')
-	logout(@Res({ passthrough: true }) res: Response) {
+	async logout(@Request() req: any, @Res({ passthrough: true }) res: Response) {
+		await this.authService.logout(req.cookies?.refresh_token);
 		this.handleRefreshTokenCookie(res, 'clear');
 
 		return {
 			message: 'Logged out successfully'
+		};
+	}
+
+	@Post('admin/logout')
+	async adminLogout(@Request() req: any, @Res({ passthrough: true }) res: Response) {
+		await this.authService.logout(req.cookies?.admin_refresh_token, true);
+		this.handleRefreshTokenCookie(res, 'clear', undefined, 'admin_refresh_token');
+
+		return {
+			message: 'Admin logged out successfully'
 		};
 	}
 

@@ -1,5 +1,7 @@
 # AutoCanvas Backend — Conversation Handoff (15 October 2026)
 
+> Historical handoff (older archive/conversation context). Port, route, auth and storage assumptions below may be outdated. Start with the current [README](README.md), [API overview](docs/api-overview.md) and [operations guide](docs/operations.md); verify source before applying old implementation notes.
+
 ## Purpose
 
 Use this document in a fresh ChatGPT conversation together with `Backend.zip` and, if relevant, the frontend `src` ZIP. Continue the existing AutoCanvas Audio Studio implementation; do not redesign existing Prisma models or recreate existing frontend screens. Verify actual files before proposing code changes.

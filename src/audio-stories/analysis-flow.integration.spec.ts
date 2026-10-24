@@ -66,7 +66,7 @@ describe.skipIf(!databaseUrl)('durable analysis and shared AI budgets', () => {
 			]
 		})
 			.overrideGuard(AuthGuard)
-			.useValue(new AuthGuard(jwt))
+			.useValue(new AuthGuard({ verifyAccessToken: (token: string) => jwt.verifyAsync(token) } as any))
 			.compile();
 		app = module.createNestApplication();
 		app.useGlobalPipes(new ValidationPipe({ transform: true, whitelist: true }));

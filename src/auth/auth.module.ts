@@ -1,4 +1,10 @@
-import { Module } from '@nestjs/common';
+import { AdminRolesController } from './admin-roles.controller.js';
+import { AdminRoleService } from './services/admin-role.service.js';
+import { SuperAdminGuard } from './services/superadmin.guard.js';
+import { AuthGuard, AdminAuthGuard } from './auth.guard.js';
+import { AuthOriginGuard } from './services/auth-origin.guard.js';
+import { LoginRateGuard } from './services/login-rate.guard.js';
+import { Global, Module } from '@nestjs/common';
 import { AuthController } from './auth.controller.js';
 import { AuthService } from './auth.service.js';
 import { UserModule } from '../user/user.module.js';
@@ -12,6 +18,8 @@ import { EmailService } from './services/email.service.js';
 import { OtpService } from './services/otp.service.js';
 import { PendingRegistrationService } from './services/pending-registration.service.js';
 import { GoogleAuthService } from './services/google-auth.service.js';
+import { AdminGuard } from './services/admin.guard.js';
+@Global()
 @Module({
 	imports: [
 		UserModule,
@@ -21,7 +29,7 @@ import { GoogleAuthService } from './services/google-auth.service.js';
 			signOptions: { expiresIn: '15m' }
 		})
 	],
-	controllers: [AuthController],
+	controllers: [AuthController, AdminRolesController],
 	providers: [
 		AuthService,
 		TokenService,
@@ -31,7 +39,15 @@ import { GoogleAuthService } from './services/google-auth.service.js';
 		Resend,
 		OtpService,
 		PendingRegistrationService,
-		GoogleAuthService
-	]
+		GoogleAuthService,
+		AdminRoleService,
+		SuperAdminGuard,
+		AdminGuard,
+		AuthGuard,
+		AdminAuthGuard,
+		AuthOriginGuard,
+		LoginRateGuard
+	],
+	exports: [TokenService, AuthGuard, AdminAuthGuard, AdminGuard, SuperAdminGuard]
 })
 export class AuthModule {}

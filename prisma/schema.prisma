@@ -11,8 +11,15 @@ datasource db {
 // USER & AUTHENTICATION
 // ==========================================
 
+enum UserRole {
+  USER
+  ADMIN
+  SUPERADMIN
+}
+
 model User {
   id                Int       @id @default(autoincrement())
+  role              UserRole  @default(USER)
   email             String    @unique
   name              String?
   password          String?
@@ -20,6 +27,7 @@ model User {
   created_at        DateTime  @default(now())
   email_verified_at DateTime?
 
+  authSessions AuthSession[]
   identities AuthIdentity[]
   projects   Project[]
   scripts    Script[]
@@ -130,10 +138,10 @@ model AudioStory {
 
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)
 
-  characters AudioCharacter[]
-  scenes     AudioScene[]
-  jobs       AudioGenerationJob[]
-  assets     AudioAsset[]
+  characters   AudioCharacter[]
+  scenes       AudioScene[]
+  jobs         AudioGenerationJob[]
+  assets       AudioAsset[]
   analysisJobs StoryAnalysisJob[]
 
   @@index([userId])
@@ -408,41 +416,79 @@ enum StoryAnalysisJobStatus {
 }
 
 model StoryAnalysisJob {
-  id              String @id @default(uuid())
+  id              String                 @id @default(uuid())
   storyId         Int
   userId          Int
   contentHash     String
   contentSnapshot String
   status          StoryAnalysisJobStatus @default(QUEUED)
-  attempts        Int @default(0)
+  attempts        Int                    @default(0)
   nextRetryAt     DateTime?
   leaseToken      String?
   leaseExpiresAt  DateTime?
   errorCode       String?
   errorMessage    String?
   source          String?
-  createdAt       DateTime @default(now())
-  updatedAt       DateTime @updatedAt
+  createdAt       DateTime               @default(now())
+  updatedAt       DateTime               @updatedAt
   completedAt     DateTime?
-  story AudioStory @relation(fields: [storyId], references: [id], onDelete: Cascade)
-  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  story           AudioStory             @relation(fields: [storyId], references: [id], onDelete: Cascade)
+  user            User                   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
   @@index([status, nextRetryAt])
   @@index([userId, status])
   @@index([storyId, createdAt])
 }
 
 model AiUsageBucket {
-  key       String @id
-  requests  Int @default(0)
-  units     Int @default(0)
+  key       String   @id
+  requests  Int      @default(0)
+  units     Int      @default(0)
   expiresAt DateTime
 }
 
 model AiRequestLease {
-  id        String @id @default(uuid())
+  id        String   @id @default(uuid())
   userId    Int
   kind      String
   expiresAt DateTime
+
   @@index([expiresAt])
   @@index([userId, expiresAt])
+}
+
+// Revocable, independent browser sessions for the user app and admin dashboard.
+model AuthSession {
+  id String @id @default(uuid())
+  userId Int
+  realm String
+  refreshHash String
+  expiresAt DateTime
+  revokedAt DateTime?
+  createdAt DateTime @default(now())
+  user User @relation(fields:[userId],references:[id],onDelete:Cascade)
+  @@index([userId, realm])
+  @@index([expiresAt])
+}
+
+model AuthRateBucket {
+  key String @id
+  attempts Int @default(0)
+  expiresAt DateTime
+  @@index([expiresAt])
+}
+
+// Immutable role-change records; IDs/emails are snapshots, retained if accounts are removed.
+model AdminRoleAudit {
+  id Int @id @default(autoincrement())
+  actorId Int?
+  actorEmail String?
+  targetId Int
+  targetEmail String
+  action String
+  fromRole UserRole
+  toRole UserRole
+  reason String
+  createdAt DateTime @default(now())
+  @@index([targetId, id])
 }

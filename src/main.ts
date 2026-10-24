@@ -1,3 +1,4 @@
+import { authAllowedOrigins } from './auth/services/auth-origins.js';
 import { NestFactory } from '@nestjs/core';
 import { AppModule, ObserveInstrument } from './app.module.js';
 import { ValidationPipe } from '@nestjs/common';
@@ -20,7 +21,7 @@ async function bootstrap() {
 	);
 
 	app.enableCors({
-		origin: [process.env.REQUEST_ORIGIN_PORT ? process.env.REQUEST_ORIGIN_PORT : 'http://localhost:3000'],
+		origin: authAllowedOrigins(),
 		methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
 		allowedHeaders: ['Content-Type', 'Authorization'],
 		credentials: true
