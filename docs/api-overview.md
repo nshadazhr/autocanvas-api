@@ -15,22 +15,54 @@ Start with this route map, then read the controller/DTO for exact validation and
 
 See [admin-auth.md](admin-auth.md) for the complete route table, body/cookie contracts, superadmin role management and first-account command. Registration creates normal users. Superadmin is a backend permission, not a separate login implementation.
 
+## Admin dashboard reporting
+
+`GET /admin/dashboard?days=7|30` requires an active admin-audience session and
+current ADMIN/SUPERADMIN role. The default is 30 days; other ranges return 400.
+Responses use `Cache-Control: private, no-store`. Controller/service are in
+`src/admin/`; existing admin guards and TokenService are reused.
+
+The response contains `generatedAt`, UTC `range`, `totals`, `projectBreakdown`,
+`audioJobs.statuses`, zero-filled `userGrowth`, `canViewUsers`, `recentUsers`, and
+`recentFailedJobs`. Counts are read in one repeatable-read PostgreSQL transaction.
+
+- Totals are all-time current records. Projects = Project + AudioStory +
+  AnimationProject; an audio story represents one project, not each scene/job.
+- Audio jobs are AudioGenerationJob records (multi-voice, including single-scene
+  retries). Single-voice narration attempts and StoryAnalysisJob are excluded.
+- Each retry job counts as a distinct job. All seven statuses are included in
+  distribution; jobs with failures = FAILED + PARTIAL, not failed scene count.
+- Growth is new User records per UTC calendar day, including today up to request
+  time; it includes every account role, excludes pending registrations and
+  zero-fills missing days. Counts do not represent historical deleted accounts.
+- Recent users are the five newest accounts, selected safe fields only, returned
+  exclusively to SUPERADMIN. Ordinary ADMIN receives an empty list and false
+  `canViewUsers`. Recent FAILED/PARTIAL jobs expose only IDs, status, story title
+  and `updated_at`; that timestamp is labelled last updated, not failure time.
+- Errors propagate as errors; a database failure is not reported as zero usage.
+  This endpoint is read-only and makes no AI/provider/storage calls.
+
+Run `vitest run --config vitest.admin-dashboard.config.ts` with
+`AUDIO_FLOW_TEST_DATABASE_URL` pointing at a disposable local database whose name
+ends in `_test`. Without that variable database tests skip; application
+DATABASE_URL is never the fallback. No schema migration is required.
+
 ## Story analysis and cast
 
 Controller: `src/audio-stories/audio-stories.controller.ts`.
 
-| Route | Purpose |
-| --- | --- |
-| POST /audio-stories | Create an owned story (`title`, `content`). |
-| GET /audio-stories | List the user's stories. |
-| GET /audio-stories/:id | Story details, analysis result/status and latest analysis job metadata. |
-| PATCH /audio-stories/:id | Edit title/content; changed content invalidates analysis and cancels active analysis. |
-| DELETE /audio-stories/:id | Delete the owned database story; do not assume this garbage-collects remote files. |
-| POST /audio-stories/:id/analyze | HTTP 202: create/reuse a durable analysis job. |
-| GET /audio-stories/:id/analysis-jobs/latest | Latest owned analysis job metadata. |
-| POST /audio-stories/:id/analysis-jobs/:jobId/cancel | Cancel active analysis; fence late results. |
-| GET /audio-stories/:id/cast | Current character/voice assignments. |
-| PATCH /audio-stories/:id/cast | Persist character voice assignments. |
+| Route                                               | Purpose                                                                               |
+| --------------------------------------------------- | ------------------------------------------------------------------------------------- |
+| POST /audio-stories                                 | Create an owned story (`title`, `content`).                                           |
+| GET /audio-stories                                  | List the user's stories.                                                              |
+| GET /audio-stories/:id                              | Story details, analysis result/status and latest analysis job metadata.               |
+| PATCH /audio-stories/:id                            | Edit title/content; changed content invalidates analysis and cancels active analysis. |
+| DELETE /audio-stories/:id                           | Delete the owned database story; do not assume this garbage-collects remote files.    |
+| POST /audio-stories/:id/analyze                     | HTTP 202: create/reuse a durable analysis job.                                        |
+| GET /audio-stories/:id/analysis-jobs/latest         | Latest owned analysis job metadata.                                                   |
+| POST /audio-stories/:id/analysis-jobs/:jobId/cancel | Cancel active analysis; fence late results.                                           |
+| GET /audio-stories/:id/cast                         | Current character/voice assignments.                                                  |
+| PATCH /audio-stories/:id/cast                       | Persist character voice assignments.                                                  |
 
 Current create DTO caps title at 120 characters and content at 30,000. Title/content are required; UI defaults are not a promise that the API accepts missing fields. Read `src/audio-stories/dto/` and `src/ai/schemas/story-analysis.schema.ts` before changing analysis shape.
 
@@ -38,19 +70,19 @@ Current create DTO caps title at 120 characters and content at 30,000. Title/con
 
 Controller: `src/audio-generation/audio-generation.controller.ts`.
 
-| Route | Purpose |
-| --- | --- |
-| POST /audio-generation/stories/:storyId/jobs | Create a generation job using current analyzed scenes/voices. |
-| GET /audio-generation/stories/:storyId/jobs/latest | Restore the current/latest job after reload or tab navigation. |
-| GET /audio-generation/jobs/:jobId | Job counters and scene items, errors/retry times and audio metadata. |
-| POST /audio-generation/jobs/:jobId/cancel | Cancel pending/processing/waiting work and retain completed audio. |
-| POST /audio-generation/jobs/:jobId/retry | Create a **new** job for failed items of a FAILED/PARTIAL job. |
-| POST /audio-generation/stories/:storyId/scenes/:sceneId/regenerate | Create a single-scene generation job; same action also serves a first generation. |
-| GET /audio-generation/stories/:storyId/audio-history | Full current scene list, assigned voices, audio versions, last attempt and download names. |
-| GET /audio-generation/audio/:audioId/stream | Authorized WAV streaming; byte ranges are supported. |
-| GET /audio-generation/stories/:storyId/download-zip | ZIP of complete current scene audio. |
-| POST /audio-generation/stories/:storyId/export-wav | Generate a persisted combined WAV asset. |
-| GET /audio-generation/exports/:assetId/download | Download the owned combined export asset. |
+| Route                                                              | Purpose                                                                                    |
+| ------------------------------------------------------------------ | ------------------------------------------------------------------------------------------ |
+| POST /audio-generation/stories/:storyId/jobs                       | Create a generation job using current analyzed scenes/voices.                              |
+| GET /audio-generation/stories/:storyId/jobs/latest                 | Restore the current/latest job after reload or tab navigation.                             |
+| GET /audio-generation/jobs/:jobId                                  | Job counters and scene items, errors/retry times and audio metadata.                       |
+| POST /audio-generation/jobs/:jobId/cancel                          | Cancel pending/processing/waiting work and retain completed audio.                         |
+| POST /audio-generation/jobs/:jobId/retry                           | Create a **new** job for failed items of a FAILED/PARTIAL job.                             |
+| POST /audio-generation/stories/:storyId/scenes/:sceneId/regenerate | Create a single-scene generation job; same action also serves a first generation.          |
+| GET /audio-generation/stories/:storyId/audio-history               | Full current scene list, assigned voices, audio versions, last attempt and download names. |
+| GET /audio-generation/audio/:audioId/stream                        | Authorized WAV streaming; byte ranges are supported.                                       |
+| GET /audio-generation/stories/:storyId/download-zip                | ZIP of complete current scene audio.                                                       |
+| POST /audio-generation/stories/:storyId/export-wav                 | Generate a persisted combined WAV asset.                                                   |
+| GET /audio-generation/exports/:assetId/download                    | Download the owned combined export asset.                                                  |
 
 A latest-job endpoint can send an empty body when no job exists. Browser consumers must normalize it to null and validate that job details contain an items array. The frontend decoder is `audio-generation-response.ts` in the web repo.
 
@@ -60,38 +92,68 @@ ZIP/combined export requires complete current audio. A past recording does not a
 
 Controller: `src/audio-generation/single-voice.controller.ts`.
 
-| Route | Purpose |
-| --- | --- |
-| POST /audio-generation/single/stories | Create narration project (`title`, `content`). |
-| GET /audio-generation/single/stories/:storyId | Saved draft, status, selected voice/style and current/previous asset metadata. |
-| POST /audio-generation/single/stories/:storyId/generate | Persist submitted draft/options and start narration (`voiceId`, optional `style`, `title`, `content`). |
-| POST /audio-generation/single/stories/:storyId/cancel | Stop remaining work and preserve previous completed narration. |
-| GET /audio-generation/single/stories/:storyId/audio/:audioId | Authorized saved narration stream. |
+| Route                                                        | Purpose                                                                                                |
+| ------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------ |
+| POST /audio-generation/single/stories                        | Create narration project (`title`, `content`).                                                         |
+| GET /audio-generation/single/stories/:storyId                | Saved draft, status, selected voice/style and current/previous asset metadata.                         |
+| POST /audio-generation/single/stories/:storyId/generate      | Persist submitted draft/options and start narration (`voiceId`, optional `style`, `title`, `content`). |
+| POST /audio-generation/single/stories/:storyId/cancel        | Stop remaining work and preserve previous completed narration.                                         |
+| GET /audio-generation/single/stories/:storyId/audio/:audioId | Authorized saved narration stream.                                                                     |
 
 Current script cap is 12,000 characters; supported speaking styles are validated by the service. A single-voice project uses its own status/attempt token, not a multi-scene job ID.
 
 ## Other current backend areas
 
-| Area | Routes / source |
-| --- | --- |
-| Voices | GET /voices lists saved voices. POST /voices syncs provider voices and additionally requires the explicit diagnostic allowlist. |
-| Gemini diagnostics | GET /ai/test and GET /ai/models require user auth plus `AI_DIAGNOSTICS_USER_IDS`. A role alone does not bypass this check. Diagnostics can consume provider usage. |
-| Generic projects | POST/GET /projects; GET/PATCH/DELETE /projects/:id. Controller: `src/projects/projects.controller.ts`. |
-| Animation | Project CRUD under /animation/projects; scene CRUD under /animation/projects/:projectId/scenes. Source: `src/animation/animation.controller.ts`. Persistence endpoints do not imply a video-rendering pipeline exists. |
-| Script outline | POST /script/outline/generate accepts title/language and uses the configured OpenAI model. Source: `src/script/`. |
+| Area               | Routes / source                                                                                                                                                                                                        |
+| ------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Voices             | GET /voices lists saved voices. POST /voices syncs provider voices and additionally requires the explicit diagnostic allowlist.                                                                                        |
+| Gemini diagnostics | GET /ai/test and GET /ai/models require user auth plus `AI_DIAGNOSTICS_USER_IDS`. A role alone does not bypass this check. Diagnostics can consume provider usage.                                                     |
+| Generic projects   | POST/GET /projects; GET/PATCH/DELETE /projects/:id. Controller: `src/projects/projects.controller.ts`.                                                                                                                 |
+| Animation          | Project CRUD under /animation/projects; scene CRUD under /animation/projects/:projectId/scenes. Source: `src/animation/animation.controller.ts`. Persistence endpoints do not imply a video-rendering pipeline exists. |
+| Script outline     | POST /script/outline/generate accepts title/language and uses the configured OpenAI model. Source: `src/script/`.                                                                                                      |
 
 The shared Gemini usage caps do not automatically cover unrelated OpenAI features. A product-page route is not evidence the corresponding backend feature or billing enforcement is implemented.
 
 ## Error interpretation
 
-| Status | Typical meaning |
-| --- | --- |
-| 400 | Invalid DTO, unsupported option, incomplete analysis/voices, missing current audio or stale retry input. |
-| 401 | Missing/expired/revoked session or wrong token audience/purpose. |
-| 403 | Insufficient role, disallowed Origin or diagnostic allowlist denial. |
-| 404 | Resource missing or inaccessible to the requesting owner. |
-| 409 | Conflicting active generation or a role change that would remove the last superadmin. |
-| 429 | Login/admission usage limit; inspect Retry-After or returned retry metadata. |
-| 5xx | Server/configuration/provider/storage error; inspect safe job status and server context. |
+| Status | Typical meaning                                                                                          |
+| ------ | -------------------------------------------------------------------------------------------------------- |
+| 400    | Invalid DTO, unsupported option, incomplete analysis/voices, missing current audio or stale retry input. |
+| 401    | Missing/expired/revoked session or wrong token audience/purpose.                                         |
+| 403    | Insufficient role, disallowed Origin or diagnostic allowlist denial.                                     |
+| 404    | Resource missing or inaccessible to the requesting owner.                                                |
+| 409    | Conflicting active generation or a role change that would remove the last superadmin.                    |
+| 429    | Login/admission usage limit; inspect Retry-After or returned retry metadata.                             |
+| 5xx    | Server/configuration/provider/storage error; inspect safe job status and server context.                 |
 
 Temporary provider errors can appear as WAITING job state instead of a failing submission HTTP response. Preserve that distinction in clients. Never retry creation blindly on every HTTP error: a job may already exist; restore state first.
+
+## Read-only admin audio job monitoring
+
+ADMIN and SUPERADMIN can read `GET /admin/audio-jobs` and
+`GET /admin/audio-jobs/:id`. The existing admin session/current-role guards apply;
+normal user tokens are rejected. Responses are private/no-store. There are no
+admin retry/cancel endpoints: users retain those actions on their own APIs.
+
+List filters: optional `search` (story title or exact job ID), `status`, `userId`,
+`storyId`, UTC `from`/`to` dates (`YYYY-MM-DD`), `limit` (1–100, default 25), and
+`cursor`. Jobs sort by descending ID; nextCursor fetches older jobs. Dates filter
+job creation time and include the entire `to` date. This list covers multi-voice
+AudioGenerationJob records, including retry jobs; single-voice/analysis jobs are
+not included. Owner IDs are shown without account emails or authentication data.
+
+Details return job metadata and a paginated scene-item list (ascending item ID,
+limit/cursor). Attempts, status, assigned voice ID snapshot, retry time and
+sanitized errors support diagnosis. Scene text, storage keys, provider settings
+and user credentials are not returned. There are no admin audio download or
+playback endpoints in this change. UI refresh is manual; no extra polling loop.
+
+Admin UI routes are `/audio-jobs` and `/audio-jobs/[jobId]`. Filters apply on form
+submission; loaded-record count is not a total-match count. Long tables scroll
+inside cards on phones. Loading, empty, request-error and missing-job states use
+the existing theme, strings/config, UI primitives and authenticated API client.
+
+Verification: API tests use `vitest.admin-audio-jobs.config.ts` and require an
+explicit local `_test` AUDIO_FLOW_TEST_DATABASE_URL (no application DB fallback).
+Frontend response checks run with `node --test tests/audio-jobs-response.test.cjs`.
+No database migration or generation/provider calls are needed for this section.
