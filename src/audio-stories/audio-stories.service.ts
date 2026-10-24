@@ -1,10 +1,8 @@
 import {
 	ConflictException,
-	HttpException,
-	HttpStatus,
 	Injectable,
+	Logger,
 	OnModuleInit,
-	OnModuleDestroy,
 	NotFoundException,
 	ServiceUnavailableException
 } from '@nestjs/common';
@@ -20,16 +18,15 @@ import { randomUUID, createHash } from 'node:crypto';
 import { ConfigService } from '@nestjs/config';
 import { AiUsageService } from '../ai/usage/ai-usage.service.js';
 import { AiCapacityError } from '../ai/usage/ai-capacity.error.js';
-import type { StoryAnalysisJob } from '../generated/prisma/client.js';
+import type { AudioStory, StoryAnalysisJob } from '../generated/prisma/client.js';
 import { StoryAnalysisSchema, type StoryAnalysisResult } from '../ai/schemas/story-analysis.schema.js';
 import { BadRequestException } from '@nestjs/common';
 import { assertNoActiveJob, withStoryLock } from '../audio-generation/utils/audio-story-lock.js';
 import { UpdateStoryCastDto } from './dto/update-story-cast.dto.js';
 @Injectable()
-export class AudioStoriesService implements OnModuleInit, OnModuleDestroy {
-	private timer: ReturnType<typeof setInterval> | null = null;
-	private scanning = false;
-	private readonly running = new Set<string>();
+export class AudioStoriesService implements OnModuleInit {
+	private readonly logger = new Logger(AudioStoriesService.name);
+	private readonly running = new Map<string, Promise<void>>();
 	constructor(
 		private readonly prisma: PrismaService,
 		private readonly audioStoryAnalysisService: AudioStoryAnalysisService,
@@ -171,6 +168,28 @@ export class AudioStoriesService implements OnModuleInit, OnModuleDestroy {
 		);
 	}
 
+	private async cachedAnalysis(tx: Prisma.TransactionClient, story: AudioStory, hash: string) {
+		if (story.analysisStatus !== 'COMPLETED' || !StoryAnalysisSchema.safeParse(story.analysisResult).success)
+			return null;
+		const cached = await tx.storyAnalysisJob.findFirst({
+			where: { storyId: story.id, contentHash: hash, status: 'COMPLETED' }
+		});
+		return (
+			cached ??
+			tx.storyAnalysisJob.create({
+				data: {
+					storyId: story.id,
+					userId: story.userId,
+					contentHash: hash,
+					contentSnapshot: story.content,
+					status: 'COMPLETED',
+					completedAt: new Date(),
+					source: 'CACHE'
+				}
+			})
+		);
+	}
+
 	async analyze(id: number, userId: number) {
 		const job = await withStoryLock(this.prisma, id, async tx => {
 			const story = await tx.audioStory.findFirst({ where: { id, userId } });
@@ -182,47 +201,9 @@ export class AudioStoriesService implements OnModuleInit, OnModuleDestroy {
 			});
 			if (active) return active;
 			const hash = createHash('sha256').update(story.content).digest('hex');
-			if (story.analysisStatus === 'COMPLETED' && StoryAnalysisSchema.safeParse(story.analysisResult).success) {
-				const cached = await tx.storyAnalysisJob.findFirst({
-					where: { storyId: id, contentHash: hash, status: 'COMPLETED' }
-				});
-				return (
-					cached ??
-					tx.storyAnalysisJob.create({
-						data: {
-							storyId: id,
-							userId,
-							contentHash: hash,
-							contentSnapshot: story.content,
-							status: 'COMPLETED',
-							completedAt: new Date(),
-							source: 'CACHE'
-						}
-					})
-				);
-			}
+			const cached = await this.cachedAnalysis(tx, story, hash);
+			if (cached) return cached;
 			await assertNoActiveJob(tx, id);
-			try {
-				await this.usage.consumeSubmission(tx, userId, 'analysis');
-			} catch (error) {
-				if (error instanceof AiCapacityError)
-					throw new HttpException(
-						{
-							message: 'Analysis submission limit reached. Please try later.',
-							nextRetryAt: error.nextRetryAt
-						},
-						HttpStatus.TOO_MANY_REQUESTS
-					);
-				throw error;
-			}
-			const activeCount = await tx.storyAnalysisJob.count({
-				where: { userId, status: { in: ['QUEUED', 'PROCESSING', 'WAITING'] } }
-			});
-			if (activeCount >= this.usage.limit('ANALYSIS_USER_ACTIVE_JOBS', 2))
-				throw new HttpException(
-					'You already have analysis jobs in progress. Wait or cancel one.',
-					HttpStatus.TOO_MANY_REQUESTS
-				);
 			const created = await tx.storyAnalysisJob.create({
 				data: { storyId: id, userId, contentSnapshot: story.content, contentHash: hash }
 			});
@@ -273,29 +254,66 @@ export class AudioStoriesService implements OnModuleInit, OnModuleDestroy {
 
 	private dispatch(jobId: string) {
 		if (this.running.has(jobId)) return;
-		this.running.add(jobId);
-		setImmediate(() => {
-			void this.processAnalysisJob(jobId)
-				.catch(() => {
-					/* An expired lease is picked up by the durable scanner. */
-				})
-				.finally(() => this.running.delete(jobId));
-		});
+		const task = this.processAnalysisJob(jobId).finally(() => this.running.delete(jobId));
+		this.running.set(jobId, task);
+		// The wait endpoint observes the result; prevent unhandled rejections when a browser disconnects.
+		void task.catch(() => this.logger.error({ jobId, errorCode: 'ANALYSIS_WORKER_FAILED' }));
+	}
+
+	async waitForAnalysis(id: number, userId: number, jobId: string) {
+		const task = this.running.get(jobId);
+		const job = await this.prisma.storyAnalysisJob.findFirst({ where: { id: jobId, storyId: id, userId } });
+		if (!job) throw new NotFoundException('Analysis job not found');
+		if (task) await task;
+		else if (['QUEUED', 'PROCESSING', 'WAITING'].includes(job.status)) {
+			if (
+				(job.leaseExpiresAt && job.leaseExpiresAt > new Date()) ||
+				(!job.leaseExpiresAt && job.updatedAt.getTime() > Date.now() - 120_000)
+			)
+				throw new ServiceUnavailableException('Analysis is still running. Refresh this page shortly.');
+			// No automatic resume after a worker restart. The user can submit again.
+			await withStoryLock(this.prisma, id, async tx => {
+				const changed = await tx.storyAnalysisJob.updateMany({
+					where: { id: jobId, status: { in: ['QUEUED', 'PROCESSING', 'WAITING'] } },
+					data: {
+						status: 'FAILED',
+						errorCode: 'WORKER_INTERRUPTED',
+						errorMessage: 'Analysis was interrupted. Please try again.',
+						completedAt: new Date(),
+						leaseToken: null,
+						leaseExpiresAt: null,
+						nextRetryAt: null
+					}
+				});
+				if (changed.count)
+					await tx.audioStory.updateMany({
+						where: { id, analysisAttemptId: jobId },
+						data: {
+							analysisStatus: 'FAILED',
+							analysisError: 'Analysis was interrupted. Please try again.',
+							analysisAttemptId: null,
+							analysisStartedAt: null
+						}
+					});
+			});
+		}
+		return this.jobDto(await this.prisma.storyAnalysisJob.findUniqueOrThrow({ where: { id: jobId } }));
 	}
 
 	async processAnalysisJob(jobId: string) {
+		while (await this.processAnalysisAttempt(jobId)) {
+			// Continue only while the provider reports server overload.
+		}
+	}
+
+	private async processAnalysisAttempt(jobId: string): Promise<boolean> {
 		const leaseToken = randomUUID();
 		const job = await this.prisma.$transaction(async tx => {
-			await tx.$queryRaw`SELECT 1 FROM pg_advisory_xact_lock(73126, 0)`;
 			const now = new Date();
 			const candidate = await tx.storyAnalysisJob.findFirst({
 				where: { id: jobId, OR: [{ status: 'QUEUED' }, { status: 'WAITING', nextRetryAt: { lte: now } }] }
 			});
 			if (!candidate) return null;
-			const processors = await tx.storyAnalysisJob.count({
-				where: { status: 'PROCESSING', leaseExpiresAt: { gt: now } }
-			});
-			if (processors >= this.usage.limit('ANALYSIS_GLOBAL_WORKERS', 2)) return null;
 			const changed = await tx.storyAnalysisJob.updateMany({
 				where: { id: jobId, status: candidate.status },
 				data: {
@@ -303,21 +321,14 @@ export class AudioStoriesService implements OnModuleInit, OnModuleDestroy {
 					leaseToken,
 					leaseExpiresAt: new Date(Date.now() + 120_000),
 					nextRetryAt: null,
+					errorCode: null,
+					errorMessage: null,
 					attempts: { increment: 1 }
 				}
 			});
 			return changed.count === 1 ? candidate : null;
 		});
-		if (!job) return;
-		const heartbeat = setInterval(() => {
-			void this.prisma.storyAnalysisJob
-				.updateMany({
-					where: { id: jobId, status: 'PROCESSING', leaseToken },
-					data: { leaseExpiresAt: new Date(Date.now() + 120_000) }
-				})
-				.catch(() => undefined);
-		}, 15_000);
-		heartbeat.unref();
+		if (!job) return false;
 		try {
 			const parsed = this.storyParserService.parseScenes(job.contentSnapshot);
 			const parserValidation = this.storyParserService.validateParsedScenes(parsed);
@@ -404,41 +415,38 @@ export class AudioStoriesService implements OnModuleInit, OnModuleDestroy {
 			const status = Number(
 				details?.status ?? details?.getStatus?.() ?? details?.response?.status ?? details?.code
 			);
-			const temporary =
-				error instanceof AiCapacityError ||
-				[408, 429, 500, 502, 503, 504].includes(status) ||
-				/ECONN|ETIMEDOUT|ENOTFOUND|fetch failed|network|abort|timeout/i.test(details?.message ?? '');
-			const malformed =
-				error instanceof SyntaxError ||
-				details?.code === 'INVALID_ANALYSIS_RESPONSE' ||
-				details?.message?.includes('empty analysis');
-			const retry = temporary || (malformed && job.attempts < 2);
-			const seconds = Math.min(300, 30 * 2 ** Math.min(job.attempts, 5)) * (0.85 + Math.random() * 0.3);
-			const retryHeader =
-				(error as any)?.response?.headers?.get?.('retry-after') ??
-				(error as any)?.response?.headers?.['retry-after'];
-			const retryHint = Number(retryHeader);
-			const retryDate = typeof retryHeader === 'string' ? Date.parse(retryHeader) : NaN;
-			const hintedTime =
-				Number.isFinite(retryHint) && retryHint > 0
-					? Date.now() + retryHint * 1000
-					: Number.isFinite(retryDate)
-						? retryDate
-						: 0;
-			const nextRetryAt =
-				error instanceof AiCapacityError
-					? error.nextRetryAt
-					: new Date(Math.max(Date.now() + seconds * 1000, hintedTime));
-			const errorCode = temporary
-				? status === 429
-					? 'PROVIDER_RATE_LIMITED'
-					: 'TEMPORARY_UNAVAILABLE'
-				: 'ANALYSIS_FAILED';
-			const message = retry
-				? 'Analysis is temporarily unavailable. Automatic retry is scheduled.'
-				: [401, 403].includes(status)
-					? 'Analysis provider access is unavailable. Contact support.'
-					: 'The story could not be analyzed. Review the script and try again.';
+			const busy = [500, 502, 503, 504].includes(status);
+			const retry = busy;
+			const nextRetryAt = new Date(Date.now() + 1000);
+			const errorCode = busy
+				? 'PROVIDER_BUSY'
+				: error instanceof AiCapacityError
+					? 'APP_CAPACITY_LIMIT'
+					: status === 429
+						? 'PROVIDER_RATE_LIMITED'
+						: [401, 403].includes(status)
+							? 'PROVIDER_ACCESS_DENIED'
+							: /ECONN|ENOTFOUND|fetch failed|network|timeout|abort/i.test(details?.message ?? '')
+								? 'NETWORK_ERROR'
+								: 'ANALYSIS_FAILED';
+			const messages: Record<string, string> = {
+				PROVIDER_BUSY: 'The analysis server is busy. Retrying.',
+				APP_CAPACITY_LIMIT: 'Analysis usage or capacity limit reached. Please try again later.',
+				PROVIDER_RATE_LIMITED: 'The analysis provider quota or rate limit was reached. Please try again later.',
+				PROVIDER_ACCESS_DENIED: 'Analysis provider access is unavailable. Contact support.',
+				NETWORK_ERROR: 'The analysis provider could not be reached or the request timed out. Please try again.',
+				ANALYSIS_FAILED: 'The story could not be analyzed. Review the script and try again.'
+			};
+			const message = messages[errorCode];
+			// Metadata only: never log scripts, API keys, tokens or raw provider responses.
+			this.logger.warn({
+				jobId,
+				errorCode,
+				providerStatus: Number.isFinite(status) ? status : null,
+				attempts: job.attempts + 1,
+				nextRetryAt: retry ? nextRetryAt.toISOString() : null
+			});
+
 			await withStoryLock(this.prisma, job.storyId, async tx => {
 				const updated = await tx.storyAnalysisJob.updateMany({
 					where: { id: jobId, status: 'PROCESSING', leaseToken },
@@ -462,48 +470,27 @@ export class AudioStoriesService implements OnModuleInit, OnModuleDestroy {
 						}
 					});
 			});
-		} finally {
-			clearInterval(heartbeat);
+			if (retry) {
+				// One short delay between busy-server attempts; no periodic retry scheduler.
+				await new Promise(resolve => setTimeout(resolve, Math.max(0, nextRetryAt.getTime() - Date.now())));
+			}
+			return retry;
 		}
-	}
-
-	async scanAnalysisJobs() {
-		if (this.scanning) return;
-		this.scanning = true;
-		try {
-			await this.prisma.storyAnalysisJob.updateMany({
-				where: { status: 'PROCESSING', leaseExpiresAt: { lte: new Date() } },
-				data: {
-					status: 'WAITING',
-					leaseToken: null,
-					leaseExpiresAt: null,
-					nextRetryAt: new Date(),
-					errorCode: 'WORKER_INTERRUPTED',
-					errorMessage: 'Analysis was interrupted. Automatic retry is scheduled.'
-				}
-			});
-			const pending = await this.prisma.storyAnalysisJob.findMany({
-				where: { OR: [{ status: 'QUEUED' }, { status: 'WAITING', nextRetryAt: { lte: new Date() } }] },
-				orderBy: { createdAt: 'asc' },
-				take: 20,
-				select: { id: true }
-			});
-			for (const job of pending) this.dispatch(job.id);
-		} finally {
-			this.scanning = false;
-		}
+		return false;
 	}
 
 	async onModuleInit() {
-		await this.scanAnalysisJobs();
-		this.timer = setInterval(() => {
-			void this.scanAnalysisJobs().catch(() => undefined);
-		}, 10_000);
-		this.timer.unref();
-	}
-
-	onModuleDestroy() {
-		if (this.timer) clearInterval(this.timer);
+		// Old jobs are not resumed automatically. Expired workers finish with a clear error.
+		const stale = await this.prisma.storyAnalysisJob.findMany({
+			where: {
+				OR: [
+					{ status: { in: ['QUEUED', 'WAITING'] }, updatedAt: { lte: new Date(Date.now() - 120_000) } },
+					{ status: 'PROCESSING', leaseExpiresAt: { lte: new Date() } }
+				]
+			},
+			select: { id: true, storyId: true, userId: true }
+		});
+		for (const job of stale) await this.waitForAnalysis(job.storyId, job.userId, job.id);
 	}
 
 	private async syncCharacters(
