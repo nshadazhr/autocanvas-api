@@ -25,6 +25,12 @@ export class AuthService {
 		private readonly googleAuthService: GoogleAuthService
 	) {}
 
+	async getProfile(userId: number) {
+		const user = await this.userService.getPublicProfile(userId);
+		if (!user) throw new UnauthorizedException();
+		return user;
+	}
+
 	async getUniqueEmail(email: string) {
 		const uniqueEmail = await this.userService.getUniqueEmail(email);
 		return uniqueEmail;

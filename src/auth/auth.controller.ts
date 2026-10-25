@@ -1,6 +1,6 @@
 import { AuthOriginGuard } from './services/auth-origin.guard.js';
 import { LoginRateGuard } from './services/login-rate.guard.js';
-import { Body, Controller, Get, Post, UseGuards, Request, Res, UnauthorizedException } from '@nestjs/common';
+import { Body, Controller, Get, Header, Post, UseGuards, Request, Res, UnauthorizedException } from '@nestjs/common';
 
 import { LoginDto, RegisterDto, VerifyOtpDto, ResendOtpDto } from './dto/register.dto.js';
 
@@ -156,7 +156,8 @@ export class AuthController {
 
 	@UseGuards(AuthGuard)
 	@Get('profile')
-	getProfile(@Request() req: any) {
-		return req.user;
+	@Header('Cache-Control', 'private, no-store')
+	getProfile(@Request() req: { user: { id: number } }) {
+		return this.authService.getProfile(req.user.id);
 	}
 }

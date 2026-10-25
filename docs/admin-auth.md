@@ -22,23 +22,23 @@ User, admin aur superadmin ke liye teen alag login systems nahi hain. User/admin
 
 All paths below are relative to the backend project root.
 
-| File | Responsibility / reusable part |
-| --- | --- |
-| `src/auth/auth.controller.ts` | Auth routes aur cookie set/clear helper. Login/refresh/logout ko service se connect karta hai. |
-| `src/auth/auth.service.ts` | Existing login, registration/OTP aur Google flow; `login(..., adminOnly)` user/admin logic reuse karta hai. |
-| `src/auth/services/token.service.ts` | Shared token issuance, audience/purpose validation, database-session checks aur revocation. |
-| `src/auth/auth.guard.ts` | AuthGuard user session check karta hai; AdminAuthGuard isi class ko extend karke admin audience select karta hai. |
-| `src/auth/services/admin.guard.ts` | Current database role ADMIN/SUPERADMIN hai ya nahi. Client ki role claim par trust nahi karta. |
-| `src/auth/services/superadmin.guard.ts` | AdminGuard reuse karke sirf SUPERADMIN allow karta hai. |
-| `src/auth/services/auth-origins.ts` | CORS aur auth Origin checks ke liye common application allowlists. |
-| `src/auth/services/auth-origin.guard.ts` | Auth mutations ko corresponding user/admin browser origin tak restrict karta hai. |
-| `src/auth/services/login-rate.guard.ts` | Password verify karne se pehle shared, database-backed login limits. |
-| `src/auth/admin-roles.controller.ts` | Superadmin-only user-list, role-change aur audit-list routes. Business logic service mein hai. |
-| `src/auth/services/admin-role.service.ts` | `changeRole()`, locked transaction, session revocation, audit aur server-only `bootstrap()` logic. |
-| `src/auth/dto/admin-role.dto.ts` | Allowed roles, reason length aur bounded query/pagination validation. |
-| `src/scripts/bootstrap-superadmin.ts` | Server command; existing role service reuse karta hai. Public bootstrap endpoint nahi hai. |
-| `src/auth/auth.module.ts` | Providers/controllers register karta hai; reusable guards/TokenService export karta hai. |
-| `prisma/schema.prisma` | User role, AuthSession, AuthRateBucket aur AdminRoleAudit ka data structure. |
+| File                                      | Responsibility / reusable part                                                                                    |
+| ----------------------------------------- | ----------------------------------------------------------------------------------------------------------------- |
+| `src/auth/auth.controller.ts`             | Auth routes aur cookie set/clear helper. Login/refresh/logout ko service se connect karta hai.                    |
+| `src/auth/auth.service.ts`                | Existing login, registration/OTP aur Google flow; `login(..., adminOnly)` user/admin logic reuse karta hai.       |
+| `src/auth/services/token.service.ts`      | Shared token issuance, audience/purpose validation, database-session checks aur revocation.                       |
+| `src/auth/auth.guard.ts`                  | AuthGuard user session check karta hai; AdminAuthGuard isi class ko extend karke admin audience select karta hai. |
+| `src/auth/services/admin.guard.ts`        | Current database role ADMIN/SUPERADMIN hai ya nahi. Client ki role claim par trust nahi karta.                    |
+| `src/auth/services/superadmin.guard.ts`   | AdminGuard reuse karke sirf SUPERADMIN allow karta hai.                                                           |
+| `src/auth/services/auth-origins.ts`       | CORS aur auth Origin checks ke liye common application allowlists.                                                |
+| `src/auth/services/auth-origin.guard.ts`  | Auth mutations ko corresponding user/admin browser origin tak restrict karta hai.                                 |
+| `src/auth/services/login-rate.guard.ts`   | Password verify karne se pehle shared, database-backed login limits.                                              |
+| `src/auth/admin-roles.controller.ts`      | Superadmin-only user-list, role-change aur audit-list routes. Business logic service mein hai.                    |
+| `src/auth/services/admin-role.service.ts` | `changeRole()`, locked transaction, session revocation, audit aur server-only `bootstrap()` logic.                |
+| `src/auth/dto/admin-role.dto.ts`          | Allowed roles, reason length aur bounded query/pagination validation.                                             |
+| `src/scripts/bootstrap-superadmin.ts`     | Server command; existing role service reuse karta hai. Public bootstrap endpoint nahi hai.                        |
+| `src/auth/auth.module.ts`                 | Providers/controllers register karta hai; reusable guards/TokenService export karta hai.                          |
+| `prisma/schema.prisma`                    | User role, AuthSession, AuthRateBucket aur AdminRoleAudit ka data structure.                                      |
 
 Reading order: **controller → AuthService → TokenService → guards**. Role management samajhna ho tab **AdminRolesController → AdminRoleService → bootstrap command** padhein. Generated Prisma files ko manually edit nahi karna hai.
 
@@ -46,20 +46,20 @@ Reading order: **controller → AuthService → TokenService → guards**. Role 
 
 Yahan “required” ka matlab current chosen behavior ko safely maintain karne ke liye required hai; har application ko ye saare features implement karna mandatory nahi hai.
 
-| Part | Kyun hai | Classification |
-| --- | --- | --- |
-| Password/user record logging remove karna | Password hash aur account data logs mein na jaaye. | Actual security fix. |
-| Server-side admin/superadmin checks | Normal user ko privileged APIs na milen. | Permission security ka core part. |
-| CORS mein admin origin | Admin frontend backend response access kar sake. | Functional integration fix. |
-| Persisted sessions + logout revocation | Logout ke baad copied tokens reuse na hon. | Required for the implemented revocation guarantee. |
-| Separate audiences, token kinds, cookies and origins | User/admin sessions aur access/refresh tokens interchange na hon. | Session separation security. |
-| Login limits | Repeated password attempts ko limit karna. | Recommended security hardening; basic login iske bina bhi function karta hai. |
-| Role-change transaction, revocation and last-superadmin lock | Role management se stale access ya concurrent lockout na ho. | Required protection while role-management API is enabled. |
-| Audit record save karna | Kisne, kis account ka role, kyun aur kab badla trace ho sake. | Useful security accountability; basic login ke liye mandatory nahi. |
-| User-list search, role filters and cursor pagination | Future admin UI ko accounts find karne mein help. | Optional management/UI support, already implemented. Bounded pagination endpoint ko controlled rakhti hai. |
-| Audit-view API and pagination | Audit records ko admin UI mein dekhna. | Optional viewing feature; audit write se separate hai. |
-| Same-role request ka `changed: false` response | Repeat click se unnecessary logout/audit entries na banen. | Convenience/idempotency behavior. |
-| Server bootstrap command | Public role-grant endpoint ke bina pehla superadmin setup. | Initial operational setup; daily login flow ka part nahi. |
+| Part                                                         | Kyun hai                                                          | Classification                                                                                             |
+| ------------------------------------------------------------ | ----------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------- |
+| Password/user record logging remove karna                    | Password hash aur account data logs mein na jaaye.                | Actual security fix.                                                                                       |
+| Server-side admin/superadmin checks                          | Normal user ko privileged APIs na milen.                          | Permission security ka core part.                                                                          |
+| CORS mein admin origin                                       | Admin frontend backend response access kar sake.                  | Functional integration fix.                                                                                |
+| Persisted sessions + logout revocation                       | Logout ke baad copied tokens reuse na hon.                        | Required for the implemented revocation guarantee.                                                         |
+| Separate audiences, token kinds, cookies and origins         | User/admin sessions aur access/refresh tokens interchange na hon. | Session separation security.                                                                               |
+| Login limits                                                 | Repeated password attempts ko limit karna.                        | Recommended security hardening; basic login iske bina bhi function karta hai.                              |
+| Role-change transaction, revocation and last-superadmin lock | Role management se stale access ya concurrent lockout na ho.      | Required protection while role-management API is enabled.                                                  |
+| Audit record save karna                                      | Kisne, kis account ka role, kyun aur kab badla trace ho sake.     | Useful security accountability; basic login ke liye mandatory nahi.                                        |
+| User-list search, role filters and cursor pagination         | Future admin UI ko accounts find karne mein help.                 | Optional management/UI support, already implemented. Bounded pagination endpoint ko controlled rakhti hai. |
+| Audit-view API and pagination                                | Audit records ko admin UI mein dekhna.                            | Optional viewing feature; audit write se separate hai.                                                     |
+| Same-role request ka `changed: false` response               | Repeat click se unnecessary logout/audit entries na banen.        | Convenience/idempotency behavior.                                                                          |
+| Server bootstrap command                                     | Public role-grant endpoint ke bina pehla superadmin setup.        | Initial operational setup; daily login flow ka part nahi.                                                  |
 
 Decision: implemented features abhi rakhe gaye hain. Future mein simplification chahiye to duplication ya unclear responsibilities se shuru karein; security behavior silently remove na karein. Extra login systems, generic permission frameworks ya unused layers add karne ki abhi zarurat nahi hai.
 
@@ -74,14 +74,14 @@ Decision: implemented features abhi rakhe gaye hain. Future mein simplification 
 - JWT_SECRET, JWT_REFRESH_SECRET, passwords, raw access/refresh tokens aur password hashes logs/docs mein paste na karein.
 - Frontend route hiding security boundary nahi hai; backend guards authoritative hain. Admin frontend screens abhi pending hain.
 
-| Symptom | Pehle kya check karein |
-| --- | --- |
-| HTTP 401 | Access token expired/revoked/legacy hai? User token admin endpoint par to nahi bheja? Refresh cookie correct hai? Role change/logout ne session revoke to nahi kiya? |
-| HTTP 403 | Current DB role aur browser Origin check karein; normal app origin se admin cookie operation intentionally blocked hai. |
-| HTTP 409 on role change | Target last superadmin to nahi hai? First-superadmin bootstrap existing superadmin ke baad different account ke liye intentionally blocked hai. |
-| HTTP 429 on login | Retry-After follow karein; account/IP limit, repeated successful attempts aur trusted reverse-proxy configuration check karein. |
-| Bootstrap account reject hua | Account pehle register + email verify hona chahiye; password login enabled hona chahiye. Command account create/auto-verify nahi karta. |
-| Tables/types missing at startup | Neeche listed migrations deploy hui hain aur Prisma client generate hua hai ya nahi check karein. |
+| Symptom                         | Pehle kya check karein                                                                                                                                               |
+| ------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| HTTP 401                        | Access token expired/revoked/legacy hai? User token admin endpoint par to nahi bheja? Refresh cookie correct hai? Role change/logout ne session revoke to nahi kiya? |
+| HTTP 403                        | Current DB role aur browser Origin check karein; normal app origin se admin cookie operation intentionally blocked hai.                                              |
+| HTTP 409 on role change         | Target last superadmin to nahi hai? First-superadmin bootstrap existing superadmin ke baad different account ke liye intentionally blocked hai.                      |
+| HTTP 429 on login               | Retry-After follow karein; account/IP limit, repeated successful attempts aur trusted reverse-proxy configuration check karein.                                      |
+| Bootstrap account reject hua    | Account pehle register + email verify hona chahiye; password login enabled hona chahiye. Command account create/auto-verify nahi karta.                              |
+| Tables/types missing at startup | Neeche listed migrations deploy hui hain aur Prisma client generate hua hai ya nahi check karein.                                                                    |
 
 Detailed endpoint contracts, configuration, bootstrap steps aur test commands neeche hain.
 
@@ -89,12 +89,12 @@ User and admin authentication have independent server-side sessions. Admin login
 
 ## Routes
 
-| Purpose | User application | Admin application |
-| --- | --- | --- |
-| Password login | POST /auth/login | POST /auth/admin/login |
-| Refresh | POST /auth/refresh | POST /auth/admin/refresh |
-| Logout | POST /auth/logout | POST /auth/admin/logout |
-| Session check | GET /auth/profile | GET /auth/admin/check |
+| Purpose        | User application   | Admin application        |
+| -------------- | ------------------ | ------------------------ |
+| Password login | POST /auth/login   | POST /auth/admin/login   |
+| Refresh        | POST /auth/refresh | POST /auth/admin/refresh |
+| Logout         | POST /auth/logout  | POST /auth/admin/logout  |
+| Session check  | GET /auth/profile  | GET /auth/admin/check    |
 
 Login responses contain the access token and safe user fields. Refresh tokens stay in separate HttpOnly cookies (`refresh_token` / `admin_refresh_token`). Cookies use Secure + SameSite=None in production and SameSite=Lax for local development. Admin check returns current id, name, email and role from the database.
 
@@ -124,10 +124,10 @@ JWT_SECRET and JWT_REFRESH_SECRET must be strong independent server-only secrets
 
 Limits are persisted in AuthRateBucket, shared across backend replicas, and enforced before password verification. They count admitted login requests, including successful logins, in fixed 15-minute UTC windows. Defaults:
 
-| Scope | Admin | User |
-| --- | --- | --- |
-| Per normalized email | 5 | 10 |
-| Per peer IP | 30 | 60 |
+| Scope                | Admin | User |
+| -------------------- | ----- | ---- |
+| Per normalized email | 5     | 10   |
+| Per peer IP          | 30    | 60   |
 
 Configure ADMIN_LOGIN_ACCOUNT_LIMIT, ADMIN_LOGIN_IP_LIMIT, LOGIN_ACCOUNT_LIMIT and LOGIN_IP_LIMIT with positive integers. Exceeding a limit returns HTTP 429 with Retry-After. Email/IP bucket identifiers are hashed. Arbitrary X-Forwarded-For headers are ignored; behind a reverse proxy, configure Express trust proxy for the known proxy addresses before relying on forwarded client IPs. Do not blindly trust all forwarded headers.
 
@@ -142,7 +142,6 @@ AUDIO_FLOW_TEST_DATABASE_URL=postgresql://postgres@127.0.0.1:55439/autocanvas_au
 The HTTP/PostgreSQL suite covers roles, sensitive logging, logout/replay, cross-application tokens, demotion, invalid/legacy tokens, input validation, concurrency/rate limits, independent sessions, origin checks and production cookie attributes. The audio/analysis regression suite remains separate under vitest.audio-flow.config.ts and uses a JWT-verification test double; real session enforcement is exercised by the auth suite.
 
 The admin frontend was not changed. Production deployment, live administrator accounts and email/Google provider calls were not used for these tests.
-
 
 ## Superadmin role management
 
@@ -172,3 +171,12 @@ The command promotes that existing verified password account, revokes its old se
 Migration `20261024060000_admin_role_audit` adds the audit table only. No real account is automatically promoted by deployment. Sensitive settings APIs can reuse SuperAdminGuard when they are introduced; no settings or frontend screens were added here.
 
 Verification includes 37 auth/superadmin HTTP/PostgreSQL tests, 54 audio/analysis regression tests and a full Nest smoke test running the bootstrap command in a separate process with disposable accounts and real password hashing.
+
+### User profile response
+
+`GET /auth/profile` uses the existing user-session guard, then loads the current
+user by the verified token ID. It returns only `{ id, name, email }` from the
+database (name can be null), with `Cache-Control: private, no-store`. Missing
+users receive 401. JWT/session claims, password hashes and credential fields are
+not profile fields. This keeps the saved name available after browser reload;
+login and token formats are unchanged.
