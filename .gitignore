@@ -85,3 +85,6 @@ report.[0-9]*.[0-9]*.[0-9]*.[0-9]*.json
 
 #adudio generated files
 uploads/
+
+# Ignore TypeScript build cache
+*.tsbuildinfo
