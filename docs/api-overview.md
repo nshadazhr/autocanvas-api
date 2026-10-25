@@ -158,3 +158,41 @@ Verification: API tests use `vitest.admin-audio-jobs.config.ts` and require an
 explicit local `_test` AUDIO_FLOW_TEST_DATABASE_URL (no application DB fallback).
 Frontend response checks run with `node --test tests/audio-jobs-response.test.cjs`.
 No database migration or generation/provider calls are needed for this section.
+
+## Analysis model setting (Super Admin)
+
+`GET /admin/settings/analysis-model` returns `{ model, source }`, where source is `database`, `environment` or `default`. `PATCH` accepts `{ "model": "exact-gemini-model-id" }`; `{ "model": null }` deletes the override and restores the backend fallback. Both require an admin-realm session and the current SUPERADMIN database role. Writes enforce the existing admin-origin guard. Responses are private/no-store. Unknown fields and invalid model IDs are rejected.
+
+Saving only validates a model ID's format (lowercase letters, digits, dots, underscores and hyphens, up to 120 characters). It does not call Google, list available models or guarantee access. This model endpoint does not manage credentials or select a different provider; the runtime controls below manage encrypted keys separately.
+
+## Runtime admin controls
+
+All `/admin/config/*` and `/admin/provider-keys/*` routes require an admin-realm session, current SUPERADMIN role and the existing origin guard for writes. Responses are private/no-store. Admin clients use their existing auth/refresh flow; user sessions cannot access these routes.
+
+| Route | Purpose |
+| --- | --- |
+| GET /admin/config/:section?locale=en | Read saved overrides (web) or effective values/defaults (private backend sections). |
+| PATCH /admin/config/:section | `{ values: { allowedKey: valueOrNull }, locale?: "en"|"hi" }`; null removes an override. |
+| PUT /admin/config/web-strings or /admin/config/web-settings | `{ values: { ...JSON }, locale?: "en"|"hi" }`; replaces the whole web override document, omitted keys restore local fallback. |
+| GET /app-config?locale=en | Public startup response `{ appSettings, appStrings, locale, features }`; private backend settings and provider credentials are never included. Omit locale to use the configured default language. |
+| GET /admin/provider-keys/:provider | Masked saved keys, environment/dashboard mode and encryption readiness. |
+| POST /admin/provider-keys/:provider | Add `{ name, key }` and switch to dashboard-managed mode. |
+| POST /admin/provider-keys/:provider/import-environment | Copy the single server environment key into encrypted management; replaces the selected key. |
+| POST /admin/provider-keys/:provider/use-environment | Explicitly restore environment mode; saved encrypted keys remain stored. |
+| PATCH /admin/provider-keys/:provider/:id | `{ enabled: boolean }`. |
+| DELETE /admin/provider-keys/:provider/:id | Clear the selected encrypted key and disable its row. Managed mode remains active; legacy extras/environment keys are not automatically selected. |
+
+Allowed config sections: `web-settings`, `web-strings`, `features`, `models`, `processing`, `pricing`. Allowed credential providers: `gemini`, `openai`. Private backend sections reject unknown fields, wrong types and invalid ranges. Web documents accept arbitrary keys: App Strings requires text values; App Settings supports nested JSON objects/arrays, booleans, numbers, null and text. Existing home-setting types and en/hi language values are validated. Unsafe object keys are rejected or stripped by request transformation; documents are limited to 64 KB and 20 nesting levels. No generated catalog or cross-repository sync is required. Web JSON is public, so credentials belong in Provider Keys. Dashboard values override local values; nested objects merge, arrays replace, and false/0/empty text remain overrides. HTML/placeholders are stored as text and are not automatically executed/expanded. Missing keys/translations fall back to local defaults. Important settings controls edit the same JSON keys; no separate store exists. Whole-document publishes use last-publish-wins; private sections do not accept PUT.
+
+Pricing drives wallet reservations and settlement; see Wallet and payments below. Provider selection/fallback for analysis was not changed: Gemini still handles analysis/audio and OpenAI handles outlines. Each provider has one selected key; analysis, outlines and audio have no automatic key rotation. TTS rate limits may schedule a job retry with the same key. The analysis-model endpoint remains backward compatible.
+
+The /app-config endpoint replaces /public/config; update web/API deployments together. The backend does not load ProviderCredential or private section values into this response. The browser fetches once per load and uses local defaults on failure. No frontend client secret is required for public data. Admin reads/writes retain independent admin-session/current-role/origin checks.
+
+
+## Wallet and payments
+
+Authenticated user routes: GET `/credits/wallet`, GET `/credits/history?cursor=...`, POST `/credits/quote` (kind ANALYSIS/AUDIO/SINGLE_AUDIO, storyId and optional sceneId/jobId/content). Wallet includes available/reserved balance, recent ledger, recent purchases, active packs and current pricing. Quotes are estimates; submission uses current server rates. Insufficient balance returns 402; payment-review block returns 403. Quotes and generation enforce story ownership; history cursors cannot read another wallet.
+
+GET `/credits/payments/config` returns enabled/mode only. POST `/credits/payments/orders` takes packId/requestId UUIDs, POST `/credits/payments/:purchaseId/verify` takes paymentId/signature, and POST `/credits/payments/:purchaseId/refresh` reconciles a lost callback. POST `/credits/payments/webhook` uses raw-body HMAC rather than browser authentication. Browser routes retain existing user auth/origin checks.
+
+Super Admin only: GET `/admin/credits/users?search=...`, GET `/admin/credits/users/:id`, POST `/admin/credits/users/:id/adjust` (signed integer amount, required reason, UUID requestId, optional unblock), GET/POST `/admin/credits/packs`, PATCH `/admin/credits/packs/:id`. Ordinary admins cannot change credits or packs. Deactivate packs rather than deleting payment history. The ledger records actor, reason, idempotency reference and settlement state; story deletion retains accounting history.

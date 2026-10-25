@@ -1,3 +1,4 @@
+import { CreditsService } from '../credits/credits.service.js';
 import { Test } from '@nestjs/testing';
 import { JwtService } from '@nestjs/jwt';
 import { ValidationPipe, type INestApplication } from '@nestjs/common';
@@ -26,14 +27,19 @@ describe.skipIf(!databaseUrl)('analysis retries and shared AI budgets', () => {
 	const limits: Record<string, string> = {};
 	const config = { get: (key: string) => limits[key] };
 	const usage = new AiUsageService(prisma as any, config as any);
-	const provider = { analyze: vi.fn() };
+	const provider = {
+		analyze: vi.fn(),
+		assertEnabled: vi.fn().mockResolvedValue(undefined),
+		getModel: vi.fn().mockResolvedValue('gemini-3.5-flash')
+	};
 	const service = new AudioStoriesService(
 		prisma as any,
 		provider as any,
 		new StoryParserService(),
 		new StoryAnalysisValidatorService(),
 		config as any,
-		usage
+		usage,
+		new CreditsService(prisma as any)
 	);
 	const result = {
 		characters: [{ name: 'Narrator', gender: 'Male' }],
@@ -73,6 +79,12 @@ describe.skipIf(!databaseUrl)('analysis retries and shared AI budgets', () => {
 		await app.init();
 	});
 	beforeEach(async () => {
+		await prisma.appSetting.upsert({
+			where: { key: 'runtime.pricing' },
+			create: { key: 'runtime.pricing', value: '{}' },
+			update: { value: '{}' }
+		});
+		await prisma.user.update({ where: { id: userId }, data: { creditBalance: 100, creditWelcomeGranted: true } });
 		for (const key of Object.keys(limits)) delete limits[key];
 		await prisma.storyAnalysisJob.updateMany({
 			where: { userId, status: { in: ['QUEUED', 'WAITING', 'PROCESSING'] } },
@@ -81,6 +93,7 @@ describe.skipIf(!databaseUrl)('analysis retries and shared AI budgets', () => {
 		await prisma.aiUsageBucket.deleteMany();
 		await prisma.aiRequestLease.deleteMany();
 		provider.analyze.mockReset().mockResolvedValue(result);
+		provider.getModel.mockReset().mockResolvedValue('gemini-3.5-flash');
 		storyId = (
 			await service.create(userId, { title: 'Test', content: 'A simple unstructured story about a person.' })
 		).id;
@@ -89,11 +102,53 @@ describe.skipIf(!databaseUrl)('analysis retries and shared AI budgets', () => {
 		await app?.close();
 		await prisma.audioScene.deleteMany({ where: { story: { userId } } });
 		await prisma.audioStory.deleteMany({ where: { userId } });
+		await prisma.creditTransaction.deleteMany({ where: { userId } });
+		await prisma.creditPurchase.deleteMany({ where: { userId } });
 		await prisma.user.delete({ where: { id: userId } });
 		await prisma.aiUsageBucket.deleteMany();
 		await prisma.aiRequestLease.deleteMany();
 		await prisma.$disconnect();
 	});
+	it('charges paid analysis once and reuses completed cached analysis for free', async () => {
+		await prisma.appSetting.update({
+			where: { key: 'runtime.pricing' },
+			data: { value: JSON.stringify({ analysisCredits: 10 }) }
+		});
+		const j = (await service.analyze(storyId, userId))!;
+		expect((await prisma.user.findUniqueOrThrow({ where: { id: userId } })).creditBalance).toBe(90);
+		await service.processAnalysisJob(j.id);
+		await service.analyze(storyId, userId);
+		expect((await prisma.user.findUniqueOrThrow({ where: { id: userId } })).creditBalance).toBe(90);
+		expect(await prisma.creditTransaction.count({ where: { userId, storyId, status: 'COMPLETED' } })).toBe(1);
+	});
+	it('refunds paid analysis on user cancellation', async () => {
+		await prisma.appSetting.update({
+			where: { key: 'runtime.pricing' },
+			data: { value: JSON.stringify({ analysisCredits: 10 }) }
+		});
+		const j = (await service.analyze(storyId, userId))!;
+		await service.cancelAnalysis(storyId, userId, j.id);
+		expect((await prisma.user.findUniqueOrThrow({ where: { id: userId } })).creditBalance).toBe(100);
+	});
+
+	it('reports invalid-key HTTP 400 as configuration failure and refunds the reservation', async () => {
+		await prisma.appSetting.update({
+			where: { key: 'runtime.pricing' },
+			data: { value: JSON.stringify({ analysisCredits: 10 }) }
+		});
+		provider.analyze.mockRejectedValue(
+			Object.assign(new Error('API key not valid. API_KEY_INVALID'), { status: 400 })
+		);
+		const j = (await service.analyze(storyId, userId))!;
+		await service.processAnalysisJob(j.id);
+		expect(await job(j.id)).toMatchObject({
+			status: 'FAILED',
+			errorCode: 'PROVIDER_CONFIGURATION_ERROR',
+			attempts: 1
+		});
+		expect((await prisma.user.findUniqueOrThrow({ where: { id: userId } })).creditBalance).toBe(100);
+	});
+
 	it('deduplicates concurrent submissions without consuming provider usage', async () => {
 		const jobs = await Promise.all(Array.from({ length: 5 }, () => service.analyze(storyId, userId)));
 		expect(new Set(jobs.map(j => j!.id)).size).toBe(1);
@@ -121,6 +176,17 @@ describe.skipIf(!databaseUrl)('analysis retries and shared AI budgets', () => {
 		await service.processAnalysisJob(j.id);
 		expect(await job(j.id)).toMatchObject({ status: 'COMPLETED', attempts: 6, nextRetryAt: null });
 		expect(provider.analyze).toHaveBeenCalledTimes(6);
+	});
+	it('keeps the starting model during busy retries when the setting changes', async () => {
+		provider.getModel.mockResolvedValueOnce('gemini-starting-model').mockResolvedValue('gemini-new-model');
+		provider.analyze.mockRejectedValueOnce(Object.assign(new Error('busy'), { status: 503 }));
+		const j = (await service.analyze(storyId, userId))!;
+		await service.processAnalysisJob(j.id);
+		expect(provider.getModel).toHaveBeenCalledTimes(1);
+		expect(provider.analyze.mock.calls.map(call => call[2])).toEqual([
+			'gemini-starting-model',
+			'gemini-starting-model'
+		]);
 	});
 	it('stops busy retries as soon as a different error arrives', async () => {
 		for (let i = 0; i < 4; i++)
@@ -183,6 +249,19 @@ describe.skipIf(!databaseUrl)('analysis retries and shared AI budgets', () => {
 			});
 			await service.cancelAnalysis(storyId, userId, j.id);
 		}
+	});
+	it('does not retry administrator-disabled or missing-credential errors', async () => {
+		provider.analyze.mockRejectedValue(
+			Object.assign(new Error('No enabled provider key'), { status: 503, nonRetryable: true })
+		);
+		const j = (await service.analyze(storyId, userId))!;
+		await service.processAnalysisJob(j.id);
+		expect(await job(j.id)).toMatchObject({
+			status: 'FAILED',
+			attempts: 1,
+			errorCode: 'PROVIDER_CONFIGURATION_ERROR'
+		});
+		expect(provider.analyze).toHaveBeenCalledTimes(1);
 	});
 	it('does not retry permanent authorization failures or expose provider keys', async () => {
 		provider.analyze.mockRejectedValue(Object.assign(new Error('AIzaSecretCredentials'), { status: 403 }));

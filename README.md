@@ -48,3 +48,22 @@ Missing test DB configuration causes those database suites to skip. Example conn
 ## Maintenance
 
 Reuse existing PrismaService, auth guards, TokenService, role service and StorageService. Keep SQL migrations with schema changes. Update DTOs, clients and docs when changing an API. Never commit real environment secrets, tokens or generated audio. Historical [backend handoff notes](AutoCanvas_Backend_Handoff.md) predate parts of the current implementation and are not the current API/port contract.
+
+## Runtime analysis model
+
+Apply migration `20261025002500_analysis_model_setting` before deploying this code, then regenerate Prisma:
+
+```sh
+npx prisma migrate deploy --config prisma7.config.ts
+npx prisma generate --config prisma7.config.ts
+```
+
+Super Admin can change the Gemini story-analysis model from the admin Global Settings page. Non-secret values live in AppSetting; GEMINI_MODEL remains a fallback until an override is saved. Changes affect new uncached analysis without a restart; running jobs keep their initial model. Resetting the setting restores the environment/default. Existing cached analysis is retained. API credentials remain backend-only and may be managed through encrypted provider-key storage; OpenAI analysis is not implemented. See [API overview](docs/api-overview.md) and [audio flow](docs/audio-flow.md).
+
+## Admin runtime controls
+
+Super Admin now manages shared web text (English/Hindi), public JSON app settings, new-AI/provider feature switches, analysis and outline model settings, one encrypted key per provider (Gemini/OpenAI), multi-scene recovery settings and credits pricing. Read [API overview](docs/api-overview.md), [operations](docs/operations.md) and [audio flow](docs/audio-flow.md) before deployment. Apply the ProviderCredential migration and configure server-only AI_KEYS_ENCRYPTION_KEY before adding/importing keys. Existing .env credentials remain fallback until managed mode is explicitly enabled. Credits billing and Razorpay INR checkout are implemented; activation requires merchant configuration. See operations for setup and limitations.
+
+The public app bootstrap is `GET /app-config` returning appStrings/appSettings/locale/features. Local frontend defaults remain the fallback. Admin saves reuse one existing AppSetting writer; encrypted provider credentials stay separate. No generated string catalog, new config table or schema migration is required. See the frontend guide for the four-step request/context/hook flow.
+
+Automatic provider key switching is removed. Only GEMINI_API_KEY / OPENAI_API_KEY or one explicitly managed key per provider are used; legacy multi-key env flags and per-key quota controls are ignored. See operations for safe handling of legacy saved rows.

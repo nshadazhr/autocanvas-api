@@ -8,6 +8,8 @@ export default defineConfig({
 		globals: true,
 		include: [
 			'src/audio-generation/audio-flow.integration.spec.ts',
+			'src/storage/audio-layout.spec.ts',
+			'src/audio-generation/providers/gemini-tts.spec.ts',
 			'src/audio-stories/analysis-flow.integration.spec.ts'
 		],
 		testTimeout: 20_000,

@@ -27,6 +27,12 @@ model User {
   created_at        DateTime  @default(now())
   email_verified_at DateTime?
 
+  creditBalance Int @default(0)
+  creditWelcomeGranted Boolean @default(false)
+  creditsBlocked Boolean @default(false)
+  creditTransactions CreditTransaction[]
+  creditPurchases CreditPurchase[]
+
   authSessions AuthSession[]
   identities AuthIdentity[]
   projects   Project[]
@@ -491,4 +497,69 @@ model AdminRoleAudit {
   reason String
   createdAt DateTime @default(now())
   @@index([targetId, id])
+}
+
+// Non-secret configuration only. Provider keys are encrypted in ProviderCredential, never in public appConfig.
+model AppSetting {
+  key       String   @id
+  value     String
+  updatedAt DateTime @updatedAt
+}
+
+model ProviderCredential {
+  id          String   @id @default(uuid())
+  provider    String
+  name        String
+  encrypted   String
+  fingerprint String
+  suffix      String
+  enabled     Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  @@unique([provider, fingerprint])
+  @@index([provider, enabled])
+}
+
+// Ledger references make reservations, refunds, grants and payment credits idempotent.
+model CreditTransaction {
+  id String @id @default(uuid())
+  userId Int
+  reference String @unique
+  amount Int
+  type String
+  status String
+  reason String
+  actorId Int?
+  storyId Int?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  user User @relation(fields: [userId], references: [id], onDelete: Restrict)
+  @@index([userId, createdAt, id])
+}
+model CreditPack {
+  id String @id @default(uuid())
+  name String
+  credits Int
+  amountPaise Int
+  active Boolean @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+model CreditPurchase {
+  id String @id @default(uuid())
+  userId Int
+  requestId String
+  packId String
+  packName String
+  credits Int
+  amountPaise Int
+  currency String @default("INR")
+  providerKeyId String
+  orderId String? @unique
+  paymentId String? @unique
+  status String @default("CREATING")
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  user User @relation(fields: [userId], references: [id], onDelete: Restrict)
+  @@unique([userId, requestId])
+  @@index([userId, createdAt])
 }

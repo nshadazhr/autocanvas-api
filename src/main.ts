@@ -9,6 +9,7 @@ import { join } from 'node:path';
 
 async function bootstrap() {
 	const app = await NestFactory.create<NestExpressApplication>(AppModule, {
+		rawBody: true,
 		instrument: ObserveInstrument
 	});
 
