@@ -2,6 +2,7 @@ import { StoryAnalysisSchema } from '../ai/schemas/story-analysis.schema.js';
 import { BadRequestException, ConflictException, HttpException, Injectable, NotFoundException } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service.js';
 import type { Prisma } from '../generated/prisma/client.js';
+import { readConfiguration } from '../settings/configuration-store.js';
 import { runtimeDefaults } from '../settings/runtime-settings.js';
 type Tx = Prisma.TransactionClient;
 export type CreditKind = 'ANALYSIS' | 'AUDIO' | 'SINGLE_AUDIO';
@@ -10,12 +11,16 @@ const MAX_BALANCE = 2_000_000_000;
 export class CreditsService {
 	constructor(private readonly prisma: PrismaService) {}
 	async pricing(tx: Tx = this.prisma) {
-		const row = await tx.appSetting.findUnique({ where: { key: 'runtime.pricing' } });
-		const saved = row ? JSON.parse(row.value) : {};
+		const saved = await readConfiguration(tx, 'credits_settings');
 		return Object.fromEntries(
 			Object.entries(runtimeDefaults.pricing).map(([key, fallback]) => {
 				const value = saved[key];
-				return [key, Number.isSafeInteger(value) && value >= 0 && value <= 1_000_000 ? value : fallback];
+				return [
+					key,
+					typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 && value <= 1_000_000
+						? value
+						: fallback
+				];
 			})
 		) as Record<keyof typeof runtimeDefaults.pricing, number>;
 	}

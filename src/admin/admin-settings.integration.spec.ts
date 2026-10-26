@@ -4,6 +4,7 @@ import {
 	AddProviderKeyDto,
 	ChangeProviderKeyDto
 } from './admin-provider-keys.controller.js';
+import { ConfigurationSnapshotService } from '../settings/configuration-snapshot.service.js';
 import { AppConfigController } from '../settings/app-config.controller.js';
 import { ProviderCredentialsService } from '../settings/provider-credentials.service.js';
 import 'reflect-metadata';
@@ -63,7 +64,11 @@ describe.skipIf(!url)('Super Admin analysis-model settings', () => {
 			AdminSettingsController.prototype,
 			'setModel'
 		);
-		Reflect.defineMetadata('design:paramtypes', [AppSettingsService], AdminRuntimeSettingsController);
+		Reflect.defineMetadata(
+			'design:paramtypes',
+			[AppSettingsService, ConfigurationSnapshotService],
+			AdminRuntimeSettingsController
+		);
 		Reflect.defineMetadata(
 			'design:paramtypes',
 			[String, SettingsPatchDto],
@@ -94,6 +99,10 @@ describe.skipIf(!url)('Super Admin analysis-model settings', () => {
 			],
 			providers: [
 				{ provide: AppSettingsService, useValue: settings },
+				{
+					provide: ConfigurationSnapshotService,
+					useValue: new ConfigurationSnapshotService(prisma as any, config as any, settings, credentials)
+				},
 				{ provide: ProviderCredentialsService, useValue: credentials },
 				{ provide: PrismaService, useValue: prisma },
 				{ provide: TokenService, useValue: tokens },
@@ -108,7 +117,7 @@ describe.skipIf(!url)('Super Admin analysis-model settings', () => {
 	});
 	beforeEach(async () => {
 		await prisma.providerCredential.deleteMany();
-		await prisma.appSetting.deleteMany();
+		await prisma.configuration.deleteMany();
 		configValues.GEMINI_MODEL = 'gemini-test-env';
 		configValues.GEMINI_API_KEY = 'AIza-fixture-secret-original';
 		configValues.AI_KEYS_ENCRYPTION_KEY = Buffer.alloc(32, 7).toString('base64');
@@ -116,7 +125,7 @@ describe.skipIf(!url)('Super Admin analysis-model settings', () => {
 	afterAll(async () => {
 		await app?.close();
 		await prisma.providerCredential.deleteMany();
-		await prisma.appSetting.deleteMany();
+		await prisma.configuration.deleteMany();
 		await prisma.user.deleteMany({ where: { id: { in: users } } });
 		await prisma.$disconnect();
 		if (oldSecret === undefined) delete process.env.JWT_REFRESH_SECRET;
@@ -173,7 +182,7 @@ describe.skipIf(!url)('Super Admin analysis-model settings', () => {
 			{ model: 'gemini-test', apiKey: 'not-accepted' }
 		])
 			await request(app.getHttpServer()).patch(endpoint).set(auth(superToken)).send(payload).expect(400);
-		expect(await prisma.appSetting.count()).toBe(0);
+		expect(await prisma.configuration.count()).toBe(0);
 	});
 	it('rejects cross-origin writes', async () => {
 		await request(app.getHttpServer())
@@ -182,7 +191,7 @@ describe.skipIf(!url)('Super Admin analysis-model settings', () => {
 			.set('Origin', 'https://untrusted.example')
 			.send({ model: 'gemini-test' })
 			.expect(403);
-		expect(await prisma.appSetting.count()).toBe(0);
+		expect(await prisma.configuration.count()).toBe(0);
 	});
 	it('checks the current DB role after token issuance', async () => {
 		await prisma.user.update({ where: { id: users[0] }, data: { role: 'ADMIN' } });
@@ -307,17 +316,74 @@ describe.skipIf(!url)('Super Admin analysis-model settings', () => {
 			.expect(400);
 		await request(app.getHttpServer()).get('/app-config?locale=xx').expect(400);
 	});
+
+	it('preserves sibling backend groups and both language documents during concurrent writes', async () => {
+		await Promise.all([
+			settings.updateSection('features', { audioEnabled: false }),
+			settings.updateSection('processing', { maxRecoveryAttempts: 5 }),
+			settings.replaceWebDocument('web-strings', { title: 'English' }, 'en'),
+			settings.replaceWebDocument('web-strings', { title: 'हिन्दी' }, 'hi')
+		]);
+		expect((await settings.section('features')).values.audioEnabled).toBe(false);
+		expect((await settings.section('processing')).values.maxRecoveryAttempts).toBe(5);
+		expect((await settings.section('web-strings', 'en')).values.title).toBe('English');
+		expect((await settings.section('web-strings', 'hi')).values.title).toBe('हिन्दी');
+		expect(await prisma.configuration.count()).toBe(2);
+	});
+	it('keeps model and credential mode together without losing either on reset', async () => {
+		await settings.setAnalysisModel('gemini-fixture-model');
+		await credentials.add('gemini', 'fixture', 'fixture-api-key-only');
+		expect((await settings.analysisModel()).model).toBe('gemini-fixture-model');
+		await settings.setAnalysisModel(null);
+		expect((await credentials.list('gemini')).managed).toBe(true);
+		await settings.setAnalysisModel('gemini-fixture-model-2');
+		await credentials.useEnvironment('gemini');
+		expect((await settings.analysisModel()).model).toBe('gemini-fixture-model-2');
+	});
+	it('exports grouped overrides and debug sources only to Super Admin without credentials', async () => {
+		await settings.replaceWebDocument('web-settings', { showStats: false, nested: { apiKey: 'do-not-export' } });
+		await settings.updateSection('processing', { maxRecoveryAttempts: 4 });
+		await credentials.add('gemini', 'fixture', 'fixture-api-key-only');
+		await prisma.configuration.create({ data: { key: 'future_service_settings', value: { enabled: true } } });
+		for (const route of ['export', 'debug']) {
+			await request(app.getHttpServer())
+				.get('/admin/config/' + route)
+				.expect(401);
+			await request(app.getHttpServer())
+				.get('/admin/config/' + route)
+				.set(auth(adminToken))
+				.expect(403);
+		}
+		const exported = await request(app.getHttpServer())
+			.get('/admin/config/export')
+			.set(auth(superToken))
+			.expect(200);
+		expect(exported.headers['cache-control']).toBe('private, no-store');
+		expect(exported.body.allConfig.app_settings.showStats).toBe(false);
+		expect(exported.body.allConfig.future_service_settings.enabled).toBe(true);
+		expect(exported.body.allConfig.app_settings.nested.apiKey).toBe('[REDACTED]');
+		expect(JSON.stringify(exported.body)).not.toContain('fixture-api-key-only');
+		expect(JSON.stringify(exported.body)).not.toContain('do-not-export');
+		const debug = await request(app.getHttpServer()).get('/admin/config/debug').set(auth(superToken)).expect(200);
+		expect(debug.body.effectiveConfig.backend_settings.processing.maxRecoveryAttempts).toEqual({
+			value: 4,
+			source: 'database'
+		});
+		expect(debug.body.effectiveConfig.gemini_settings.analysisModel.source).toBe('environment');
+		expect((await settings.appConfig()).appSettings.showStats).toBe(false);
+		expect(await settings.appConfig()).not.toHaveProperty('providerStatus');
+	});
 	it('publishes arbitrary web keys while keeping private backend sections separate', async () => {
-		await prisma.appSetting.create({
+		await prisma.configuration.create({
 			data: {
-				key: 'runtime.web-settings',
-				value: JSON.stringify({ showStats: false, customLabel: 'custom-public' })
+				key: 'app_settings',
+				value: { showStats: false, customLabel: 'custom-public' }
 			}
 		});
-		await prisma.appSetting.create({
+		await prisma.configuration.create({
 			data: {
-				key: 'web.strings.en',
-				value: JSON.stringify({ heroTitle: 'Visible', customLabel: 'custom-public' })
+				key: 'app_strings',
+				value: { en: { heroTitle: 'Visible', customLabel: 'custom-public' } }
 			}
 		});
 		const result = await settings.appConfig('en');

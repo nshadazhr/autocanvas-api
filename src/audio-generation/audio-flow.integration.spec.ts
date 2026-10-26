@@ -167,10 +167,10 @@ describe.skipIf(!databaseUrl)('audio flow with real PostgreSQL and stubbed Gemin
 	});
 
 	beforeEach(async () => {
-		await prisma.appSetting.upsert({
-			where: { key: 'runtime.pricing' },
-			create: { key: 'runtime.pricing', value: '{}' },
-			update: { value: '{}' }
+		await prisma.configuration.upsert({
+			where: { key: 'credits_settings' },
+			create: { key: 'credits_settings', value: {} },
+			update: { value: {} }
 		});
 		await prisma.user.update({ where: { id: userId }, data: { creditBalance: 100, creditWelcomeGranted: true } });
 		tts.generateSpeech.mockReset();
@@ -208,9 +208,9 @@ describe.skipIf(!databaseUrl)('audio flow with real PostgreSQL and stubbed Gemin
 	});
 
 	it('settles paid partial work and charges only the successful failed-scene retry', async () => {
-		await prisma.appSetting.update({
-			where: { key: 'runtime.pricing' },
-			data: { value: JSON.stringify({ audioCreditsPer1000Characters: 1000 }) }
+		await prisma.configuration.update({
+			where: { key: 'credits_settings' },
+			data: { value: { audioCreditsPer1000Characters: 1000 } }
 		});
 		tts.generateSpeech.mockRejectedValueOnce(new Error('Invalid voice configuration'));
 		const first = await service.createGenerationJob(story.id, userId);
@@ -222,9 +222,9 @@ describe.skipIf(!databaseUrl)('audio flow with real PostgreSQL and stubbed Gemin
 		expect((await prisma.user.findUniqueOrThrow({ where: { id: userId } })).creditBalance).toBe(86);
 	});
 	it('refunds paid pending cancellation exactly once', async () => {
-		await prisma.appSetting.update({
-			where: { key: 'runtime.pricing' },
-			data: { value: JSON.stringify({ audioCreditsPer1000Characters: 1000 }) }
+		await prisma.configuration.update({
+			where: { key: 'credits_settings' },
+			data: { value: { audioCreditsPer1000Characters: 1000 } }
 		});
 		const job = await service.createGenerationJob(story.id, userId);
 		await service.cancelGenerationJob(job.id, userId);
@@ -446,9 +446,9 @@ describe.skipIf(!databaseUrl)('audio flow with real PostgreSQL and stubbed Gemin
 		expect(history.scenes[0].lastGeneration?.status).toBe('FAILED');
 	});
 	it('charges a paid single-voice output and charges a new manual regeneration', async () => {
-		await prisma.appSetting.update({
-			where: { key: 'runtime.pricing' },
-			data: { value: JSON.stringify({ audioCreditsPer1000Characters: 1000 }) }
+		await prisma.configuration.update({
+			where: { key: 'credits_settings' },
+			data: { value: { audioCreditsPer1000Characters: 1000 } }
 		});
 		const project = await single.create(userId, 'Paid single', 'Hello');
 		await single.generate(project.id, userId, voice.id);

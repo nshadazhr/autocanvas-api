@@ -1,6 +1,7 @@
 import { BadRequestException, Injectable, NotFoundException, ServiceUnavailableException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { createCipheriv, createDecipheriv, createHash, randomBytes, randomUUID } from 'node:crypto';
+import { readConfiguration, writeConfiguration } from './configuration-store.js';
 import { PrismaService } from '../prisma/prisma.service.js';
 
 @Injectable()
@@ -52,7 +53,7 @@ export class ProviderCredentialsService {
 		return this.config.get<string>(provider === 'gemini' ? 'GEMINI_API_KEY' : 'OPENAI_API_KEY')?.trim() || '';
 	}
 	private modeKey(provider: string) {
-		return 'credentials.' + provider + '.managed';
+		return provider + '_settings';
 	}
 	async list(provider: string) {
 		this.provider(provider);
@@ -62,7 +63,7 @@ export class ProviderCredentialsService {
 		} catch {
 			encryptionReady = false;
 		}
-		const managed = await this.prisma.appSetting.findUnique({ where: { key: this.modeKey(provider) } });
+		const managed = await readConfiguration(this.prisma, this.modeKey(provider));
 		const keys = await this.prisma.providerCredential.findMany({
 			where: { provider },
 			take: 1,
@@ -70,7 +71,7 @@ export class ProviderCredentialsService {
 			select: { id: true, name: true, suffix: true, enabled: true, createdAt: true }
 		});
 		return {
-			managed: managed?.value === 'true',
+			managed: managed.credentialMode === 'dashboard',
 			encryptionReady,
 			environmentKeyCount: this.envKey(provider) ? 1 : 0,
 			keys: keys
@@ -80,8 +81,8 @@ export class ProviderCredentialsService {
 	}
 	async available(provider: string): Promise<Array<{ id: string; key: string }>> {
 		this.provider(provider);
-		const mode = await this.prisma.appSetting.findUnique({ where: { key: this.modeKey(provider) } });
-		if (mode?.value !== 'true') {
+		const mode = await readConfiguration(this.prisma, this.modeKey(provider));
+		if (mode.credentialMode !== 'dashboard') {
 			const key = this.envKey(provider);
 			return key ? [{ id: 'environment', key }] : [];
 		}
@@ -131,11 +132,7 @@ export class ProviderCredentialsService {
 				enabled: true
 			};
 			await tx.providerCredential.upsert({ where: { id }, create: { id, ...data }, update: data });
-			await tx.appSetting.upsert({
-				where: { key: this.modeKey(provider) },
-				create: { key: this.modeKey(provider), value: 'true' },
-				update: { value: 'true' }
-			});
+			await writeConfiguration(tx, this.modeKey(provider), { credentialMode: 'dashboard' });
 		});
 		return this.list(provider);
 	}
@@ -166,7 +163,7 @@ export class ProviderCredentialsService {
 	}
 	async useEnvironment(provider: string) {
 		this.provider(provider);
-		await this.prisma.appSetting.deleteMany({ where: { key: this.modeKey(provider) } });
+		await this.prisma.$transaction(tx => writeConfiguration(tx, this.modeKey(provider), { credentialMode: null }));
 		return this.list(provider);
 	}
 }

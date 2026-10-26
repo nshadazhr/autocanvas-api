@@ -29,7 +29,7 @@ Single narration and multi-scene generation are different project modes. Story a
 
 ## Analysis jobs
 
-`StoryAnalysisJob` records the snapshot/hash, status and attempts. Submission returns HTTP 202 with safe job metadata. Valid structured scripts use the local parser; otherwise Gemini is called. The Gemini analysis model is resolved from the non-secret AppSetting record at job start, with GEMINI_MODEL then gemini-3.5-flash as fallbacks. Busy retries keep that starting model; completed cached results are not invalidated by changing the model. Both paths require schema/consistency validation before saving scenes and characters atomically.
+`StoryAnalysisJob` records the snapshot/hash, status and attempts. Submission returns HTTP 202 with safe job metadata. Valid structured scripts use the local parser; otherwise Gemini is called. The Gemini analysis model is resolved from the non-secret `Configuration.gemini_settings.analysisModel` field at job start, with GEMINI_MODEL then gemini-3.5-flash as fallbacks. Busy retries keep that starting model; completed cached results are not invalidated by changing the model. Both paths require schema/consistency validation before saving scenes and characters atomically.
 
 - The frontend makes one authenticated `GET /audio-stories/:id/analysis-jobs/:jobId/wait` request, then fetches the story when work ends. There is no analysis polling interval, periodic scanner, heartbeat or countdown.
 - Only busy-server responses (500/502/503/504) retry, with a one-second wait between calls and no attempt limit. One iterative loop continues until success, cancellation, or a different error. Actual provider quota errors stop work; analysis has no custom application request budgets.

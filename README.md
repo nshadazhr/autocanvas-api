@@ -67,3 +67,10 @@ Super Admin now manages shared web text (English/Hindi), public JSON app setting
 The public app bootstrap is `GET /app-config` returning appStrings/appSettings/locale/features. Local frontend defaults remain the fallback. Admin saves reuse one existing AppSetting writer; encrypted provider credentials stay separate. No generated string catalog, new config table or schema migration is required. See the frontend guide for the four-step request/context/hook flow.
 
 Automatic provider key switching is removed. Only GEMINI_API_KEY / OPENAI_API_KEY or one explicitly managed key per provider are used; legacy multi-key env flags and per-key quota controls are ignored. See operations for safe handling of legacy saved rows.
+
+
+Configuration uses the native-JSON `Configuration` Prisma model. Before running
+this version on an existing database, deploy migration
+`20261026060000_configuration_groups` and regenerate Prisma using the setup commands
+above. It preserves existing settings in service groups; see
+[configuration migration and export](docs/operations.md#grouped-configuration-storage-and-diagnostics).

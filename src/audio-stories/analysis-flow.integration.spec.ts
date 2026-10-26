@@ -79,10 +79,10 @@ describe.skipIf(!databaseUrl)('analysis retries and shared AI budgets', () => {
 		await app.init();
 	});
 	beforeEach(async () => {
-		await prisma.appSetting.upsert({
-			where: { key: 'runtime.pricing' },
-			create: { key: 'runtime.pricing', value: '{}' },
-			update: { value: '{}' }
+		await prisma.configuration.upsert({
+			where: { key: 'credits_settings' },
+			create: { key: 'credits_settings', value: {} },
+			update: { value: {} }
 		});
 		await prisma.user.update({ where: { id: userId }, data: { creditBalance: 100, creditWelcomeGranted: true } });
 		for (const key of Object.keys(limits)) delete limits[key];
@@ -110,9 +110,9 @@ describe.skipIf(!databaseUrl)('analysis retries and shared AI budgets', () => {
 		await prisma.$disconnect();
 	});
 	it('charges paid analysis once and reuses completed cached analysis for free', async () => {
-		await prisma.appSetting.update({
-			where: { key: 'runtime.pricing' },
-			data: { value: JSON.stringify({ analysisCredits: 10 }) }
+		await prisma.configuration.update({
+			where: { key: 'credits_settings' },
+			data: { value: { analysisCredits: 10 } }
 		});
 		const j = (await service.analyze(storyId, userId))!;
 		expect((await prisma.user.findUniqueOrThrow({ where: { id: userId } })).creditBalance).toBe(90);
@@ -122,9 +122,9 @@ describe.skipIf(!databaseUrl)('analysis retries and shared AI budgets', () => {
 		expect(await prisma.creditTransaction.count({ where: { userId, storyId, status: 'COMPLETED' } })).toBe(1);
 	});
 	it('refunds paid analysis on user cancellation', async () => {
-		await prisma.appSetting.update({
-			where: { key: 'runtime.pricing' },
-			data: { value: JSON.stringify({ analysisCredits: 10 }) }
+		await prisma.configuration.update({
+			where: { key: 'credits_settings' },
+			data: { value: { analysisCredits: 10 } }
 		});
 		const j = (await service.analyze(storyId, userId))!;
 		await service.cancelAnalysis(storyId, userId, j.id);
@@ -132,9 +132,9 @@ describe.skipIf(!databaseUrl)('analysis retries and shared AI budgets', () => {
 	});
 
 	it('reports invalid-key HTTP 400 as configuration failure and refunds the reservation', async () => {
-		await prisma.appSetting.update({
-			where: { key: 'runtime.pricing' },
-			data: { value: JSON.stringify({ analysisCredits: 10 }) }
+		await prisma.configuration.update({
+			where: { key: 'credits_settings' },
+			data: { value: { analysisCredits: 10 } }
 		});
 		provider.analyze.mockRejectedValue(
 			Object.assign(new Error('API key not valid. API_KEY_INVALID'), { status: 400 })

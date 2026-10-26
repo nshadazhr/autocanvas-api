@@ -500,9 +500,9 @@ model AdminRoleAudit {
 }
 
 // Non-secret configuration only. Provider keys are encrypted in ProviderCredential, never in public appConfig.
-model AppSetting {
+model Configuration {
   key       String   @id
-  value     String
+  value     Json
   updatedAt DateTime @updatedAt
 }
 

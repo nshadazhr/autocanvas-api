@@ -100,13 +100,13 @@ Before first save/import, each provider uses its single environment key (GEMINI_
 
 GEMINI_API_KEYS, GEMINI_MULTI_KEY_ENABLED and GEMINI_RPM_LIMIT/GEMINI_RPD_LIMIT are no longer read; remove these obsolete entries from deployment configuration when convenient. Runtime processing controls now cover recovery attempts and retry delay only. Shared AI usage protections remain.
 
-Non-secret runtime configuration stays in AppSetting, separate from ProviderCredential. Backend .env retains infrastructure/auth/mail/storage secrets, server origins, the encryption master key, scanner timing and fallback values. Dashboard changes do not rewrite .env. Login protection is unchanged. Configuration/key change history is not added to the existing role-audit UI in this change.
+Non-secret runtime configuration stays in Configuration, separate from ProviderCredential. Backend .env retains infrastructure/auth/mail/storage secrets, server origins, the encryption master key, scanner timing and fallback values. Dashboard changes do not rewrite .env. Login protection is unchanged. Configuration/key change history is not added to the existing role-audit UI in this change.
 
 Feature switches block new analysis/audio/outline submissions. Maintenance blocks new AI work without blocking admin login, existing reads/downloads or cancellation. Provider switches also prevent subsequent provider requests; they do not abort a request already sent. Multi-scene recovery attempts/delay are read for new processing/recovery work; scanner interval remains deployment configuration. Script outlines reuse OpenAIProvider and resolve saved outline model and the current enabled key on each request.
 
 App Strings accepts arbitrary text keys; generated catalogs/export scripts are no longer needed. App Settings accepts arbitrary public JSON configuration. PUT /admin/config/web-strings and /admin/config/web-settings replace the whole override document (body: {values, locale}); PATCH remains partial and null removes a field. Omitted keys fall back locally, nested objects merge and arrays replace in the web resolver. Important controls edit the same JSON keys. Both documents are public; never store credentials there. Text HTML/placeholders stay data. Root must be an object; text values must be strings. Known home setting types/language, 64 KB document size, nesting depth and unsafe object keys are validated. Private backend sections retain strict allowlists and cannot use PUT. Hardcoded copy in other untouched pages is not automatically migrated. Credit pricing is enforced by wallet reservations and settlement; Razorpay activation requires the backend credentials below.
 
-Public configuration flow: `GET /app-config` -> frontend AppConfigProvider -> existing text/settings hooks. Response fields are appStrings/appSettings/locale/features; the old /public/config route is removed. Deploy web and API together. Each browser load fetches once; published changes require reload. No focus timer, polling, frontend secret, new database table or migration is added. Both save APIs reuse one transaction writer; PATCH merges fields while PUT replaces only the web override document. Existing saved AppSetting keys and encrypted ProviderCredential rows are unchanged. ProviderCredential remains separate because public JSON must never contain provider keys.
+Public configuration flow: `GET /app-config` -> frontend AppConfigProvider -> existing text/settings hooks. Response fields are appStrings/appSettings/locale/features; the old /public/config route is removed. Deploy web and API together. Each browser load fetches once; published changes require reload. There is no focus timer, polling or frontend secret. The Configuration migration below preserves existing configuration data. Both save APIs reuse one transaction writer; PATCH merges fields while PUT replaces only the web override document. Legacy AppSetting keys are consolidated by the Configuration migration; encrypted ProviderCredential rows are unchanged. ProviderCredential remains separate because public JSON must never contain provider keys.
 
 
 ## Credits and Razorpay INR
@@ -153,3 +153,65 @@ A Super Admin granted the test user 100 credits through the real guarded adjustm
 Reducing only the fixture wallet to 5 made a 12-credit generation return 402/INSUFFICIENT_CREDITS without creating paid work. After restoring the fixture balance, a controlled provider-disabled failure and its failed-scene retry each received separate reservations and full refunds. The provider-disabled setting affected only the disposable database; no global live feature flag was changed. The final wallet balance (78) matched completed grants/charges in the ledger exactly; released entries did not count as extra credits or charges. This test observed successful paid audio plus a real failed regeneration, rather than claiming another successful provider generation after its quota was exhausted.
 
 The web UI was connected to this real isolated API for wallet/refund-history checks and a 12-credit confirmation. Dismissing confirmation must issue no generation request. The test API, temporary uploads, synthetic accounts/sessions and disposable database are removed after verification. Razorpay settlement remains a separate pending merchant test.
+
+
+## Grouped Configuration storage and diagnostics
+
+Migration `20261026060000_configuration_groups` renames `AppSetting` to
+`Configuration`, converts text to native JSONB and folds rows into groups. It
+preserves saved values/timestamps and never decrypts or moves ProviderCredential.
+Stop old API processes before migration, back up configuration/database, run the
+existing migrate-deploy and generate commands above, then start the new API.
+Do not run an old API binary against the renamed table. On another development
+machine, pull migration/code and run these commands before starting the backend.
+
+| Configuration key | Contents |
+| --- | --- |
+| `app_strings` | Locale objects (`en`, `hi`), shared naming for future web/mobile/desktop consumers |
+| `app_settings` | Public app configuration overrides |
+| `backend_settings` | `features` and `processing` objects |
+| `gemini_settings` | `analysisModel`, provider `enabled`, `credentialMode` |
+| `openai_settings` | `outlineModel`, provider `enabled`, `credentialMode` |
+| `credits_settings` | Analysis/audio/welcome rates |
+
+Resend sender/key and Razorpay activation remain environment-backed; they are not
+silently migrated into unused database rows. Their safe effective/configured
+status appears in diagnostics. Audio model selection retains the existing voice/
+generation flow; no new audio model override is introduced here. Missing keys
+retain existing environment/code defaults. Settings HTTP section names and public
+`/app-config` fields remain compatible. Central mappings and the shared read/write
+helpers are in `src/settings/configuration-store.ts`. All grouped writers use the
+same transaction lock, so languages and provider/backend sibling fields survive
+concurrent updates. Credentials remain encrypted in their existing table.
+
+Super Admin → Global Settings offers **Export configuration** and **View debug
+snapshot**. Export `GET /admin/config/export` returns schemaVersion 1, exportedAt,
+`allConfig` (saved JSON overrides), credit packs and safe provider/payment status.
+New stored groups are included automatically. Debug `GET /admin/config/debug` adds
+`effectiveConfig` backend values with database/environment/default sources.
+Client defaults remain owned by each client; read web `allSettings`/`allStrings`
+for effective client values. Neither route is public or available to ordinary
+admins. Responses use private/no-store. No automatic logging or browser storage
+is introduced. Keys, encryption material, tokens and credential-like arbitrary
+JSON fields are excluded/redacted. Treat user-authored configuration text as
+private diagnostic data; never paste secrets into public app settings.
+
+This export is **not** a database/credential backup and has no import endpoint.
+Credit packs are exported with stable IDs, INR amounts in paise and active status;
+users, balances, ledger, purchases and generated files are not exported. Resend
+configuration editing, import/restore preview and configuration-change audit are
+planned, not implemented by this refactor. Existing role audit is unchanged.
+New fields/groups do not require schema migrations, but runtime consumers and
+validated admin editing still require code. Do not add a second value store.
+
+
+Verification for this migration/refactor: populated legacy migration fixture and
+configuration/provider/export integration regressions passed on a disposable
+local `_test` PostgreSQL database; audio/analysis (81 tests), credits (17 tests),
+settings/runtime clients (26 tests), migration preservation (1 test), backend
+TypeScript and build passed. Development migration was applied after a private
+configuration backup; all seven legacy rows matched their five resulting groups.
+The running public app-config contract and unauthenticated diagnostic rejection
+were read-checked. Admin download/debug/error states were browser-checked with
+mock API responses at 360, 393, 768 and 1440px in light/dark modes. No live provider
+request or payment was used. Admin TypeScript and isolated production build passed.

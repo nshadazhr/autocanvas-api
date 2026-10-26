@@ -51,10 +51,10 @@ describe.skipIf(!url)('Credit ledger and captured Razorpay payments', () => {
 	let providerPayment: any;
 	let orderCount = 0;
 	const pricing = (values = {}) =>
-		prisma.appSetting.upsert({
-			where: { key: 'runtime.pricing' },
-			create: { key: 'runtime.pricing', value: JSON.stringify(values) },
-			update: { value: JSON.stringify(values) }
+		prisma.configuration.upsert({
+			where: { key: 'credits_settings' },
+			create: { key: 'credits_settings', value: values },
+			update: { value: values }
 		});
 	const balance = async () => (await prisma.user.findUniqueOrThrow({ where: { id: userId } })).creditBalance;
 	const reserve = (ref: string, texts: string[] = [], kind: 'ANALYSIS' | 'AUDIO' = 'ANALYSIS') =>

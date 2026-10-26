@@ -3,7 +3,7 @@ import { ConfigService } from '@nestjs/config';
 import { PrismaService } from '../prisma/prisma.service.js';
 import { runtimeDefaults, type RuntimeSection, type RuntimeValues } from './runtime-settings.js';
 
-const ANALYSIS_MODEL_KEY = 'analysis.gemini.model';
+import { configurationGroups, readConfiguration, writeConfiguration, objectValue } from './configuration-store.js';
 type Values = Record<string, unknown>;
 
 @Injectable()
@@ -14,37 +14,32 @@ export class AppSettingsService {
 	) {}
 
 	async analysisModel() {
-		const saved = await this.prisma.appSetting.findUnique({ where: { key: ANALYSIS_MODEL_KEY } });
+		const saved = await readConfiguration(this.prisma, 'gemini_settings');
 		const fromEnv = this.config.get<string>('GEMINI_MODEL')?.trim();
 		return {
-			model: saved?.value ?? (fromEnv || 'gemini-3.5-flash'),
-			source: saved ? ('database' as const) : fromEnv ? ('environment' as const) : ('default' as const)
+			model: typeof saved.analysisModel === 'string' ? saved.analysisModel : fromEnv || 'gemini-3.5-flash',
+			source:
+				typeof saved.analysisModel === 'string'
+					? ('database' as const)
+					: fromEnv
+						? ('environment' as const)
+						: ('default' as const)
 		};
 	}
-
 	async setAnalysisModel(model: string | null) {
-		if (model === null) await this.prisma.appSetting.deleteMany({ where: { key: ANALYSIS_MODEL_KEY } });
-		else
-			await this.prisma.appSetting.upsert({
-				where: { key: ANALYSIS_MODEL_KEY },
-				create: { key: ANALYSIS_MODEL_KEY, value: model },
-				update: { value: model }
-			});
+		await this.prisma.$transaction(tx => writeConfiguration(tx, 'gemini_settings', { analysisModel: model }));
 		return this.analysisModel();
 	}
-
-	private sectionKey(name: string, locale: string) {
-		if (name !== 'web-strings' && !Object.hasOwn(runtimeDefaults, name))
-			throw new BadRequestException('Unknown settings section');
+	private location(name: string, locale: string) {
+		if (!Object.hasOwn(configurationGroups, name)) throw new BadRequestException('Unknown settings section');
 		if (!['en', 'hi'].includes(locale)) throw new BadRequestException('Unsupported language');
-		return name === 'web-strings' ? 'web.strings.' + locale : 'runtime.' + name;
+		const [key, path] = configurationGroups[name as keyof typeof configurationGroups] as readonly string[];
+		return { key: key!, path: name === 'web-strings' ? locale : path };
 	}
-
 	async section(name: string, locale = 'en') {
-		const key = this.sectionKey(name, locale);
-		const row = await this.prisma.appSetting.findUnique({ where: { key } });
-		const stored: Values = row ? JSON.parse(row.value) : {};
-		// Public web JSON contains only saved overrides. The web app owns its local defaults.
+		const { key, path } = this.location(name, locale);
+		const root = await readConfiguration(this.prisma, key);
+		const stored = path ? objectValue(root[path]) : root;
 		if (name === 'web-strings' || name === 'web-settings') return { values: stored, defaults: {} };
 		const defaults: RuntimeValues = { ...runtimeDefaults[name as RuntimeSection] };
 		if (name === 'models') defaults.outlineModel = this.config.get<string>('OPENAI_MODEL')?.trim() || 'gpt-4.1';
@@ -57,23 +52,32 @@ export class AppSettingsService {
 				if (Number.isSafeInteger(value) && value > 0) defaults[field] = value;
 			}
 		}
+		if (name === 'features') {
+			for (const provider of ['gemini', 'openai']) {
+				const providerSettings = await readConfiguration(this.prisma, provider + '_settings');
+				if (typeof providerSettings.enabled === 'boolean')
+					stored[provider + 'Enabled'] = providerSettings.enabled;
+			}
+		}
 		const allowed = Object.fromEntries(Object.entries(stored).filter(([key]) => Object.hasOwn(defaults, key)));
 		return { values: { ...defaults, ...allowed }, defaults };
 	}
-
-	/** One database writer: PUT replaces the document; PATCH merges fields and null removes them. */
-	private async save(key: string, values: Values, replace: boolean) {
+	private async save(name: string, locale: string, values: Values, replace: boolean) {
+		if (Buffer.byteLength(JSON.stringify(values)) > 65536)
+			throw new BadRequestException('JSON must be at most 64 KB');
+		const { key, path } = this.location(name, locale);
 		await this.prisma.$transaction(async tx => {
-			await tx.$queryRaw`SELECT 1 FROM pg_advisory_xact_lock(73127, 0)`;
-			const old = replace ? null : await tx.appSetting.findUnique({ where: { key } });
-			const next: Values = old ? JSON.parse(old.value) : {};
-			for (const [field, value] of Object.entries(values)) {
-				if (!replace && value === null) delete next[field];
-				else next[field] = value;
+			const patch = { ...values };
+			if (name === 'features') {
+				for (const provider of ['gemini', 'openai']) {
+					const field = provider + 'Enabled';
+					if (Object.hasOwn(patch, field)) {
+						await writeConfiguration(tx, provider + '_settings', { enabled: patch[field] });
+						delete patch[field];
+					}
+				}
 			}
-			const value = JSON.stringify(next);
-			if (Buffer.byteLength(value) > 65536) throw new BadRequestException('JSON must be at most 64 KB');
-			await tx.appSetting.upsert({ where: { key }, create: { key, value }, update: { value } });
+			await writeConfiguration(tx, key, patch, path, replace);
 		});
 	}
 
@@ -107,16 +111,16 @@ export class AppSettingsService {
 	}
 
 	async replaceWebDocument(name: string, values: Values, locale = 'en') {
-		const key = this.sectionKey(name, locale);
+		this.location(name, locale);
 		if (name !== 'web-strings' && name !== 'web-settings')
 			throw new BadRequestException('Only web configuration supports JSON replacement');
 		this.validateWebDocument(name, values, false);
-		await this.save(key, values, true);
+		await this.save(name, locale, values, true);
 		return this.section(name, locale);
 	}
 
 	async updateSection(name: string, values: Values, locale = 'en') {
-		const key = this.sectionKey(name, locale);
+		this.location(name, locale);
 		if (!values || typeof values !== 'object' || Array.isArray(values) || Object.keys(values).length > 200)
 			throw new BadRequestException('Invalid settings values');
 		if (name === 'web-strings' || name === 'web-settings') this.validateWebDocument(name, values, true);
@@ -140,7 +144,7 @@ export class AppSettingsService {
 					throw new BadRequestException('Retry delay must be at least 1000 ms');
 			}
 		}
-		await this.save(key, values, false);
+		await this.save(name, locale, values, false);
 		return this.section(name, locale);
 	}
 

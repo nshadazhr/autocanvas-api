@@ -196,3 +196,15 @@ Authenticated user routes: GET `/credits/wallet`, GET `/credits/history?cursor=.
 GET `/credits/payments/config` returns enabled/mode only. POST `/credits/payments/orders` takes packId/requestId UUIDs, POST `/credits/payments/:purchaseId/verify` takes paymentId/signature, and POST `/credits/payments/:purchaseId/refresh` reconciles a lost callback. POST `/credits/payments/webhook` uses raw-body HMAC rather than browser authentication. Browser routes retain existing user auth/origin checks.
 
 Super Admin only: GET `/admin/credits/users?search=...`, GET `/admin/credits/users/:id`, POST `/admin/credits/users/:id/adjust` (signed integer amount, required reason, UUID requestId, optional unblock), GET/POST `/admin/credits/packs`, PATCH `/admin/credits/packs/:id`. Ordinary admins cannot change credits or packs. Deactivate packs rather than deleting payment history. The ledger records actor, reason, idempotency reference and settlement state; story deletion retains accounting history.
+
+
+### Configuration export and debug (Super Admin only)
+
+`GET /admin/config/export` downloads versioned grouped saved overrides plus credit
+pack definitions and safe credential/payment availability. `GET /admin/config/debug`
+adds effective backend values and their sources. Both reuse origin/admin/superadmin
+guards and private/no-store headers; ordinary admins/users cannot access them.
+No full credentials, encrypted credentials or environment dump is returned.
+There is no import route. See [operations](operations.md#grouped-configuration-storage-and-diagnostics)
+for group names, migration and verification boundaries. Existing section URLs,
+analysis-model/key management and public app-config payloads are unchanged.
