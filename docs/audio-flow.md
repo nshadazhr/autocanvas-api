@@ -95,7 +95,7 @@ Runtime controls: new analysis/audio/outline submissions enforce their feature f
 
 A user-row database lock serializes balance mutations. Creation reserves funds in the same transaction as the job: one entry for analysis, one per audio item, or one for a single-voice attempt. Cost is fixed at reservation. Analysis costs the configured fixed rate; cached valid completed analysis is free. Audio charges ceil(trimmed Unicode code points × rate / 1000), separately per scene/output; hidden provider prompts are excluded. Single voice uses the submitted script including its text tags.
 
-Saving a successful asset and completing its charge share a transaction. Terminal failure/cancellation releases unused reservations once, while busy/recovery waits retain them. Successful scenes stay charged when another scene fails or the job is cancelled. Provider retries reuse the reservation; manual failed-scene retry creates a new reservation after the failed one was refunded. Manual regeneration is a new paid operation. Legacy jobs already running before billing deployment are not retroactively charged. The client confirms nonzero estimates, but the server computes all costs and enforces balance. Credits do not replace provider quotas.
+Saving a successful asset and completing its charge share a transaction. Terminal item failure locks the job row and validates the current worker before marking the item failed and releasing its reservation in the same transaction. An obsolete worker cannot refund a replacement worker’s hold. Cancellation releases unused reservations once, while busy/recovery waits retain them. Successful scenes stay charged when another scene fails or the job is cancelled. Provider retries reuse the reservation; manual failed-scene retry creates a new reservation after the failed one was refunded. Manual regeneration is a new paid operation. Legacy jobs already running before billing deployment are not retroactively charged. The client confirms nonzero estimates, but the server computes all costs and enforces balance. Credits do not replace provider quotas.
 
 Invalid/expired Gemini API keys may arrive as HTTP 400 (API_KEY_INVALID), not just 401/403. Analysis reports these as PROVIDER_CONFIGURATION_ERROR; audio uses a safe configuration message, no key switching or automatic retry. Failed reservations are released. Fix the configured key rather than modifying the story or repeatedly submitting.
 
@@ -127,6 +127,8 @@ missing jobs and current-result scope using fixture persistence.
 Recovery regression coverage includes cancel/regenerate between the pending read
 and claim, audio completion between recovery scan and row claim, analysis lease
 replacement between stale read and cleanup, and model lookup failures including
-a concurrently leased worker. These use real disposable PostgreSQL with stubbed
+a concurrently leased worker. Terminal-failure coverage also replaces worker ownership
+between the optimistic check and settlement, verifies the hold stays reserved,
+and verifies the replacement’s successful audio completes the charge. These use real disposable PostgreSQL with stubbed
 providers/storage and assert credit reservations/settlement as well as status.
 See the remaining critical audit findings in [operations](operations.md#critical-audit-after-recovery-fixes-2026-10-27).

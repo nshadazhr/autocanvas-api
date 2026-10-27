@@ -690,8 +690,16 @@ export class audioGenerationService implements OnModuleInit, OnModuleDestroy {
 					}
 
 					await this.prisma.$transaction(async tx => {
-						await this.credits.finish(tx, 'audio:' + item.id, false);
-						await tx.audioGenerationJobItem.updateMany({
+						// Serialize settlement with cancellation, recovery and successful commits.
+						await tx.$queryRaw`SELECT id FROM "AudioGenerationJob" WHERE id = ${jobId} FOR UPDATE`;
+						if (
+							!(await tx.audioGenerationJob.findFirst({
+								where: { id: jobId, status: 'PROCESSING', started_at: startedAt },
+								select: { id: true }
+							}))
+						)
+							return;
+						const failed = await tx.audioGenerationJobItem.updateMany({
 							where: {
 								id: item.id,
 								status: 'PROCESSING',
@@ -704,6 +712,7 @@ export class audioGenerationService implements OnModuleInit, OnModuleDestroy {
 								completed_at: new Date()
 							}
 						});
+						if (failed.count === 1) await this.credits.finish(tx, 'audio:' + item.id, false);
 					});
 				}
 

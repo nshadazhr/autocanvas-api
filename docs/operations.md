@@ -242,21 +242,27 @@ were used. The temporary test database was removed after verification.
    Restrict private audio to owned authenticated endpoints while preserving any
    intentionally public voice-preview assets. Production exposure/bucket policy
    was not tested.
-2. **An obsolete multi-audio failure can refund its replacement's hold.** In
-   `processGenerationJob`'s terminal item-error transaction, credits.finish(false)
-   runs before the item update checks job ownership. If recovery changes the
-   owner between the earlier ownsJob check and that transaction, the item update
-   affects zero rows but its shared reservation is already refunded. A real
-   disposable-PostgreSQL interleaving reproduced a PROCESSING replacement item
-   with a REFUNDED reservation. Its later success cannot recapture that refunded
-   hold, because settlement only changes RESERVED entries. Fix by locking and
-   validating current ownership before settlement and changing failure state in
-   the same transaction, using the existing fields/lock conventions.
+### Follow-up fix: stale worker credit refund (2026-10-27)
 
-The second finding used a temporary targeted test (one selected case, remaining
-cases skipped), separate from the passing regression suites; it demonstrates a
-remaining bug rather than a new passing protection. It was not added as a
-failing project test. No additional confirmed payment-signature, duplicate-credit
+Implemented without schema/API changes: terminal item failure now locks the
+AudioGenerationJob row and verifies its PROCESSING status and worker timestamp
+inside the settlement transaction. Only a successfully failed current item can
+release its reservation. This uses the same job-row lock as cancellation,
+recovery and successful asset commits.
+
+A permanent PostgreSQL regression test replaces ownership after the optimistic
+worker check but before the failure transaction. It verifies the replacement item
+stays PROCESSING, its credit reservation stays RESERVED, and its later successful
+audio settles the reservation as COMPLETED. This supersedes the earlier temporary
+audit reproduction of a refunded replacement hold.
+
+Follow-up verification: all 87 audio/analysis tests and 17 credits/payment tests
+passed against a newly created local disposable database with existing migrations.
+Type checking, changed TypeScript formatting and diff whitespace checks passed.
+Provider/storage/payment calls were stubbed; the disposable database was removed
+after verification. No production data or live provider calls were used.
+
+No additional confirmed payment-signature, duplicate-credit
 or cross-owner authenticated audio-access issue was found in the inspected paths
 and existing isolated tests. This is a targeted audit, not a claim of complete
 production security or provider reliability.

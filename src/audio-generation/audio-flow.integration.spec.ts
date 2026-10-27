@@ -517,6 +517,55 @@ describe.skipIf(!databaseUrl)('audio flow with real PostgreSQL and stubbed Gemin
 			})
 		).toBe(1);
 	});
+	it('a late terminal failure cannot refund a replacement worker reservation', async () => {
+		await prisma.configuration.update({
+			where: { key: 'credits_settings' },
+			data: { value: { audioCreditsPer1000Characters: 1000 } }
+		});
+		const job = await service.createSingleSceneJob(story.id, scenes[0].id, userId);
+		const item = (await service.getGenerationJob(job.id, userId)).items[0];
+		const transaction = prisma.$transaction.bind(prisma);
+		let replacementStartedAt!: Date;
+		let interleaved = false;
+		let transactionSpy: ReturnType<typeof vi.spyOn> | undefined;
+		const generate = vi.spyOn(service, 'generateSceneAudio').mockImplementationOnce(async () => {
+			// Replace ownership after the catch's optimistic ownsJob check, but
+			// before its settlement transaction starts.
+			transactionSpy = vi.spyOn(prisma as any, '$transaction').mockImplementationOnce(async (callback: any) => {
+				const current = await prisma.audioGenerationJob.findUniqueOrThrow({ where: { id: job.id } });
+				replacementStartedAt = new Date(current.started_at!.getTime() + 1000);
+				await prisma.audioGenerationJob.update({
+					where: { id: job.id },
+					data: { started_at: replacementStartedAt }
+				});
+				interleaved = true;
+				return transaction(callback);
+			});
+			throw new Error('Invalid audio request');
+		});
+		try {
+			await service.processGenerationJob(job.id);
+		} finally {
+			transactionSpy?.mockRestore();
+			generate.mockRestore();
+		}
+		expect(interleaved).toBe(true);
+		expect((await service.getGenerationJob(job.id, userId)).status).toBe('PROCESSING');
+		expect((await prisma.audioGenerationJobItem.findUniqueOrThrow({ where: { id: item.id } })).status).toBe(
+			'PROCESSING'
+		);
+		expect(
+			(await prisma.creditTransaction.findUniqueOrThrow({ where: { reference: 'audio:' + item.id } })).status
+		).toBe('RESERVED');
+		await service.generateSceneAudio(item.sceneId, undefined, undefined, undefined, item.id, {
+			jobId: job.id,
+			startedAt: replacementStartedAt
+		});
+		expect(
+			(await prisma.creditTransaction.findUniqueOrThrow({ where: { reference: 'audio:' + item.id } })).status
+		).toBe('COMPLETED');
+		expect(await prisma.sceneAudio.count({ where: { jobItemId: item.id } })).toBe(1);
+	});
 	it('recovery preserves audio committed after its stale scan and before the row claim', async () => {
 		const j = await service.createSingleSceneJob(story.id, scenes[0].id, userId);
 		const item = (await service.getGenerationJob(j.id, userId)).items[0];
