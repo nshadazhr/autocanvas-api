@@ -784,16 +784,7 @@ export class audioGenerationService implements OnModuleInit, OnModuleDestroy {
 		const { values: processing } = await this.settings.section('processing');
 		const interruptedJobs = await this.prisma.audioGenerationJob.findMany({
 			where: { status: 'PROCESSING', updated_at: { lt: new Date(Date.now() - 5 * 60_000) } },
-			select: {
-				id: true,
-				items: {
-					where: { status: 'PROCESSING' },
-					select: {
-						id: true,
-						attempts: true
-					}
-				}
-			}
+			select: { id: true }
 		});
 
 		for (const job of interruptedJobs) {
@@ -803,7 +794,13 @@ export class audioGenerationService implements OnModuleInit, OnModuleDestroy {
 					data: { status: 'WAITING' }
 				});
 				if (claimed.count !== 1) return;
-				for (const item of job.items) {
+				// The job row is locked by the claim. Re-read items after that lock so
+				// a completed commit between the scan and claim cannot be overwritten.
+				const processingItems = await tx.audioGenerationJobItem.findMany({
+					where: { jobId: job.id, status: 'PROCESSING' },
+					select: { id: true, attempts: true }
+				});
+				for (const item of processingItems) {
 					const exhausted = item.attempts >= Number(processing.maxRecoveryAttempts);
 					if (exhausted) await this.credits.finish(tx, 'audio:' + item.id, false);
 

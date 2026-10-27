@@ -1,3 +1,5 @@
+import { AdminAnalysisJobsController } from './admin-analysis-jobs.controller.js';
+import { AdminAnalysisJobsService } from './admin-analysis-jobs.service.js';
 import { AdminCreditsController } from './admin-credits.controller.js';
 import { CreditsModule } from '../credits/credits.module.js';
 import { AdminRuntimeSettingsController } from './admin-runtime-settings.controller.js';
@@ -14,6 +16,7 @@ import { AdminDashboardService } from './admin-dashboard.service.js';
 @Module({
 	imports: [CreditsModule, AuthModule, AppSettingsModule],
 	controllers: [
+		AdminAnalysisJobsController,
 		AdminCreditsController,
 		AdminDashboardController,
 		AdminAudioJobsController,
@@ -21,6 +24,6 @@ import { AdminDashboardService } from './admin-dashboard.service.js';
 		AdminRuntimeSettingsController,
 		AdminProviderKeysController
 	],
-	providers: [PrismaService, AdminDashboardService, AdminAudioJobsService]
+	providers: [AdminAnalysisJobsService, PrismaService, AdminDashboardService, AdminAudioJobsService]
 })
 export class AdminModule {}

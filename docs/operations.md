@@ -19,17 +19,17 @@ See the web repository's `docs/development.md` for the three local applications/
 
 ## Configuration groups
 
-| Group | Variables / source |
-| --- | --- |
-| DB and auth | DATABASE_URL, JWT_SECRET, JWT_REFRESH_SECRET; `prisma7.config.ts`, `src/auth/`. |
-| Server | PORT, NODE_ENV; `src/main.ts`. |
-| Origins and login limits | REQUEST_ORIGIN_PORT, ADMIN_ORIGIN, additional application origins and limit names documented in [admin-auth.md](admin-auth.md). |
-| Email / Google | RESEND_API_KEY, optional RESEND_FROM_EMAIL; GOOGLE_CLIENT_ID. |
-| AI | GEMINI_API_KEY and optional GEMINI_MODEL; OPENAI_API_KEY and optional OPENAI_MODEL for script outlines. |
-| Shared provider/admission caps | AI_* and ANALYSIS_* names/defaults in [audio-flow.md](audio-flow.md). |
-| Audio recovery | AUDIO_MAX_RECOVERY_ATTEMPTS, AUDIO_RECOVERY_RETRY_DELAY_MS, AUDIO_RETRY_SCAN_INTERVAL_MS. |
-| Storage | STORAGE_PROVIDER; Supabase URL/service-role key/bucket when selected. See [storage.md](storage.md). |
-| Diagnostics | AI_DIAGNOSTICS_USER_IDS; no implicit role bypass. |
+| Group                          | Variables / source                                                                                                              |
+| ------------------------------ | ------------------------------------------------------------------------------------------------------------------------------- |
+| DB and auth                    | DATABASE_URL, JWT_SECRET, JWT_REFRESH_SECRET; `prisma7.config.ts`, `src/auth/`.                                                 |
+| Server                         | PORT, NODE_ENV; `src/main.ts`.                                                                                                  |
+| Origins and login limits       | REQUEST_ORIGIN_PORT, ADMIN_ORIGIN, additional application origins and limit names documented in [admin-auth.md](admin-auth.md). |
+| Email / Google                 | RESEND_API_KEY, optional RESEND_FROM_EMAIL; GOOGLE_CLIENT_ID.                                                                   |
+| AI                             | GEMINI_API_KEY and optional GEMINI_MODEL; OPENAI_API_KEY and optional OPENAI_MODEL for script outlines.                         |
+| Shared provider/admission caps | AI_* and ANALYSIS_* names/defaults in [audio-flow.md](audio-flow.md).                                                           |
+| Audio recovery                 | AUDIO_MAX_RECOVERY_ATTEMPTS, AUDIO_RECOVERY_RETRY_DELAY_MS, AUDIO_RETRY_SCAN_INTERVAL_MS.                                       |
+| Storage                        | STORAGE_PROVIDER; Supabase URL/service-role key/bucket when selected. See [storage.md](storage.md).                             |
+| Diagnostics                    | AI_DIAGNOSTICS_USER_IDS; no implicit role bypass.                                                                               |
 
 The environment example is not a complete runnable configuration. Never commit a real `.env`, provider key, signing secret, refresh cookie or connection credential. NEXT_PUBLIC frontend variables must not contain backend secrets. Current application startup constructs AI/email clients even if a particular request does not use them.
 
@@ -71,17 +71,17 @@ After a relevant change, verify only the affected flows and their boundaries. Us
 
 ## Troubleshooting map
 
-| Symptom | First checks |
-| --- | --- |
-| Boot/table/column error | Correct DATABASE_URL, migration status and generated client; do not immediately reset data. |
-| 401 after logout/role change/upgrade | Intentional session revocation or legacy tokens; sign in through the correct application flow. |
-| 403 admin request | Current DB role, token audience and admin Origin; role alone does not bypass diagnostic allowlists. |
-| 429 login | Retry-After and fixed-window account/IP caps; check proxy IP handling if many people share a peer. |
-| Provider job WAITING | Next retry time, shared usage buckets and provider retry/network status. |
-| Failed attempt but old audio plays | Expected: old files are preserved; inspect the latest item error/current revision. |
-| Audio file missing/export fails | Persisted provider/key, original bucket/root, current revision and metadata/file existence. |
-| Correct job but UI blank/crashes | Verify latest-job response shape, no-job empty response handling and full history; do not infer all scenes from a retry job. |
-| Duplicate UI requests | Polling is expected. Check mutation idempotency/refs and backend conflicts before blaming a repeated status GET. |
+| Symptom                              | First checks                                                                                                                 |
+| ------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------- |
+| Boot/table/column error              | Correct DATABASE_URL, migration status and generated client; do not immediately reset data.                                  |
+| 401 after logout/role change/upgrade | Intentional session revocation or legacy tokens; sign in through the correct application flow.                               |
+| 403 admin request                    | Current DB role, token audience and admin Origin; role alone does not bypass diagnostic allowlists.                          |
+| 429 login                            | Retry-After and fixed-window account/IP caps; check proxy IP handling if many people share a peer.                           |
+| Provider job WAITING                 | Next retry time, shared usage buckets and provider retry/network status.                                                     |
+| Failed attempt but old audio plays   | Expected: old files are preserved; inspect the latest item error/current revision.                                           |
+| Audio file missing/export fails      | Persisted provider/key, original bucket/root, current revision and metadata/file existence.                                  |
+| Correct job but UI blank/crashes     | Verify latest-job response shape, no-job empty response handling and full history; do not infer all scenes from a retry job. |
+| Duplicate UI requests                | Polling is expected. Check mutation idempotency/refs and backend conflicts before blaming a repeated status GET.             |
 
 Log safe resource IDs, status/error codes and timestamps. Redact tokens/credentials and avoid logging full scripts/provider responses or user password records. Historical handoffs are reference material; code and these current docs are the implementation contract.
 
@@ -108,7 +108,6 @@ App Strings accepts arbitrary text keys; generated catalogs/export scripts are n
 
 Public configuration flow: `GET /app-config` -> frontend AppConfigProvider -> existing text/settings hooks. Response fields are appStrings/appSettings/locale/features; the old /public/config route is removed. Deploy web and API together. Each browser load fetches once; published changes require reload. There is no focus timer, polling or frontend secret. The Configuration migration below preserves existing configuration data. Both save APIs reuse one transaction writer; PATCH merges fields while PUT replaces only the web override document. Legacy AppSetting keys are consolidated by the Configuration migration; encrypted ProviderCredential rows are unchanged. ProviderCredential remains separate because public JSON must never contain provider keys.
 
-
 ## Credits and Razorpay INR
 
 Apply `20261025120000_credits_and_payments` and regenerate Prisma before starting API, web or admin. Existing users start with zero credits and no retroactive welcome grant. Newly verified users receive the configured welcome grant once, when their wallet is first used. Defaults are zero; Super Admin configures rates and packs on Pricing & Credits.
@@ -122,7 +121,6 @@ Refunds/disputes freeze new wallet spending for manual review; the app does not 
 Payment signing-key rotation with outstanding orders requires operational care: verification uses the currently configured secret; retain working provider access and reconcile outstanding purchases before rotating keys. Production payment activation and real test-mode checkout require merchant credentials and a reachable signed webhook; automated tests use mocked provider responses, never live money.
 
 Disposable database verification: `AUDIO_FLOW_TEST_DATABASE_URL=postgresql://postgres@127.0.0.1:5432/autocanvas_test npx vitest run --config vitest.credits.config.ts`. Tests reject non-local/non-test URLs. Existing audio tests also exercise paid reservation, partial failure, retry and cancellation. No AI/provider requests are made in these fixtures.
-
 
 ### Live verification — 2026-10-25
 
@@ -143,7 +141,6 @@ Cleanup also exposed a real generated-story deletion failure: composite scene/jo
 
 Verification data is synthetic. Its generated local/cloud objects, owned database rows and auth sessions are removed only after checking jobs are terminal and reservations are released. Global table/bucket cleanup is never used. Deleting a normal story still does not imply automatic object-storage garbage collection; see the storage guide.
 
-
 ### Nonzero credit utilization verification — 2026-10-25
 
 A disposable database and separate API on a temporary local port were used, so live pricing and real users' balances were unchanged. The isolated API reused the configured Gemini key for real requests. Test rates were analysis 10 credits, audio 1,000 credits per 1,000 Unicode characters, and welcome 25; these are verification values, not a recommended production price.
@@ -153,7 +150,6 @@ A Super Admin granted the test user 100 credits through the real guarded adjustm
 Reducing only the fixture wallet to 5 made a 12-credit generation return 402/INSUFFICIENT_CREDITS without creating paid work. After restoring the fixture balance, a controlled provider-disabled failure and its failed-scene retry each received separate reservations and full refunds. The provider-disabled setting affected only the disposable database; no global live feature flag was changed. The final wallet balance (78) matched completed grants/charges in the ledger exactly; released entries did not count as extra credits or charges. This test observed successful paid audio plus a real failed regeneration, rather than claiming another successful provider generation after its quota was exhausted.
 
 The web UI was connected to this real isolated API for wallet/refund-history checks and a 12-credit confirmation. Dismissing confirmation must issue no generation request. The test API, temporary uploads, synthetic accounts/sessions and disposable database are removed after verification. Razorpay settlement remains a separate pending merchant test.
-
 
 ## Grouped Configuration storage and diagnostics
 
@@ -165,14 +161,14 @@ existing migrate-deploy and generate commands above, then start the new API.
 Do not run an old API binary against the renamed table. On another development
 machine, pull migration/code and run these commands before starting the backend.
 
-| Configuration key | Contents |
-| --- | --- |
-| `app_strings` | Locale objects (`en`, `hi`), shared naming for future web/mobile/desktop consumers |
-| `app_settings` | Public app configuration overrides |
-| `backend_settings` | `features` and `processing` objects |
-| `gemini_settings` | `analysisModel`, provider `enabled`, `credentialMode` |
-| `openai_settings` | `outlineModel`, provider `enabled`, `credentialMode` |
-| `credits_settings` | Analysis/audio/welcome rates |
+| Configuration key  | Contents                                                                           |
+| ------------------ | ---------------------------------------------------------------------------------- |
+| `app_strings`      | Locale objects (`en`, `hi`), shared naming for future web/mobile/desktop consumers |
+| `app_settings`     | Public app configuration overrides                                                 |
+| `backend_settings` | `features` and `processing` objects                                                |
+| `gemini_settings`  | `analysisModel`, provider `enabled`, `credentialMode`                              |
+| `openai_settings`  | `outlineModel`, provider `enabled`, `credentialMode`                               |
+| `credits_settings` | Analysis/audio/welcome rates                                                       |
 
 Resend sender/key and Razorpay activation remain environment-backed; they are not
 silently migrated into unused database rows. Their safe effective/configured
@@ -204,7 +200,6 @@ planned, not implemented by this refactor. Existing role audit is unchanged.
 New fields/groups do not require schema migrations, but runtime consumers and
 validated admin editing still require code. Do not add a second value store.
 
-
 Verification for this migration/refactor: populated legacy migration fixture and
 configuration/provider/export integration regressions passed on a disposable
 local `_test` PostgreSQL database; audio/analysis (81 tests), credits (17 tests),
@@ -215,3 +210,53 @@ The running public app-config contract and unauthenticated diagnostic rejection
 were read-checked. Admin download/debug/error states were browser-checked with
 mock API responses at 360, 393, 768 and 1440px in light/dark modes. No live provider
 request or payment was used. Admin TypeScript and isolated production build passed.
+
+## Critical audit after recovery fixes (2026-10-27)
+
+Implemented without schema changes:
+
+- Single narration claims the same pending attempt it observed, preventing an
+  old reader from taking a replacement generation/credit reservation.
+- Multi-scene recovery re-reads processing items after locking/claiming the job
+  row, so a completed scene is not overwritten by stale scan data.
+- Analysis cleanup matches the observed status/lease/timestamp rather than
+  invalidating a newly leased worker.
+- Pre-attempt model lookup failure fails the unchanged pending job and releases
+  its credit hold atomically; it cannot overwrite another worker.
+
+Verification used a newly created, migrated local disposable `_test` database.
+All 86 tests in vitest.audio-flow.config.ts and 17 tests in
+vitest.credits.config.ts passed, including the five new PostgreSQL regression
+cases. Type checking and formatting passed. Provider/storage/payment calls were
+stubbed; no real generation, payments, application records or wallet changes
+were used. The temporary test database was removed after verification.
+
+### Remaining high-priority findings — identified, not fixed
+
+1. **Private local storage has a public static bypass.** `src/main.ts` mounts
+   the entire uploads directory at /uploads without authentication. Someone
+   possessing a private file's path can bypass the owned audio stream APIs.
+   The same static mount returned a synthetic file with HTTP 200 and no token
+   in an isolated Nest app; actual uploads were not read. This is already noted
+   in [storage](storage.md#playback-and-exports), but remains unresolved.
+   Restrict private audio to owned authenticated endpoints while preserving any
+   intentionally public voice-preview assets. Production exposure/bucket policy
+   was not tested.
+2. **An obsolete multi-audio failure can refund its replacement's hold.** In
+   `processGenerationJob`'s terminal item-error transaction, credits.finish(false)
+   runs before the item update checks job ownership. If recovery changes the
+   owner between the earlier ownsJob check and that transaction, the item update
+   affects zero rows but its shared reservation is already refunded. A real
+   disposable-PostgreSQL interleaving reproduced a PROCESSING replacement item
+   with a REFUNDED reservation. Its later success cannot recapture that refunded
+   hold, because settlement only changes RESERVED entries. Fix by locking and
+   validating current ownership before settlement and changing failure state in
+   the same transaction, using the existing fields/lock conventions.
+
+The second finding used a temporary targeted test (one selected case, remaining
+cases skipped), separate from the passing regression suites; it demonstrates a
+remaining bug rather than a new passing protection. It was not added as a
+failing project test. No additional confirmed payment-signature, duplicate-credit
+or cross-owner authenticated audio-access issue was found in the inspected paths
+and existing isolated tests. This is a targeted audit, not a claim of complete
+production security or provider reliability.

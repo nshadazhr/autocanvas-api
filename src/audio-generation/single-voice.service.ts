@@ -196,7 +196,7 @@ export class SingleVoiceService implements OnModuleInit, OnModuleDestroy {
 		if (!pending) return;
 		const attemptId = pending.analysisAttemptId ?? randomUUID();
 		const claimed = await this.prisma.audioStory.updateMany({
-			where: { id: storyId, status: 'SINGLE_PENDING' },
+			where: { id: storyId, status: 'SINGLE_PENDING', analysisAttemptId: pending.analysisAttemptId },
 			data: { status: 'SINGLE_PROCESSING', analysisAttemptId: attemptId }
 		});
 		if (claimed.count !== 1) return;

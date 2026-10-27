@@ -291,7 +291,13 @@ export class AudioStoriesService implements OnModuleInit {
 			// No automatic resume after a worker restart. The user can submit again.
 			await withStoryLock(this.prisma, id, async tx => {
 				const changed = await tx.storyAnalysisJob.updateMany({
-					where: { id: jobId, status: { in: ['QUEUED', 'PROCESSING', 'WAITING'] } },
+					where: {
+						id: jobId,
+						status: job.status,
+						leaseToken: job.leaseToken,
+						leaseExpiresAt: job.leaseExpiresAt,
+						updatedAt: job.updatedAt
+					},
 					data: {
 						status: 'FAILED',
 						errorCode: 'WORKER_INTERRUPTED',
@@ -319,7 +325,48 @@ export class AudioStoriesService implements OnModuleInit {
 	}
 
 	async processAnalysisJob(jobId: string) {
-		const model = await this.audioStoryAnalysisService.getModel();
+		const pending = await this.prisma.storyAnalysisJob.findFirst({
+			where: { id: jobId, status: { in: ['QUEUED', 'WAITING'] } }
+		});
+		if (!pending) return;
+		let model: string;
+		try {
+			model = await this.audioStoryAnalysisService.getModel();
+		} catch {
+			// A setup failure happens before an attempt is claimed. Only fail the
+			// exact pending version observed here, never a newly leased worker.
+			await withStoryLock(this.prisma, pending.storyId, async tx => {
+				const changed = await tx.storyAnalysisJob.updateMany({
+					where: {
+						id: jobId,
+						status: pending.status,
+						leaseToken: pending.leaseToken,
+						updatedAt: pending.updatedAt
+					},
+					data: {
+						status: 'FAILED',
+						errorCode: 'ANALYSIS_SETUP_FAILED',
+						errorMessage: 'Analysis could not start. Please try again.',
+						completedAt: new Date(),
+						nextRetryAt: null,
+						leaseToken: null,
+						leaseExpiresAt: null
+					}
+				});
+				if (!changed.count) return;
+				await this.credits.finish(tx, 'analysis:' + jobId, false);
+				await tx.audioStory.updateMany({
+					where: { id: pending.storyId, analysisAttemptId: jobId },
+					data: {
+						analysisStatus: 'FAILED',
+						analysisError: 'Analysis could not start. Please try again.',
+						analysisAttemptId: null,
+						analysisStartedAt: null
+					}
+				});
+			});
+			return;
+		}
 		while (await this.processAnalysisAttempt(jobId, model)) {
 			// Continue only while the provider reports server overload.
 		}

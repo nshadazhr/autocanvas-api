@@ -305,6 +305,69 @@ describe.skipIf(!databaseUrl)('analysis retries and shared AI budgets', () => {
 		expect((await job(j.id)).status).toBe('CANCELLED');
 		expect(provider.analyze).not.toHaveBeenCalled();
 	});
+	it('settles a model lookup failure without leaving queued paid analysis', async () => {
+		await prisma.configuration.update({
+			where: { key: 'credits_settings' },
+			data: { value: { analysisCredits: 10 } }
+		});
+		const j = (await service.analyze(storyId, userId))!;
+		provider.getModel.mockRejectedValueOnce(new Error('Settings temporarily unavailable'));
+		await service.processAnalysisJob(j.id);
+		expect(await job(j.id)).toMatchObject({
+			status: 'FAILED',
+			errorCode: 'ANALYSIS_SETUP_FAILED',
+			leaseToken: null
+		});
+		expect((await prisma.audioStory.findUniqueOrThrow({ where: { id: storyId } })).analysisStatus).toBe('FAILED');
+		expect((await prisma.user.findUniqueOrThrow({ where: { id: userId } })).creditBalance).toBe(100);
+		expect(
+			await prisma.creditTransaction.count({ where: { reference: 'analysis:' + j.id, status: 'REFUNDED' } })
+		).toBe(1);
+		expect(provider.analyze).not.toHaveBeenCalled();
+	});
+	it('setup failure cannot overwrite an analysis worker claimed during model lookup', async () => {
+		const j = (await service.analyze(storyId, userId))!;
+		provider.getModel.mockImplementationOnce(async () => {
+			await prisma.storyAnalysisJob.update({
+				where: { id: j.id },
+				data: { status: 'PROCESSING', leaseToken: 'new-owner', leaseExpiresAt: new Date(Date.now() + 120000) }
+			});
+			throw new Error('Settings unavailable');
+		});
+		await service.processAnalysisJob(j.id);
+		expect(await job(j.id)).toMatchObject({ status: 'PROCESSING', leaseToken: 'new-owner' });
+		expect(
+			await prisma.creditTransaction.count({ where: { reference: 'analysis:' + j.id, status: 'RESERVED' } })
+		).toBe(1);
+		await service.cancelAnalysis(storyId, userId, j.id);
+	});
+	it('interruption recovery cannot fail a worker claimed after its initial stale read', async () => {
+		const j = (await service.analyze(storyId, userId))!;
+		await prisma.storyAnalysisJob.update({
+			where: { id: j.id },
+			data: { status: 'WAITING', leaseToken: null, leaseExpiresAt: null, updatedAt: new Date(0) }
+		});
+		const original = prisma.storyAnalysisJob.findFirst.bind(prisma.storyAnalysisJob);
+		const spy = vi.spyOn(prisma.storyAnalysisJob as any, 'findFirst').mockImplementationOnce(async (query: any) => {
+			const snapshot = await original(query);
+			await prisma.storyAnalysisJob.update({
+				where: { id: j.id },
+				data: { status: 'PROCESSING', leaseToken: 'fresh-owner', leaseExpiresAt: new Date(Date.now() + 120000) }
+			});
+			return snapshot;
+		});
+		try {
+			await service.waitForAnalysis(storyId, userId, j.id);
+		} finally {
+			spy.mockRestore();
+		}
+		expect(await job(j.id)).toMatchObject({ status: 'PROCESSING', leaseToken: 'fresh-owner' });
+		expect(
+			await prisma.creditTransaction.count({ where: { reference: 'analysis:' + j.id, status: 'RESERVED' } })
+		).toBe(1);
+		await service.cancelAnalysis(storyId, userId, j.id);
+	});
+
 	it('fails expired workers after restart without retrying', async () => {
 		const j = (await service.analyze(storyId, userId))!;
 		await prisma.storyAnalysisJob.update({

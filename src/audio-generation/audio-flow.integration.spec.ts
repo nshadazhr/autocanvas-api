@@ -475,6 +475,86 @@ describe.skipIf(!databaseUrl)('audio flow with real PostgreSQL and stubbed Gemin
 		expect(updated.audioIsCurrent).toBe(true);
 		expect(tts.generateSpeech.mock.calls.some(call => call[0].includes('Changed script'))).toBe(true);
 	});
+	it('a stale single pending reader cannot steal a newly reserved replacement attempt', async () => {
+		await prisma.configuration.update({
+			where: { key: 'credits_settings' },
+			data: { value: { audioCreditsPer1000Characters: 1000 } }
+		});
+		const project = await single.create(userId, 'Claim race', 'short');
+		const process = (single as any).processPending.bind(single);
+		const dispatch = vi.spyOn(single as any, 'processPending').mockResolvedValue(undefined);
+		await single.generate(project.id, userId, voice.id);
+		const old = (await prisma.audioStory.findUniqueOrThrow({ where: { id: project.id } })).analysisAttemptId;
+		const original = prisma.audioStory.findFirst.bind(prisma.audioStory);
+		const spy = vi.spyOn(prisma.audioStory as any, 'findFirst').mockImplementationOnce(async (query: any) => {
+			const snapshot = await original(query);
+			await single.cancel(project.id, userId);
+			await single.generate(project.id, userId, voice.id);
+			return snapshot;
+		});
+		try {
+			await process(project.id);
+		} finally {
+			spy.mockRestore();
+			dispatch.mockRestore();
+		}
+		const replacement = await prisma.audioStory.findUniqueOrThrow({ where: { id: project.id } });
+		expect(replacement.status).toBe('SINGLE_PENDING');
+		expect(replacement.analysisAttemptId).not.toBe(old);
+		expect(
+			await prisma.creditTransaction.count({ where: { reference: 'single:' + old, status: 'REFUNDED' } })
+		).toBe(1);
+		expect(
+			await prisma.creditTransaction.count({
+				where: { reference: 'single:' + replacement.analysisAttemptId, status: 'RESERVED' }
+			})
+		).toBe(1);
+		await process(project.id);
+		expect((await single.get(project.id, userId)).status).toBe('SINGLE_COMPLETED');
+		expect(
+			await prisma.creditTransaction.count({
+				where: { reference: 'single:' + replacement.analysisAttemptId, status: 'COMPLETED' }
+			})
+		).toBe(1);
+	});
+	it('recovery preserves audio committed after its stale scan and before the row claim', async () => {
+		const j = await service.createSingleSceneJob(story.id, scenes[0].id, userId);
+		const item = (await service.getGenerationJob(j.id, userId)).items[0];
+		const startedAt = new Date(0);
+		await prisma.audioGenerationJob.update({
+			where: { id: j.id },
+			data: { status: 'PROCESSING', started_at: startedAt, updated_at: new Date(0) }
+		});
+		await prisma.audioGenerationJobItem.update({
+			where: { id: item.id },
+			data: { status: 'PROCESSING', attempts: 3 }
+		});
+		const original = prisma.audioGenerationJob.findMany.bind(prisma.audioGenerationJob);
+		const spy = vi
+			.spyOn(prisma.audioGenerationJob as any, 'findMany')
+			.mockImplementationOnce(async (query: any) => {
+				const snapshot = await original(query);
+				await service.generateSceneAudio(item.sceneId, undefined, undefined, undefined, item.id, {
+					jobId: j.id,
+					startedAt
+				});
+				return snapshot;
+			});
+		try {
+			await service.recoverInterruptedJobs();
+		} finally {
+			spy.mockRestore();
+		}
+		expect((await service.getGenerationJob(j.id, userId)).status).toBe('COMPLETED');
+		expect((await prisma.audioGenerationJobItem.findUniqueOrThrow({ where: { id: item.id } })).status).toBe(
+			'COMPLETED'
+		);
+		expect(await prisma.sceneAudio.count({ where: { jobItemId: item.id } })).toBe(1);
+		expect(
+			await prisma.creditTransaction.count({ where: { reference: 'audio:' + item.id, status: 'COMPLETED' } })
+		).toBe(1);
+	});
+
 	it('single-voice restart recovers pending and releases stale processing state', async () => {
 		const project = await single.create(userId, 'Interrupted', 'Old script');
 		await prisma.audioStory.update({

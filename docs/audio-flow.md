@@ -23,7 +23,7 @@ Single narration and multi-scene generation are different project modes. Story a
 | `src/audio-generation/single-voice.service.ts`                   | Narration drafts, segments, attempts, cancellation and completed assets.                        |
 | `src/audio-generation/utils/audio-story-lock.ts`                 | Shared per-story transaction lock/conflicting-job guard.                                        |
 | `src/audio-generation/utils/scene-audio-revision.ts`             | Determines whether saved audio matches current scene/voice/settings.                            |
-| `src/audio-generation/providers/`                                | Single-key TTS requests and prompt/error helpers.                                              |
+| `src/audio-generation/providers/`                                | Single-key TTS requests and prompt/error helpers.                                               |
 | `src/ai/usage/`                                                  | Shared persisted request/character/concurrency accounting.                                      |
 | `src/storage/`                                                   | Reads/writes through the configured provider; see [storage.md](storage.md).                     |
 
@@ -37,6 +37,8 @@ Single narration and multi-scene generation are different project modes. Story a
 - Duplicate submissions reuse active work; valid unchanged completed results are cached. Cancellation/content changes fence late responses and prevent subsequent retries. Cancel does not abort an already-sent provider call or guarantee its cost is refunded.
 - Wait requests attach to in-memory work on the API instance that started it. Use a single API instance or sticky routing; this is not a distributed durable queue. A busy provider can keep the wait request open indefinitely; configure deployment proxy timeouts accordingly. If the connection closes, the UI reports a connection error and reload reconnects to active work. A browser disconnect does not itself cancel analysis.
 - Jobs are not automatically resumed after restart. Startup marks stale queued/waiting or expired processing records FAILED. A wait request also fails an interrupted job when no worker owns it; an unexpired lease on another instance is not overwritten. There is no periodic restart recovery; reload after lease expiry can identify interruption and allow manual retry.
+- A model/settings lookup failure before an attempt is claimed marks only the unchanged queued/waiting version FAILED with ANALYSIS_SETUP_FAILED and releases its credit reservation. A newly claimed worker is preserved.
+- Interrupted-job cleanup compares the observed status, lease and updatedAt atomically; a newer lease cannot be failed using an older read.
 - Failed errors are safe messages; logs include job IDs, status codes and attempts without scripts or credentials. A claimed retry clears previous failure metadata. Lease tokens still fence stale commits; there is no lease-renewal timer.
 
 ## Multi-scene jobs
@@ -44,6 +46,7 @@ Single narration and multi-scene generation are different project modes. Story a
 `AudioGenerationJob` owns `AudioGenerationJobItem` records. Items snapshot text/voice/settings so a running job does not silently switch to edited content. Job states include PENDING, PROCESSING, WAITING, COMPLETED, PARTIAL, FAILED and CANCELLED. Item states also include SKIPPED.
 
 - Per-story locks prevent conflicting jobs. Pending jobs are persisted before background dispatch; scanners recover work after restart.
+- Recovery locks/claims the stale job row before reading its currently processing items, preserving audio committed after the initial scan.
 - Item ownership and worker timestamps fence stale workers and late responses. Heartbeats support interrupted-worker recovery.
 - A retry of failed scenes creates a **new job** containing those failed scenes. It does not erase successful current audio or mean the history consists only of retry rows.
 - Quota/application capacity errors move work to WAITING and use a future retry time. Recognized transient provider errors have bounded recovery attempts; defaults are three attempts and a 60-second initial recovery delay.
@@ -54,7 +57,7 @@ Current scenes have positive sceneOrder. Re-analysis can retire replaced scene r
 
 ## Single narration
 
-Statuses are stored on AudioStory: SINGLE_DRAFT, SINGLE_PENDING, SINGLE_PROCESSING, SINGLE_COMPLETED, SINGLE_FAILED and SINGLE_CANCELLED. The saved draft/options and a unique attempt token fence concurrent/late output.
+Statuses are stored on AudioStory: SINGLE_DRAFT, SINGLE_PENDING, SINGLE_PROCESSING, SINGLE_COMPLETED, SINGLE_FAILED and SINGLE_CANCELLED. The saved draft/options and a unique attempt token fence concurrent/late output. Pending claims compare the observed attempt token as well as status; a cancelled/replaced attempt cannot be stolen by an older pending reader.
 
 Generation splits supported emotion segments, creates/merges WAV audio and persists a completed asset. Shared application-capacity waits retain generated chunks within the running process. Pending projects can be redispatched; stale processing is marked interrupted/failed rather than claiming durable recovery of every partial chunk. This differs from the persisted multi-scene item workflow.
 
@@ -88,15 +91,42 @@ Before changing this flow, check no-job, first generation, waiting, partial fail
 
 Runtime controls: new analysis/audio/outline submissions enforce their feature flag and maintenance setting. Provider-disabled or missing-credential configuration errors are terminal, not Google busy retries. Multi-scene recovery reads configured attempts/delay at processing start; Gemini audio RPM/RPD settings are refreshed with the key list. Credentials do not change an already-sent request. See operations.md for environment/managed-mode and encryption details. Pricing values are not used for charging in this change.
 
-
 ## Credit settlement
 
 A user-row database lock serializes balance mutations. Creation reserves funds in the same transaction as the job: one entry for analysis, one per audio item, or one for a single-voice attempt. Cost is fixed at reservation. Analysis costs the configured fixed rate; cached valid completed analysis is free. Audio charges ceil(trimmed Unicode code points × rate / 1000), separately per scene/output; hidden provider prompts are excluded. Single voice uses the submitted script including its text tags.
 
 Saving a successful asset and completing its charge share a transaction. Terminal failure/cancellation releases unused reservations once, while busy/recovery waits retain them. Successful scenes stay charged when another scene fails or the job is cancelled. Provider retries reuse the reservation; manual failed-scene retry creates a new reservation after the failed one was refunded. Manual regeneration is a new paid operation. Legacy jobs already running before billing deployment are not retroactively charged. The client confirms nonzero estimates, but the server computes all costs and enforces balance. Credits do not replace provider quotas.
 
-
 Invalid/expired Gemini API keys may arrive as HTTP 400 (API_KEY_INVALID), not just 401/403. Analysis reports these as PROVIDER_CONFIGURATION_ERROR; audio uses a safe configuration message, no key switching or automatic retry. Failed reservations are released. Fix the configured key rather than modifying the story or repeatedly submitting.
 
-
 Deleting a completed multi-voice story removes its generation jobs/items before scenes inside the existing story-lock transaction, avoiding the composite scene/job FK constraint. An active job still rejects deletion. Credit accounting rows keep their story ID snapshot and remain in the ledger after story deletion. This database deletion does not introduce a background storage cleanup mechanism.
+
+## Admin analysis inspection
+
+The read-only admin analysis monitor reads existing StoryAnalysisJob/AudioStory
+records through `src/admin/admin-analysis-jobs.*`. It shows safe latest errors,
+attempt counts, retry times, timestamps and submitted script snapshots without
+starting or changing work. Result JSON belongs to the current story, not each
+historical job; the API labels it separately and compares current content hash
+to the selected job input. Old attempt failures cleared by a later claim cannot
+be recovered through this view. No new persistence or provider logging is added.
+The focused fixture HTTP tests in `src/admin/admin-analysis-jobs.spec.ts` exercise
+real auth/role guards with stubbed token verification and Prisma persistence;
+they do not claim live PostgreSQL/session integration.
+
+Run the focused fixture HTTP suite from the API repository:
+
+```sh
+npx vitest run --config vitest.admin-auth.config.ts src/admin/admin-analysis-jobs.spec.ts
+```
+
+This command was verified without a database connection. It checks role/realm
+guards, query/UUID validation, cursor ordering, UTC date filters, safe errors,
+missing jobs and current-result scope using fixture persistence.
+
+Recovery regression coverage includes cancel/regenerate between the pending read
+and claim, audio completion between recovery scan and row claim, analysis lease
+replacement between stale read and cleanup, and model lookup failures including
+a concurrently leased worker. These use real disposable PostgreSQL with stubbed
+providers/storage and assert credit reservations/settlement as well as status.
+See the remaining critical audit findings in [operations](operations.md#critical-audit-after-recovery-fixes-2026-10-27).

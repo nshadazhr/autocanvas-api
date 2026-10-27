@@ -7,6 +7,7 @@ export default defineConfig({
 			'src/auth/admin-auth.integration.spec.ts',
 			'src/auth/superadmin.integration.spec.ts',
 			'src/admin/admin-settings.integration.spec.ts',
+			'src/admin/admin-analysis-jobs.spec.ts',
 			'src/settings/runtime-clients.spec.ts'
 		],
 		testTimeout: 20000,
