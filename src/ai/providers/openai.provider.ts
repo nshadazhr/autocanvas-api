@@ -14,11 +14,26 @@ export class OpenAIProvider implements AIProvider {
 
 	async generateText(request: AITextRequest): Promise<AITextResponse> {
 		await this.settings.assertEnabled('openaiEnabled');
-		const client = new OpenAI({ apiKey: await this.credentials.primary('openai') });
+		const client = new OpenAI({
+			apiKey: await this.credentials.primary('openai'),
+			...(request.jsonSchema ? { maxRetries: 0, timeout: 90000 } : {})
+		});
+		await request.onRequest?.();
 		const response = await client.responses.create({
 			model: request.model,
 			instructions: request.systemPrompt,
 			input: request.userPrompt,
+			...(request.jsonSchema && {
+				store: false,
+				text: {
+					format: {
+						type: 'json_schema' as const,
+						name: 'story_analysis',
+						strict: true,
+						schema: request.jsonSchema
+					}
+				}
+			}),
 			...(request.temperature !== undefined && {
 				temperature: request.temperature
 			}),

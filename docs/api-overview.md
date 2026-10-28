@@ -67,6 +67,8 @@ Controller: `src/audio-stories/audio-stories.controller.ts`.
 
 Current create DTO caps title at 120 characters and content at 30,000. Title/content are required; UI defaults are not a promise that the API accepts missing fields. Read `src/audio-stories/dto/` and `src/ai/schemas/story-analysis.schema.ts` before changing analysis shape.
 
+User story and analysis-job responses intentionally exclude provider routing metadata, including source/provider/model. That metadata remains persisted and is available only through the protected admin diagnostics routes.
+
 ## Multi-scene generation and files
 
 Controller: `src/audio-generation/audio-generation.controller.ts`.
@@ -161,7 +163,7 @@ No database migration or generation/provider calls are needed for this section.
 
 ## Analysis model setting (Super Admin)
 
-`GET /admin/settings/analysis-model` returns `{ model, source }`, where source is `database`, `environment` or `default`. `PATCH` accepts `{ "model": "exact-gemini-model-id" }`; `{ "model": null }` deletes the override and restores the backend fallback. Both require an admin-realm session and the current SUPERADMIN database role. Writes enforce the existing admin-origin guard. Responses are private/no-store. Unknown fields and invalid model IDs are rejected.
+`GET /admin/settings/analysis-model` returns `{ model, source }`, where source is `database`, `environment` or `default`. `PATCH` accepts `{ "model": "exact-gemini-model-id" }`; `{ "model": null }` deletes the override and restores the backend fallback. Before a new analysis routing configuration is saved, this legacy endpoint controls the Gemini default. After first routing save, PATCH returns 400 directing callers to the routing endpoint; GET remains a legacy value, not the effective routed provider. Both require an admin-realm session and the current SUPERADMIN database role. Writes enforce the existing admin-origin guard. Responses are private/no-store. Unknown fields and invalid model IDs are rejected.
 
 Saving only validates a model ID's format (lowercase letters, digits, dots, underscores and hyphens, up to 120 characters). It does not call Google, list available models or guarantee access. This model endpoint does not manage credentials or select a different provider; the runtime controls below manage encrypted keys separately.
 
@@ -184,7 +186,7 @@ All `/admin/config/*` and `/admin/provider-keys/*` routes require an admin-realm
 
 Allowed config sections: `web-settings`, `web-strings`, `features`, `models`, `processing`, `pricing`. Allowed credential providers: `gemini`, `openai`. Private backend sections reject unknown fields, wrong types and invalid ranges. Web documents accept arbitrary keys: App Strings requires text values; App Settings supports nested JSON objects/arrays, booleans, numbers, null and text. Existing home-setting types and en/hi language values are validated. Unsafe object keys are rejected or stripped by request transformation; documents are limited to 64 KB and 20 nesting levels. No generated catalog or cross-repository sync is required. Web JSON is public, so credentials belong in Provider Keys. Dashboard values override local values; nested objects merge, arrays replace, and false/0/empty text remain overrides. HTML/placeholders are stored as text and are not automatically executed/expanded. Missing keys/translations fall back to local defaults. Important settings controls edit the same JSON keys; no separate store exists. Whole-document publishes use last-publish-wins; private sections do not accept PUT.
 
-Pricing drives wallet reservations and settlement; see Wallet and payments below. Provider selection/fallback for analysis was not changed: Gemini still handles analysis/audio and OpenAI handles outlines. Each provider has one selected key; analysis, outlines and audio have no automatic key rotation. TTS rate limits may schedule a job retry with the same key. The analysis-model endpoint remains backward compatible.
+Pricing drives wallet reservations and settlement; see Wallet and payments below. Analysis provider/model selection and fallback use the separate routing endpoint below. Gemini audio and OpenAI outlines retain their existing configuration. Each provider has one selected key; analysis, outlines and audio have no automatic key rotation. TTS rate limits may schedule a job retry with the same key. The legacy analysis-model endpoint remains writable only until routing configuration is saved.
 
 The /app-config endpoint replaces /public/config; update web/API deployments together. The backend does not load ProviderCredential or private section values into this response. The browser fetches once per load and uses local defaults on failure. No frontend client secret is required for public data. Admin reads/writes retain independent admin-session/current-role/origin checks.
 
@@ -222,9 +224,92 @@ analysis-model/key management and public app-config payloads are unchanged.
   Unknown jobs return 404. Invalid IDs/filters return 400. No mutation route is
   added. Both responses use `Cache-Control: private, no-store`.
 
-Errors pass through the existing safe-AI redactor. Credentials, session data and
-worker lease tokens are excluded by explicit selects. Current story results are
-not stored per analysis job; consumers must not label them as historical output
-for the selected job. Model IDs, per-retry errors/provider statuses and exact
-provider start times are not recorded by this feature. No schema migration,
-analysis dispatch, billing or provider-call behavior changes are required.
+List/detail job metadata includes nullable `successfulProvider`/`successfulModel`.
+Detail adds `job.resultSnapshot` (this job's validated successful result or null)
+and `attemptHistory: { attempts, nextCursor }` with the first 25 request records.
+`currentStoryAnalysis` remains explicitly current story data, not the selected
+job's historical result. Older jobs have null historical/model fields; no guessed
+backfill is performed. Latest job errors may clear on retry/success while attempt
+errors remain available.
+
+`GET /admin/analysis-jobs/:id/attempts?limit=25&cursor=<attempt-uuid>` uses the same
+ADMIN/SUPERADMIN guards and private/no-store headers. Limit is 1–100. Records are
+ordered by unique per-job sequence; a cursor must belong to that job (400 if not).
+Unknown jobs return 404. Rows expose id, sequence, provider/model, kind, status,
+startedAt, responseAt, finishedAt, durationMs, errorCategory, providerHttpStatus,
+providerErrorCode and redacted errorMessage. This endpoint contains no script,
+failed response body, credential or worker-lease fields. It has no mutations.
+
+Deploy `20261027120000_analysis_attempt_history` and regenerate Prisma before
+running the updated backend. Existing user job DTOs and billing/routing contracts
+are unchanged. Local parsing/cache hits are not model request successes; cancelled,
+interrupted and running calls must not enter completed-model-attempt denominators.
+See [attempt semantics](audio-flow.md#admin-analysis-inspection) before reporting
+latency, availability or success percentages.
+
+## Analysis routing settings (Super Admin)
+
+`GET /admin/settings/analysis` returns the effective configuration;
+`PATCH /admin/settings/analysis` accepts `{ "configuration": { ... } }` with:
+
+- `primaryProvider`: `gemini` or `openai`.
+- `providerFallback`: boolean. When false, only the selected provider is used.
+- `retryLimit`: integer 0–10, additional delayed retries of the original primary.
+- `retryDelaySeconds`: integer 1–120; applies only after the initial candidate list.
+- `providers.gemini` and `providers.openai`: each `{ primaryModel, models }`.
+  `models` is an ordered list of at most 20 `{ id, enabled }` entries. IDs are
+  unique within a provider and follow the existing 120-character model-ID format.
+  `primaryModel` must name an enabled entry. An unused provider may have null
+  primary and an empty/disabled-only list; the selected provider must be usable.
+  Enabling fallback requires usable primaries for both providers.
+
+Existing admin-realm/current SUPERADMIN role/origin guards apply. Responses are
+private/no-store; unknown fields, unusable primaries and invalid limits return
+400. The shared configuration writer persists the non-secret `analysis_settings`
+JSON document without a new table/migration. It is excluded from public app-config
+and included in authenticated configuration export/debug. No credentials are
+accepted here; use existing provider-key controls. Saving does not contact either
+provider or guarantee a model supports the required structured output.
+
+Remove models by omitting them from the next saved list, or disable them by
+setting enabled=false. Primary replacement is validated before either action.
+Empty backups are valid. A running job retains its captured model configuration;
+provider feature flags/credential access checks remain authoritative per call.
+History is not deleted when configuration entries are removed. See
+[audio flow](audio-flow.md#analysis-jobs) for busy/429 routing and cancellation.
+
+## Analysis performance monitoring
+
+`GET /admin/analysis-performance` is read-only ADMIN/SUPERADMIN, using the existing
+admin-realm/current-role guards and private/no-store responses. Query fields:
+`days` (1, 7, 30, 90; default 7), optional exact `provider` (gemini/openai), optional
+exact `model` (existing model-ID format), `page` (1–10000), `limit` (1–100; default
+25), and optional ISO `asOf` no later than now. Unknown/invalid fields return 400.
+
+The cohort starts at UTC midnight days-1 days before the cutoff, and ends at
+asOf/current time, filtered by request startedAt. asOf pins the start-time cohort
+for model-page continuation; it is not historical reconstruction of past request
+statuses. Every response uses a repeatable-read transaction for consistent
+aggregate/model/recent-job reads. Requests already in that cohort can finish
+between pages; Refresh starts a new report cohort.
+
+Response: from/to, selected filters, totals, paginated models, page/nextPage and
+latest 10 recentJobs with recorded matching requests. Aggregation is performed in
+PostgreSQL over the full filtered cohort, not only the displayed model page.
+Models are ordered by provider/model, not ranked by quality. Exact model filters
+can inspect historical models removed from configuration. Recent jobs may have
+succeeded on a different model after a matching failed attempt; open job details.
+No prompts, snapshots, failed response bodies or keys are included here.
+
+Completed attempts = COMPLETED + FAILED, excluding FAILED/COMMIT_FAILED. Rates
+use that denominator and are null when it is empty. Busy/server errors use FAILED
+with errorCategory BUSY; rate/quota errors use HTTP 429 separately. Running,
+cancelled, interrupted and local commit failures are returned as excluded counts.
+Average/median timing uses successful rows with recorded duration only; global
+median is computed from raw successes, not from model medians. latencySamples
+reports the number of measured successes. Success is validated/committed output,
+not semantic accuracy, and fallback samples are not controlled benchmarks.
+
+No new schema/migration, job dispatch, configuration writes or billing changes
+are introduced. The existing analysis-attempt-history migration must already be
+applied. This API does not execute any AI/provider request.

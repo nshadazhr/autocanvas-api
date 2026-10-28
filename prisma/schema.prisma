@@ -422,28 +422,70 @@ enum StoryAnalysisJobStatus {
 }
 
 model StoryAnalysisJob {
-  id              String                 @id @default(uuid())
-  storyId         Int
-  userId          Int
-  contentHash     String
-  contentSnapshot String
-  status          StoryAnalysisJobStatus @default(QUEUED)
-  attempts        Int                    @default(0)
-  nextRetryAt     DateTime?
-  leaseToken      String?
-  leaseExpiresAt  DateTime?
-  errorCode       String?
-  errorMessage    String?
-  source          String?
-  createdAt       DateTime               @default(now())
-  updatedAt       DateTime               @updatedAt
-  completedAt     DateTime?
-  story           AudioStory             @relation(fields: [storyId], references: [id], onDelete: Cascade)
-  user            User                   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  id                 String                 @id @default(uuid())
+  storyId            Int
+  userId             Int
+  contentHash        String
+  contentSnapshot    String
+  resultSnapshot     Json?
+  successfulProvider String?
+  successfulModel    String?
+  attemptHistory     StoryAnalysisAttempt[]
+  status             StoryAnalysisJobStatus @default(QUEUED)
+  attempts           Int                    @default(0)
+  nextRetryAt        DateTime?
+  leaseToken         String?
+  leaseExpiresAt     DateTime?
+  errorCode          String?
+  providerHttpStatus Int?
+  errorMessage       String?
+  source             String?
+  createdAt          DateTime               @default(now())
+  updatedAt          DateTime               @updatedAt
+  completedAt        DateTime?
+  story              AudioStory             @relation(fields: [storyId], references: [id], onDelete: Cascade)
+  user               User                   @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   @@index([status, nextRetryAt])
   @@index([userId, status])
   @@index([storyId, createdAt])
+}
+
+enum AnalysisAttemptStatus {
+  RUNNING
+  COMPLETED
+  FAILED
+  CANCELLED
+  INTERRUPTED
+}
+
+enum AnalysisAttemptKind {
+  INITIAL
+  MODEL_FALLBACK
+  PROVIDER_FALLBACK
+  PRIMARY_RETRY
+}
+
+model StoryAnalysisAttempt {
+  id                 String                @id @default(uuid())
+  jobId              String
+  sequence           Int
+  provider           String
+  model              String
+  kind               AnalysisAttemptKind
+  status             AnalysisAttemptStatus @default(RUNNING)
+  startedAt          DateTime              @default(now())
+  responseAt         DateTime?
+  finishedAt         DateTime?
+  durationMs         Int?
+  errorCategory      String?
+  providerHttpStatus Int?
+  providerErrorCode  String?
+  errorMessage       String?
+  job                StoryAnalysisJob      @relation(fields: [jobId], references: [id], onDelete: Cascade)
+
+  @@unique([jobId, sequence])
+  @@index([provider, model, status, startedAt])
 }
 
 model AiUsageBucket {

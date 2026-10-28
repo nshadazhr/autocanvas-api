@@ -1,3 +1,6 @@
+import { AdminAnalysisPerformanceController } from './admin-analysis-performance.controller.js';
+import { AdminAnalysisPerformanceService } from './admin-analysis-performance.service.js';
+import { AdminAnalysisSettingsController } from './admin-analysis-settings.controller.js';
 import { AdminAnalysisJobsController } from './admin-analysis-jobs.controller.js';
 import { AdminAnalysisJobsService } from './admin-analysis-jobs.service.js';
 import { AdminCreditsController } from './admin-credits.controller.js';
@@ -16,6 +19,8 @@ import { AdminDashboardService } from './admin-dashboard.service.js';
 @Module({
 	imports: [CreditsModule, AuthModule, AppSettingsModule],
 	controllers: [
+		AdminAnalysisPerformanceController,
+		AdminAnalysisSettingsController,
 		AdminAnalysisJobsController,
 		AdminCreditsController,
 		AdminDashboardController,
@@ -24,6 +29,12 @@ import { AdminDashboardService } from './admin-dashboard.service.js';
 		AdminRuntimeSettingsController,
 		AdminProviderKeysController
 	],
-	providers: [AdminAnalysisJobsService, PrismaService, AdminDashboardService, AdminAudioJobsService]
+	providers: [
+		AdminAnalysisPerformanceService,
+		AdminAnalysisJobsService,
+		PrismaService,
+		AdminDashboardService,
+		AdminAudioJobsService
+	]
 })
 export class AdminModule {}

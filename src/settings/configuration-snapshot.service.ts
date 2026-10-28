@@ -122,6 +122,7 @@ export class ConfigurationSnapshotService {
 					source: this.config.get<string>('RESEND_FROM_EMAIL') ? 'environment' : 'default'
 				}
 			};
+			if (allConfig.analysis_settings) effectiveConfig.analysis_settings = allConfig.analysis_settings;
 			result.effectiveConfig = effectiveConfig;
 			result.clientDefaults =
 				'Public app defaults are owned by each client; allConfig contains saved overrides only.';

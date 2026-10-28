@@ -58,7 +58,16 @@ npx prisma migrate deploy --config prisma7.config.ts
 npx prisma generate --config prisma7.config.ts
 ```
 
-Super Admin can change the Gemini story-analysis model from the admin Global Settings page. Non-secret values live in AppSetting; GEMINI_MODEL remains a fallback until an override is saved. Changes affect new uncached analysis without a restart; running jobs keep their initial model. Resetting the setting restores the environment/default. Existing cached analysis is retained. API credentials remain backend-only and may be managed through encrypted provider-key storage; OpenAI analysis is not implemented. See [API overview](docs/api-overview.md) and [audio flow](docs/audio-flow.md).
+Super Admin configures story analysis on the admin Providers & Models page:
+primary provider, each provider's primary/backup models, optional provider
+fallback, and bounded delayed primary retries. Gemini and OpenAI reuse the shared
+prompt/schema and existing backend credential storage. Configuration is stored
+under `Configuration.analysis_settings`; until first save, the current legacy
+Gemini model remains the primary with two delayed retries at five seconds.
+Running jobs capture their configuration; cached results remain valid. No new
+schema migration is required for routing. Audio generation and script outlines
+keep their existing settings. See [API overview](docs/api-overview.md#analysis-routing-settings-super-admin)
+and [audio flow](docs/audio-flow.md).
 
 ## Admin runtime controls
 
@@ -74,3 +83,26 @@ this version on an existing database, deploy migration
 `20261026060000_configuration_groups` and regenerate Prisma using the setup commands
 above. It preserves existing settings in service groups; see
 [configuration migration and export](docs/operations.md#grouped-configuration-storage-and-diagnostics).
+
+## Analysis diagnostics migration
+
+Before deploying the current backend, apply
+`20261027060000_analysis_provider_http_status` using the migration/generation
+commands above. It adds one nullable HTTP status field to analysis jobs for
+admin diagnostics; see [operations](docs/operations.md#analysis-http-status-diagnostics-2026-10-27).
+
+## Analysis attempt history migration
+
+Before deploying attempt/model history, apply
+`20261027120000_analysis_attempt_history` with the existing migrate-deploy and
+Prisma-generate commands. This adds per-request metadata and per-job successful
+result snapshots. Historical records are not guessed/backfilled. See
+[audio flow](docs/audio-flow.md#admin-analysis-inspection) and
+[operations](docs/operations.md#analysis-attempt-history-rollout-2026-10-27).
+
+## Analysis workspace
+
+The admin /providers page groups configuration and read-only monitoring under
+Analysis tabs. Monitoring uses the existing request history, not live provider
+probes, and needs no additional database migration. See
+[performance API](docs/api-overview.md#analysis-performance-monitoring).

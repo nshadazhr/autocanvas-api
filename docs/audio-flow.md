@@ -18,7 +18,7 @@ Single narration and multi-scene generation are different project modes. Story a
 | `src/audio-stories/audio-stories.service.ts`                     | Analysis admission/cache, leases/retries, cancellation and syncing validated scenes/characters. |
 | `src/audio-stories/services/story-parser.service.ts`             | Local structured-script parser.                                                                 |
 | `src/audio-stories/services/story-analysis-validator.service.ts` | Cross-scene/character consistency checks.                                                       |
-| `src/ai/ai.service.ts`, `src/ai/prompts/story-analysis.txt`      | Gemini analysis request, JSON schema/prompt and safe analysis response parsing.                 |
+| `src/ai/analysis/`, `src/ai/ai.service.ts`, `src/ai/prompts/story-analysis.txt`      | Analysis routing/error mapping/adapters; shared JSON schema/prompt and safe response parsing.                 |
 | `src/audio-generation/audio-generation.service.ts`               | Multi-scene jobs, item claims/recovery, audio commit/history, retry/cancel and exports.         |
 | `src/audio-generation/single-voice.service.ts`                   | Narration drafts, segments, attempts, cancellation and completed assets.                        |
 | `src/audio-generation/utils/audio-story-lock.ts`                 | Shared per-story transaction lock/conflicting-job guard.                                        |
@@ -29,17 +29,18 @@ Single narration and multi-scene generation are different project modes. Story a
 
 ## Analysis jobs
 
-`StoryAnalysisJob` records the snapshot/hash, status and attempts. Submission returns HTTP 202 with safe job metadata. Valid structured scripts use the local parser; otherwise Gemini is called. The Gemini analysis model is resolved from the non-secret `Configuration.gemini_settings.analysisModel` field at job start, with GEMINI_MODEL then gemini-3.5-flash as fallbacks. Busy retries keep that starting model; completed cached results are not invalidated by changing the model. Both paths require schema/consistency validation before saving scenes and characters atomically.
+`StoryAnalysisJob` records the snapshot/hash, status and attempts. Submission returns HTTP 202 with safe job metadata. Valid structured scripts use the local parser; otherwise the configured Gemini/OpenAI analysis adapter is called. Provider/model order, primary retry limits and delay are captured from `Configuration.analysis_settings` at job start. Until first save, the legacy Gemini selection (`gemini_settings.analysisModel`, then GEMINI_MODEL, then gemini-3.5-flash) remains primary, with two delayed retries at five seconds. Running jobs keep their captured routing configuration; completed cached results are not invalidated by changing the model. Both paths require schema/consistency validation before saving scenes and characters atomically.
 
 - The frontend makes one authenticated `GET /audio-stories/:id/analysis-jobs/:jobId/wait` request, then fetches the story when work ends. There is no analysis polling interval, periodic scanner, heartbeat or countdown.
-- Only busy-server responses (500/502/503/504) retry, with a one-second wait between calls and no attempt limit. One iterative loop continues until success, cancellation, or a different error. Actual provider quota errors stop work; analysis has no custom application request budgets.
-- Network/timeouts, actual provider quota/rate limits, authorization, malformed responses and validation errors stop immediately. Provider requests retain their 90-second timeout. Analysis bypasses custom application request/day/character budgets and AI concurrency leases; custom per-user active-job and global analysis worker-count caps are also removed. Authentication, ownership, duplicate-job locks, input-size/schema validation and cancellation fencing remain. Former AI_SUBMISSIONS_* and ANALYSIS_USER_ACTIVE_JOBS / ANALYSIS_GLOBAL_WORKERS settings are not used. Credits settlement is described below.
+- Busy-server responses (500/502/503/504) advance immediately through the selected provider's enabled models (primary first), then the other provider's models only if provider fallback is enabled. Once candidates are exhausted, only the original primary provider/model receives delayed retries, bounded by retryLimit. There is no repeated full-list cycle or unlimited retry. Gemini/OpenAI SDK retries are disabled for analysis so this job policy owns attempt counts.
+- HTTP 429 skips remaining models of that provider because quota/rate limits may be shared. Explicit exhausted quota is distinguished from generic rate limiting; provider switching may continue, but a rate/quota-blocked primary receives no delayed retries. Invalid credentials/access/request, malformed output, local failures and network errors stop. A completed or failed job settles its single reservation once; switching models/providers does not create another paid job.
+- Network/timeouts, authorization, malformed responses and validation errors stop immediately. Provider rate/quota handling follows the routing rule above. Provider requests retain their 90-second timeout. Analysis bypasses custom application request/day/character budgets and AI concurrency leases; custom per-user active-job and global analysis worker-count caps are also removed. Authentication, ownership, duplicate-job locks, input-size/schema validation and cancellation fencing remain. Former AI_SUBMISSIONS_* and ANALYSIS_USER_ACTIVE_JOBS / ANALYSIS_GLOBAL_WORKERS settings are not used. Credits settlement is described below.
 - Duplicate submissions reuse active work; valid unchanged completed results are cached. Cancellation/content changes fence late responses and prevent subsequent retries. Cancel does not abort an already-sent provider call or guarantee its cost is refunded.
 - Wait requests attach to in-memory work on the API instance that started it. Use a single API instance or sticky routing; this is not a distributed durable queue. A busy provider can keep the wait request open indefinitely; configure deployment proxy timeouts accordingly. If the connection closes, the UI reports a connection error and reload reconnects to active work. A browser disconnect does not itself cancel analysis.
 - Jobs are not automatically resumed after restart. Startup marks stale queued/waiting or expired processing records FAILED. A wait request also fails an interrupted job when no worker owns it; an unexpired lease on another instance is not overwritten. There is no periodic restart recovery; reload after lease expiry can identify interruption and allow manual retry.
 - A model/settings lookup failure before an attempt is claimed marks only the unchanged queued/waiting version FAILED with ANALYSIS_SETUP_FAILED and releases its credit reservation. A newly claimed worker is preserved.
 - Interrupted-job cleanup compares the observed status, lease and updatedAt atomically; a newer lease cannot be failed using an older read.
-- Failed errors are safe messages; logs include job IDs, status codes and attempts without scripts or credentials. A claimed retry clears previous failure metadata. Lease tokens still fence stale commits; there is no lease-renewal timer.
+- Failed errors are safe messages; logs include job IDs, status codes and attempts without scripts or credentials. The current upstream HTTP error status is persisted in nullable `providerHttpStatus` for admin monitoring; user job DTOs exclude it, as well as provider routing source/model metadata. Local failures without an upstream response leave it null. A claimed retry clears previous failure metadata, including this status. Lease tokens still fence stale commits; there is no lease-renewal timer.
 
 ## Multi-scene jobs
 
@@ -81,7 +82,7 @@ Shared PostgreSQL limits below apply to TTS and restricted diagnostics, across i
 
 Configured limits must be positive integers. Shared time buckets use fixed UTC boundaries. Provider calls have a 90-second timeout.
 
-Gemini TTS, analysis and outlines each use the provider's single configured key. There is no key manager, rotation, fallback pool or per-key RPM/RPD counter. GEMINI_API_KEYS, GEMINI_MULTI_KEY_ENABLED and the old GEMINI_RPM_LIMIT/GEMINI_RPD_LIMIT settings are ignored. Shared AI usage/security controls remain independent. A TTS 429 returns ProviderRateLimitError with the provider retry hint (or 60 seconds), allowing the existing multi-scene job scheduler to wait and retry the same key; the provider client does not try another key. Authentication/content errors are returned without key failover. Existing single-voice errors, cancellation, network recovery and downloads retain their flow. Manual key replacement affects subsequent requests; an in-flight SDK request keeps its captured key.
+Gemini TTS, Gemini/OpenAI analysis and OpenAI outlines use each provider's single configured key. Analysis model/provider routing is independent of credentials: there is no automatic key rotation, key fallback pool or per-key RPM/RPD counter. GEMINI_API_KEYS, GEMINI_MULTI_KEY_ENABLED and the old GEMINI_RPM_LIMIT/GEMINI_RPD_LIMIT settings are ignored. Shared AI usage/security controls remain independent. A TTS 429 returns ProviderRateLimitError with the provider retry hint (or 60 seconds), allowing the existing multi-scene job scheduler to wait and retry the same key; the provider client does not try another key. Authentication/content errors are returned without key failover. Existing single-voice errors, cancellation, network recovery and downloads retain their flow. Manual key replacement affects subsequent requests; an in-flight SDK request keeps its captured key.
 
 ## Verification and maintenance
 
@@ -103,13 +104,37 @@ Deleting a completed multi-voice story removes its generation jobs/items before 
 
 ## Admin analysis inspection
 
-The read-only admin analysis monitor reads existing StoryAnalysisJob/AudioStory
-records through `src/admin/admin-analysis-jobs.*`. It shows safe latest errors,
-attempt counts, retry times, timestamps and submitted script snapshots without
-starting or changing work. Result JSON belongs to the current story, not each
-historical job; the API labels it separately and compares current content hash
-to the selected job input. Old attempt failures cleared by a later claim cannot
-be recovered through this view. No new persistence or provider logging is added.
+The read-only admin monitor shows job status, safe latest errors, submitted
+script/hash, and separate historical-job versus current-story result panels.
+After migration `20261027120000_analysis_attempt_history`, successful jobs retain
+`resultSnapshot`, `successfulProvider` and `successfulModel`. Re-analysis updates
+the editor's latest story result but does not overwrite previous job snapshots.
+Older jobs are not backfilled from the current story or guessed model settings.
+
+`StoryAnalysisAttempt` records each request dispatch with order, requested API
+provider/model ID, trigger (initial/model fallback/provider fallback/primary retry),
+start/call-return/finish timestamps, duration and outcome. An optional dispatch
+hook is awaited after prompt/credential/client preparation and immediately before
+the SDK call. Tracking failure or lost ownership prevents an untracked new call.
+Local-parser/cache/preflight failures do not create AI attempts. A crash between
+dispatch recording and actual network send cannot prove delivery: the unfinished
+record is later classified INTERRUPTED, not a completed model attempt.
+
+Attempt outcomes are RUNNING, COMPLETED (validated result committed), FAILED,
+CANCELLED or INTERRUPTED. Actual provider-call timing includes request/SDK parsing,
+not queue/retry delay or subsequent result persistence. Cancel/interruption
+finishes open rows at local cancellation/detection time; late call return may
+populate responseAt, but cannot turn cancelled work into success. Exclude these
+rows from completed-attempt latency/success calculations. COMMIT_FAILED identifies
+local persistence failure separately from model/provider failure. COMPLETED is
+not proof of semantic accuracy. Model IDs are the requested IDs, not an inferred
+provider-internal model version. Terminal metadata is preserved across retries.
+
+Failures keep HTTP status, a bounded provider error code and redacted error
+message; no failed output payload, stack, keys or per-attempt script copy is stored.
+There is no automatic retention purge; history follows normal job/story deletion
+cascades. Charts/automatic accuracy evaluation remain planned. Pagination keeps
+admin reads bounded; current story data is always labelled separately.
 The focused fixture HTTP tests in `src/admin/admin-analysis-jobs.spec.ts` exercise
 real auth/role guards with stubbed token verification and Prisma persistence;
 they do not claim live PostgreSQL/session integration.
@@ -132,3 +157,31 @@ between the optimistic check and settlement, verifies the hold stays reserved,
 and verifies the replacement’s successful audio completes the charge. These use real disposable PostgreSQL with stubbed
 providers/storage and assert credit reservations/settlement as well as status.
 See the remaining critical audit findings in [operations](operations.md#critical-audit-after-recovery-fixes-2026-10-27).
+
+## Analysis code ownership
+
+- `ai/analysis/analysis-runner.service.ts`: per-job candidate order and bounded primary retries.
+- `ai/analysis/analysis-errors.ts`: shared HTTP/code classification for providers.
+- `ai/analysis/providers/`: Gemini adapter delegates to the existing Gemini schema/prompt path; OpenAI adapter reuses OpenAIProvider with the same Zod schema and prompt.
+- `settings/analysis-settings.service.ts`: strict routing validation, legacy defaults and existing configuration-store persistence.
+- `audio-stories/audio-stories.service.ts`: existing lease, cancel, revision/result validation and single reservation lifecycle. Delayed waits wake on local cancellation; lease/status checks fence late responses and further requests.
+
+OpenAI uses [Responses Structured Outputs](https://developers.openai.com/api/docs/guides/structured-outputs)
+with strict JSON Schema, followed by the same local consistency validation as Gemini.
+Model IDs are format-validated, not live-probed; choose models supporting the
+required structured output. No live provider compatibility/accuracy claim is
+implied by fixture tests. Per-attempt history and successful job snapshots are implemented; automatic
+accuracy scoring remains future work; read-only model reliability/timing
+statistics are implemented in the Analysis workspace Monitoring tab; audio/image configuration is
+not migrated by this feature.
+
+## Analysis workspace monitoring
+
+Analysis has Configuration and Monitoring tabs in the admin workspace. The
+monitoring API reads persisted attempt history only; it never triggers generation
+or changes pricing/configuration. See
+[performance API](api-overview.md#analysis-performance-monitoring) for denominator,
+UTC cohort, latency and pagination semantics. Metrics cover currently recorded
+analysis requests; audio/script/images/key-specific monitoring are not inferred
+from this data. Original script/results/attempts remain available through linked
+job details for manual quality review.

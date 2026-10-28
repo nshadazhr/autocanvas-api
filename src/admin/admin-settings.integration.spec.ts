@@ -1,3 +1,5 @@
+import { AdminAnalysisSettingsController, AnalysisSettingsDto } from './admin-analysis-settings.controller.js';
+import { AnalysisSettingsService, defaultAnalysisSettings } from '../settings/analysis-settings.service.js';
 import { AdminRuntimeSettingsController, SettingsPatchDto } from './admin-runtime-settings.controller.js';
 import {
 	AdminProviderKeysController,
@@ -58,6 +60,13 @@ describe.skipIf(!url)('Super Admin analysis-model settings', () => {
 			else memberToken = result.access_token;
 		}
 		Reflect.defineMetadata('design:paramtypes', [AppSettingsService], AdminSettingsController);
+		Reflect.defineMetadata('design:paramtypes', [AnalysisSettingsService], AdminAnalysisSettingsController);
+		Reflect.defineMetadata(
+			'design:paramtypes',
+			[AnalysisSettingsDto],
+			AdminAnalysisSettingsController.prototype,
+			'save'
+		);
 		Reflect.defineMetadata(
 			'design:paramtypes',
 			[UpdateAnalysisModelDto],
@@ -92,12 +101,14 @@ describe.skipIf(!url)('Super Admin analysis-model settings', () => {
 
 		const module = await Test.createTestingModule({
 			controllers: [
+				AdminAnalysisSettingsController,
 				AdminSettingsController,
 				AdminRuntimeSettingsController,
 				AdminProviderKeysController,
 				AppConfigController
 			],
 			providers: [
+				{ provide: AnalysisSettingsService, useValue: new AnalysisSettingsService(prisma as any, settings) },
 				{ provide: AppSettingsService, useValue: settings },
 				{
 					provide: ConfigurationSnapshotService,
@@ -132,6 +143,69 @@ describe.skipIf(!url)('Super Admin analysis-model settings', () => {
 		else process.env.JWT_REFRESH_SECRET = oldSecret;
 	});
 	const auth = (token: string) => ({ Authorization: `Bearer ${token}` });
+	it('protects and persists analysis routing configuration without exposing it publicly', async () => {
+		const route = '/admin/settings/analysis';
+		for (const method of ['get', 'patch'] as const) {
+			await request(app.getHttpServer())
+				[method](route)
+				.send(method === 'patch' ? { configuration: defaultAnalysisSettings('fixture') } : undefined)
+				.expect(401);
+			await request(app.getHttpServer())
+				[method](route)
+				.set(auth(adminToken))
+				.send(method === 'patch' ? { configuration: defaultAnalysisSettings('fixture') } : undefined)
+				.expect(403);
+			await request(app.getHttpServer())
+				[method](route)
+				.set(auth(memberToken))
+				.send(method === 'patch' ? { configuration: defaultAnalysisSettings('fixture') } : undefined)
+				.expect(401);
+		}
+		const configuration = {
+			...defaultAnalysisSettings('gemini-test'),
+			providerFallback: true,
+			providers: {
+				gemini: {
+					primaryModel: 'gemini-test',
+					models: [
+						{ id: 'gemini-test', enabled: true },
+						{ id: 'gemini-disabled', enabled: false }
+					]
+				},
+				openai: { primaryModel: 'gpt-test', models: [{ id: 'gpt-test', enabled: true }] }
+			}
+		};
+		const saved = await request(app.getHttpServer())
+			.patch(route)
+			.set(auth(superToken))
+			.send({ configuration })
+			.expect(200);
+		expect(saved.body).toEqual(configuration);
+		expect((await request(app.getHttpServer()).get(route).set(auth(superToken)).expect(200)).body).toEqual(
+			configuration
+		);
+		expect(saved.headers['cache-control']).toBe('private, no-store');
+		await request(app.getHttpServer())
+			.patch(route)
+			.set(auth(superToken))
+			.send({ configuration: { ...configuration, retryLimit: 11 } })
+			.expect(400);
+		await request(app.getHttpServer())
+			.patch(route)
+			.set(auth(superToken))
+			.send({ configuration: { ...configuration, secret: 'not-allowed' } })
+			.expect(400);
+		await request(app.getHttpServer())
+			.patch(route)
+			.set(auth(superToken))
+			.set('Origin', 'https://untrusted.invalid')
+			.send({ configuration })
+			.expect(403);
+		await request(app.getHttpServer()).patch(endpoint).set(auth(superToken)).send({ model: 'legacy' }).expect(400);
+		expect((await request(app.getHttpServer()).get('/app-config').expect(200)).body).not.toHaveProperty(
+			'analysis_settings'
+		);
+	});
 	it('rejects anonymous/user tokens and ordinary admins for reads and writes', async () => {
 		for (const method of ['get', 'patch'] as const) {
 			await request(app.getHttpServer())

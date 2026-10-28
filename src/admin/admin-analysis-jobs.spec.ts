@@ -1,4 +1,5 @@
 import 'reflect-metadata';
+import { AdminAnalysisAttemptsQuery } from './dto/admin-analysis-attempts.dto.js';
 import { beforeAll, afterAll, describe, expect, it, vi } from 'vitest';
 import { Test } from '@nestjs/testing';
 import { ValidationPipe, type INestApplication } from '@nestjs/common';
@@ -21,7 +22,10 @@ const summary = {
 	status: 'FAILED',
 	attempts: 3,
 	nextRetryAt: null,
-	errorCode: 'NETWORK_ERROR',
+	successfulProvider: null,
+	successfulModel: null,
+	errorCode: 'PROVIDER_RATE_LIMITED',
+	providerHttpStatus: 429,
 	errorMessage: '?key=private-key Bearer private-token',
 	source: null,
 	createdAt: new Date('2026-10-01T12:00:00Z'),
@@ -36,11 +40,13 @@ const prisma = {
 			role: where.id === 1 ? 'ADMIN' : where.id === 2 ? 'SUPERADMIN' : 'USER'
 		}))
 	},
+	storyAnalysisAttempt: { findMany: vi.fn(async () => []), findFirst: vi.fn(async () => null) },
 	storyAnalysisJob: {
 		findMany: vi.fn(async (_query: any) => [summary, { ...summary, id: next }]),
 		findUnique: vi.fn(async () => ({
 			...summary,
 			contentSnapshot: content,
+			resultSnapshot: null,
 			contentHash: createHash('sha256').update(content).digest('hex'),
 			story: {
 				title: 'Changed story',
@@ -66,6 +72,12 @@ describe('admin analysis monitoring with existing guards and fixture persistence
 			'list'
 		);
 		Reflect.defineMetadata('design:paramtypes', [String], AdminAnalysisJobsController.prototype, 'detail');
+		Reflect.defineMetadata(
+			'design:paramtypes',
+			[String, AdminAnalysisAttemptsQuery],
+			AdminAnalysisJobsController.prototype,
+			'attempts'
+		);
 		const module = await Test.createTestingModule({
 			controllers: [AdminAnalysisJobsController],
 			providers: [
@@ -97,6 +109,24 @@ describe('admin analysis monitoring with existing guards and fixture persistence
 		await request(app.getHttpServer()).post('/admin/analysis-jobs').set(auth()).expect(404);
 		await request(app.getHttpServer()).get('/admin/analysis-jobs').set(auth('2')).expect(200);
 	});
+	it('protects and validates paginated attempt history', async () => {
+		await request(app.getHttpServer()).get(`/admin/analysis-jobs/${id}/attempts`).expect(401);
+		const res = await request(app.getHttpServer())
+			.get(`/admin/analysis-jobs/${id}/attempts`)
+			.set(auth())
+			.expect(200);
+		expect(res.body).toEqual({ attempts: [], nextCursor: null });
+		expect(res.headers['cache-control']).toBe('private, no-store');
+		for (const query of ['limit=101', 'cursor=bad', 'unknown=1'])
+			await request(app.getHttpServer())
+				.get(`/admin/analysis-jobs/${id}/attempts?${query}`)
+				.set(auth())
+				.expect(400);
+		await request(app.getHttpServer())
+			.get(`/admin/analysis-jobs/${id}/attempts?cursor=${next}`)
+			.set(auth())
+			.expect(400);
+	});
 	it('validates IDs, dates, status, page size and query allowlist', async () => {
 		for (const query of [
 			'limit=101',
@@ -124,6 +154,7 @@ describe('admin analysis monitoring with existing guards and fixture persistence
 			.set(auth())
 			.expect(200);
 		expect(res.body.jobs).toHaveLength(1);
+		expect(res.body.jobs[0].providerHttpStatus).toBe(429);
 		expect(res.body.nextCursor).toBe(id);
 		expect(res.headers['cache-control']).toBe('private, no-store');
 		expect(JSON.stringify(res.body)).not.toContain('private-key');

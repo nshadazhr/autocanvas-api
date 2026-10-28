@@ -1,3 +1,4 @@
+import { AppSettingsModule } from '../settings/app-settings.module.js';
 import { CreditsModule } from '../credits/credits.module.js';
 import { AiUsageModule } from '../ai/usage/ai-usage.module.js';
 import { Module } from '@nestjs/common';
@@ -10,7 +11,7 @@ import { StoryParserService } from './services/story-parser.service.js';
 import { StoryAnalysisValidatorService } from './services/story-analysis-validator.service.js';
 
 @Module({
-	imports: [CreditsModule, AiUsageModule, AiModule],
+	imports: [AppSettingsModule, CreditsModule, AiUsageModule, AiModule],
 	controllers: [AudioStoriesController],
 	providers: [
 		AudioStoriesService,

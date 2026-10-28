@@ -7,6 +7,7 @@ export default defineConfig({
 	test: {
 		globals: true,
 		include: [
+			'src/ai/analysis/**/*.spec.ts',
 			'src/audio-generation/audio-flow.integration.spec.ts',
 			'src/storage/audio-layout.spec.ts',
 			'src/audio-generation/providers/gemini-tts.spec.ts',

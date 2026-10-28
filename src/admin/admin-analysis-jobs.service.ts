@@ -1,3 +1,5 @@
+import { safeAnalysisDetail } from '../ai/analysis/analysis-attempts.js';
+import { AdminAnalysisAttemptsQuery } from './dto/admin-analysis-attempts.dto.js';
 import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
 import { createHash } from 'node:crypto';
 import { PrismaService } from '../prisma/prisma.service.js';
@@ -12,8 +14,11 @@ const summary = {
 	attempts: true,
 	nextRetryAt: true,
 	errorCode: true,
+	providerHttpStatus: true,
 	errorMessage: true,
 	source: true,
+	successfulProvider: true,
+	successfulModel: true,
 	createdAt: true,
 	updatedAt: true,
 	completedAt: true,
@@ -90,6 +95,47 @@ export class AdminAnalysisJobsService {
 			nextCursor: jobs.length > query.limit ? jobs[query.limit - 1].id : null
 		};
 	}
+	async attempts(jobId: string, query: AdminAnalysisAttemptsQuery) {
+		if (!(await this.prisma.storyAnalysisJob.findUnique({ where: { id: jobId }, select: { id: true } })))
+			throw new NotFoundException('Analysis job not found');
+		const cursor = query.cursor
+			? await this.prisma.storyAnalysisAttempt.findFirst({
+					where: { id: query.cursor, jobId },
+					select: { sequence: true }
+				})
+			: null;
+		if (query.cursor && !cursor)
+			throw new BadRequestException('Analysis attempt cursor does not belong to this job. Refresh the details.');
+		const rows = await this.prisma.storyAnalysisAttempt.findMany({
+			where: { jobId, ...(cursor ? { sequence: { gt: cursor.sequence } } : {}) },
+			orderBy: { sequence: 'asc' },
+			take: query.limit + 1,
+			select: {
+				id: true,
+				sequence: true,
+				provider: true,
+				model: true,
+				kind: true,
+				status: true,
+				startedAt: true,
+				responseAt: true,
+				finishedAt: true,
+				durationMs: true,
+				errorCategory: true,
+				providerHttpStatus: true,
+				providerErrorCode: true,
+				errorMessage: true
+			}
+		});
+		const attempts = rows
+			.slice(0, query.limit)
+			.map(row => ({
+				...row,
+				errorMessage: row.errorMessage ? safeAnalysisDetail(new Error(row.errorMessage)) : null
+			}));
+		return { attempts, nextCursor: rows.length > query.limit ? attempts.at(-1)!.id : null };
+	}
+
 	async detail(id: string) {
 		const job = await this.prisma.storyAnalysisJob.findUnique({
 			where: { id },
@@ -97,6 +143,7 @@ export class AdminAnalysisJobsService {
 				...summary,
 				contentSnapshot: true,
 				contentHash: true,
+				resultSnapshot: true,
 				story: {
 					select: { title: true, content: true, analysisStatus: true, analysisResult: true, analyzedAt: true }
 				}
@@ -106,6 +153,7 @@ export class AdminAnalysisJobsService {
 		const { story, ...metadata } = job;
 		return {
 			job: safe({ ...metadata, story: { title: story.title } }),
+			attemptHistory: await this.attempts(id, { limit: 25 }),
 			currentStoryAnalysis: {
 				status: story.analysisStatus,
 				analyzedAt: story.analyzedAt,

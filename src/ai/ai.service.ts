@@ -32,8 +32,8 @@ export class AiService {
 	assertDiagnosticsAccess(userId: number) {
 		const allowed = (this.configService.get<string>('AI_DIAGNOSTICS_USER_IDS') ?? '')
 			.split(',')
-			.map((value) => Number(value.trim()))
-			.filter((value) => value > 0);
+			.map(value => Number(value.trim()))
+			.filter(value => value > 0);
 		if (!allowed.includes(userId))
 			throw new ForbiddenException('AI diagnostics are restricted to configured administrators');
 	}
@@ -69,15 +69,23 @@ export class AiService {
 		return (await this.settings.analysisModel()).model;
 	}
 
-	async analyzeStory(content: string, userId: number, selectedModel?: string): Promise<StoryAnalysisResult> {
+	async analyzeStory(
+		content: string,
+		userId: number,
+		selectedModel?: string,
+		onRequest?: () => Promise<void>
+	): Promise<StoryAnalysisResult> {
 		const model = selectedModel ?? (await this.getAnalysisModel());
 		const systemInstruction = await this.aiPromptService.getPrompt('story-analysis');
-		const response = await this.usage.execute(userId, 'analysis', content.length, async () =>
-			(await this.geminiClient()).models.generateContent({
+		const response = await this.usage.execute(userId, 'analysis', content.length, async () => {
+			const client = await this.geminiClient();
+			await onRequest?.();
+			return client.models.generateContent({
 				model,
 				contents: content,
 				config: {
 					systemInstruction: systemInstruction,
+					httpOptions: { retryOptions: { attempts: 1 } },
 					maxOutputTokens: 16_384,
 					responseMimeType: 'application/json',
 					responseSchema: {
@@ -113,8 +121,8 @@ export class AiService {
 						required: ['characters', 'scenes']
 					}
 				}
-			})
-		);
+			});
+		});
 
 		if (!response.text) {
 			throw new Error('Gemini returned an empty analysis response');
@@ -158,7 +166,7 @@ export class AiService {
 
 		const parts = response.candidates?.[0]?.content?.parts ?? [];
 
-		const audioPart = parts.find((part) => part.inlineData?.data);
+		const audioPart = parts.find(part => part.inlineData?.data);
 
 		console.log('TTS Response:', {
 			finishReason: response.candidates?.[0]?.finishReason,
@@ -228,9 +236,9 @@ export class AiService {
 			pageToken = response.next_page_token;
 		} while (pageToken);
 
-		const studioVoiceMap = new Map(studioVoices.map((voice) => [voice.geminiVoiceName.toLowerCase(), voice]));
+		const studioVoiceMap = new Map(studioVoices.map(voice => [voice.geminiVoiceName.toLowerCase(), voice]));
 
-		const filteredVoices = allGeminiVoices.flatMap((voice) => {
+		const filteredVoices = allGeminiVoices.flatMap(voice => {
 			if (voice.type !== 'prebuilt' || !voice.display_name) {
 				return [];
 			}

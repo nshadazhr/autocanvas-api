@@ -1,3 +1,6 @@
+import { AdminAnalysisJobsService } from '../admin/admin-analysis-jobs.service.js';
+import { defaultAnalysisSettings } from '../settings/analysis-settings.service.js';
+import { AnalysisRun } from '../ai/analysis/analysis-runner.service.js';
 import { CreditsService } from '../credits/credits.service.js';
 import { Test } from '@nestjs/testing';
 import { JwtService } from '@nestjs/jwt';
@@ -30,11 +33,29 @@ describe.skipIf(!databaseUrl)('analysis retries and shared AI budgets', () => {
 	const provider = {
 		analyze: vi.fn(),
 		assertEnabled: vi.fn().mockResolvedValue(undefined),
-		getModel: vi.fn().mockResolvedValue('gemini-3.5-flash')
+		getModel: vi.fn().mockResolvedValue('gemini-3.5-flash'),
+		getConfiguration: vi.fn(async () => ({
+			...defaultAnalysisSettings(await provider.getModel()),
+			retryDelaySeconds: 1,
+			retryLimit: 6
+		}))
 	};
+	let dispatchProviderRequest = true;
 	const service = new AudioStoriesService(
 		prisma as any,
-		provider as any,
+		{
+			...provider,
+			analyze: async (
+				content: string,
+				user: number,
+				model: string,
+				which: string,
+				onRequest?: () => Promise<void>
+			) => {
+				if (dispatchProviderRequest) await onRequest?.();
+				return provider.analyze(content, user, model, which);
+			}
+		} as any,
 		new StoryParserService(),
 		new StoryAnalysisValidatorService(),
 		config as any,
@@ -92,8 +113,14 @@ describe.skipIf(!databaseUrl)('analysis retries and shared AI budgets', () => {
 		});
 		await prisma.aiUsageBucket.deleteMany();
 		await prisma.aiRequestLease.deleteMany();
+		dispatchProviderRequest = true;
 		provider.analyze.mockReset().mockResolvedValue(result);
 		provider.getModel.mockReset().mockResolvedValue('gemini-3.5-flash');
+		provider.getConfiguration.mockReset().mockImplementation(async () => ({
+			...defaultAnalysisSettings(await provider.getModel()),
+			retryDelaySeconds: 1,
+			retryLimit: 6
+		}));
 		storyId = (
 			await service.create(userId, { title: 'Test', content: 'A simple unstructured story about a person.' })
 		).id;
@@ -144,6 +171,7 @@ describe.skipIf(!databaseUrl)('analysis retries and shared AI budgets', () => {
 		expect(await job(j.id)).toMatchObject({
 			status: 'FAILED',
 			errorCode: 'PROVIDER_CONFIGURATION_ERROR',
+			providerHttpStatus: 400,
 			attempts: 1
 		});
 		expect((await prisma.user.findUniqueOrThrow({ where: { id: userId } })).creditBalance).toBe(100);
@@ -162,6 +190,7 @@ describe.skipIf(!databaseUrl)('analysis retries and shared AI budgets', () => {
 		expect(await job(j.id)).toMatchObject({
 			status: 'COMPLETED',
 			attempts: 2,
+			providerHttpStatus: null,
 			errorCode: null,
 			errorMessage: null
 		});
@@ -169,7 +198,203 @@ describe.skipIf(!databaseUrl)('analysis retries and shared AI budgets', () => {
 		expect((await service.analyze(storyId, userId))!.id).toBe(j.id);
 		expect(provider.analyze).toHaveBeenCalledTimes(2);
 	});
-	it('keeps retrying busy responses beyond three retries until success', async () => {
+	it('stores provider HTTP status during busy waits without exposing it to users', async () => {
+		const j = (await service.analyze(storyId, userId))!;
+		provider.analyze.mockRejectedValueOnce(Object.assign(new Error('private upstream detail'), { status: 503 }));
+		await (service as any).processAnalysisAttempt(
+			j.id,
+			'fixture-model',
+			'gemini',
+			new AnalysisRun({ ...defaultAnalysisSettings('fixture-model'), retryDelaySeconds: 1 })
+		);
+		expect(await job(j.id)).toMatchObject({
+			status: 'WAITING',
+			providerHttpStatus: 503,
+			errorCode: 'PROVIDER_BUSY'
+		});
+		expect(JSON.stringify(await service.getLatestAnalysisJob(storyId, userId))).not.toContain('providerHttpStatus');
+	});
+	it('fails after the configured primary retry limit and refunds the single paid job reservation', async () => {
+		await prisma.configuration.update({
+			where: { key: 'credits_settings' },
+			data: { value: { analysisCredits: 10 } }
+		});
+		provider.getConfiguration.mockResolvedValueOnce({
+			...defaultAnalysisSettings('g1'),
+			retryDelaySeconds: 1,
+			retryLimit: 1
+		});
+		provider.analyze.mockRejectedValue(Object.assign(new Error('busy'), { status: 503 }));
+		const j = (await service.analyze(storyId, userId))!;
+		await service.processAnalysisJob(j.id);
+		expect(await job(j.id)).toMatchObject({
+			status: 'FAILED',
+			attempts: 2,
+			errorCode: 'PROVIDER_BUSY',
+			providerHttpStatus: 503
+		});
+		expect((await job(j.id)).errorMessage).not.toContain('automatically');
+		expect(
+			await prisma.creditTransaction.findUniqueOrThrow({ where: { reference: 'analysis:' + j.id } })
+		).toMatchObject({ status: 'REFUNDED' });
+		expect((await prisma.user.findUniqueOrThrow({ where: { id: userId } })).creditBalance).toBe(100);
+	});
+	it('switches providers inside one job, charges once, and records OpenAI source', async () => {
+		await prisma.configuration.update({
+			where: { key: 'credits_settings' },
+			data: { value: { analysisCredits: 10 } }
+		});
+		provider.getConfiguration.mockResolvedValueOnce({
+			...defaultAnalysisSettings('g1'),
+			providerFallback: true,
+			retryLimit: 0,
+			providers: {
+				gemini: {
+					primaryModel: 'g1',
+					models: [
+						{ id: 'g1', enabled: true },
+						{ id: 'g2', enabled: true }
+					]
+				},
+				openai: { primaryModel: 'o1', models: [{ id: 'o1', enabled: true }] }
+			}
+		});
+		provider.analyze
+			.mockRejectedValueOnce(Object.assign(new Error('busy'), { status: 503 }))
+			.mockRejectedValueOnce(Object.assign(new Error('busy'), { status: 503 }));
+		const j = (await service.analyze(storyId, userId))!;
+		await service.processAnalysisJob(j.id);
+		expect(await job(j.id)).toMatchObject({ status: 'COMPLETED', attempts: 3, source: 'OPENAI_AI' });
+		expect(provider.analyze.mock.calls.map(c => [c[2], c[3]])).toEqual([
+			['g1', 'gemini'],
+			['g2', 'gemini'],
+			['o1', 'openai']
+		]);
+		expect(await prisma.creditTransaction.count({ where: { reference: 'analysis:' + j.id } })).toBe(1);
+		expect((await prisma.user.findUniqueOrThrow({ where: { id: userId } })).creditBalance).toBe(90);
+	});
+	it('preserves per-job models, failures and snapshots across re-analysis and exposes paginated history', async () => {
+		const configuration = {
+			...defaultAnalysisSettings('g1'),
+			retryLimit: 0,
+			providers: {
+				gemini: {
+					primaryModel: 'g1',
+					models: [
+						{ id: 'g1', enabled: true },
+						{ id: 'g2', enabled: true }
+					]
+				},
+				openai: { primaryModel: null, models: [] }
+			}
+		};
+		provider.getConfiguration.mockResolvedValue(configuration);
+		provider.analyze.mockRejectedValueOnce(
+			Object.assign(new Error('Busy apiKey=AIza-fixture-secret sk-fixturesecretlong'), {
+				status: 503,
+				code: 'UNAVAILABLE'
+			})
+		);
+		const first = (await service.analyze(storyId, userId))!;
+		await service.processAnalysisJob(first.id);
+		const firstJob = await job(first.id);
+		expect(firstJob).toMatchObject({
+			status: 'COMPLETED',
+			successfulProvider: 'gemini',
+			successfulModel: 'g2',
+			resultSnapshot: { source: 'GEMINI_AI' }
+		});
+		const history = await prisma.storyAnalysisAttempt.findMany({
+			where: { jobId: first.id },
+			orderBy: { sequence: 'asc' }
+		});
+		expect(history.map(a => [a.model, a.status, a.kind])).toEqual([
+			['g1', 'FAILED', 'INITIAL'],
+			['g2', 'COMPLETED', 'MODEL_FALLBACK']
+		]);
+		expect(history[0]).toMatchObject({
+			providerHttpStatus: 503,
+			providerErrorCode: 'UNAVAILABLE',
+			errorCategory: 'BUSY'
+		});
+		expect(history[0].errorMessage).not.toContain('AIza');
+		expect(history[0].errorMessage).not.toContain('sk-fixture');
+		expect(history.every(a => a.durationMs !== null && a.durationMs >= 0 && a.finishedAt && a.responseAt)).toBe(
+			true
+		);
+		expect((await service.analyze(storyId, userId))!.id).toBe(first.id);
+		expect(await prisma.storyAnalysisAttempt.count({ where: { jobId: first.id } })).toBe(2);
+		await service.update(storyId, userId, { content: 'A revised unstructured story about another day.' });
+		provider.analyze.mockResolvedValueOnce({
+			...result,
+			scenes: result.scenes.map(scene => ({ ...scene, text: 'Revised dialogue' }))
+		});
+		const second = (await service.analyze(storyId, userId))!;
+		await service.processAnalysisJob(second.id);
+		expect(await job(second.id)).toMatchObject({ successfulModel: 'g1' });
+		expect((await job(first.id)).resultSnapshot).toEqual(firstJob.resultSnapshot);
+		expect((await job(second.id)).resultSnapshot).not.toEqual(firstJob.resultSnapshot);
+		const admin = new AdminAnalysisJobsService(prisma as any);
+		const detail = await admin.detail(first.id);
+		expect(detail.job.resultSnapshot).toEqual(firstJob.resultSnapshot);
+		expect(detail.currentStoryAnalysis.result).not.toEqual(firstJob.resultSnapshot);
+		const page = await admin.attempts(first.id, { limit: 1 });
+		expect(page.attempts).toHaveLength(1);
+		expect(page.nextCursor).toBe(history[0].id);
+		expect((await admin.attempts(first.id, { limit: 1, cursor: page.nextCursor! })).attempts[0].id).toBe(
+			history[1].id
+		);
+		const sizes = await prisma.$queryRaw<
+			Array<{ logical: number; stored: number; attempt: number }>
+		>`SELECT octet_length(j."resultSnapshot"::text)::int AS logical,pg_column_size(j."resultSnapshot")::int AS stored,(SELECT pg_column_size(a)::int FROM "StoryAnalysisAttempt" a WHERE a."jobId"=j.id LIMIT 1) AS attempt FROM "StoryAnalysisJob" j WHERE j.id=${first.id}`;
+		console.log('Synthetic one-scene history storage bytes:', sizes[0]);
+	});
+	it('measures a synthetic 100-scene job snapshot without duplicating results per attempt', async () => {
+		const large = {
+			characters: result.characters,
+			scenes: Array.from({ length: 100 }, (_, i) => ({
+				...result.scenes[0],
+				sceneOrder: i + 1,
+				text: `दृश्य ${i + 1}: यह कहानी का एक अलग संवाद है। ${Array.from({ length: 8 }, () => randomUUID()).join(' ')}`
+			}))
+		};
+		provider.analyze.mockResolvedValueOnce(large);
+		const j = (await service.analyze(storyId, userId))!;
+		await service.processAnalysisJob(j.id);
+		expect((await job(j.id)).status).toBe('COMPLETED');
+		expect(await prisma.storyAnalysisAttempt.count({ where: { jobId: j.id } })).toBe(1);
+		const sizes = await prisma.$queryRaw<
+			Array<{ logical: number; stored: number }>
+		>`SELECT octet_length("resultSnapshot"::text)::int AS logical,pg_column_size("resultSnapshot")::int AS stored FROM "StoryAnalysisJob" WHERE id=${j.id}`;
+		console.log('Synthetic 100-scene snapshot bytes:', sizes[0]);
+	});
+	it('does not invent a provider attempt when configuration fails before dispatch', async () => {
+		dispatchProviderRequest = false;
+		provider.analyze.mockRejectedValue(
+			Object.assign(new Error('Provider key unavailable'), { status: 503, nonRetryable: true })
+		);
+		const j = (await service.analyze(storyId, userId))!;
+		await service.processAnalysisJob(j.id);
+		expect(await prisma.storyAnalysisAttempt.count({ where: { jobId: j.id } })).toBe(0);
+		expect((await job(j.id)).successfulModel).toBeNull();
+	});
+	it('records interrupted running attempts on stale-job cleanup without counting model failure', async () => {
+		const j = (await service.analyze(storyId, userId))!;
+		const startedAt = new Date(Date.now() - 180000);
+		await prisma.storyAnalysisJob.update({
+			where: { id: j.id },
+			data: { status: 'PROCESSING', leaseToken: 'old-lease', leaseExpiresAt: startedAt, updatedAt: startedAt }
+		});
+		await prisma.storyAnalysisAttempt.create({
+			data: { jobId: j.id, sequence: 1, provider: 'gemini', model: 'g1', kind: 'INITIAL', startedAt }
+		});
+		await service.waitForAnalysis(storyId, userId, j.id);
+		expect(await prisma.storyAnalysisAttempt.findFirstOrThrow({ where: { jobId: j.id } })).toMatchObject({
+			status: 'INTERRUPTED',
+			errorCategory: 'WORKER_INTERRUPTED'
+		});
+	});
+	it('honors a configured primary retry limit above three until success', async () => {
 		for (let i = 0; i < 5; i++)
 			provider.analyze.mockRejectedValueOnce(Object.assign(new Error('busy'), { status: 503 }));
 		const j = (await service.analyze(storyId, userId))!;
@@ -198,6 +423,7 @@ describe.skipIf(!databaseUrl)('analysis retries and shared AI budgets', () => {
 			status: 'FAILED',
 			attempts: 5,
 			errorCode: 'PROVIDER_RATE_LIMITED',
+			providerHttpStatus: 429,
 			nextRetryAt: null
 		});
 		await service.processAnalysisJob(j.id);
@@ -220,14 +446,24 @@ describe.skipIf(!databaseUrl)('analysis retries and shared AI budgets', () => {
 			vi.spyOn(service as any, 'dispatch').mockImplementation(() => {});
 		}
 	});
-	it('cancel during busy retry prevents further provider calls', async () => {
+	it('cancel wakes a long primary delay and prevents further provider calls', async () => {
+		provider.getConfiguration.mockResolvedValueOnce({
+			...defaultAnalysisSettings('g1'),
+			retryDelaySeconds: 120,
+			retryLimit: 1
+		});
 		provider.analyze.mockRejectedValue(Object.assign(new Error('busy'), { status: 503 }));
 		const j = (await service.analyze(storyId, userId))!;
 		const work = service.processAnalysisJob(j.id);
 		for (let i = 0; i < 100 && (await job(j.id)).status !== 'WAITING'; i++)
 			await new Promise(resolve => setTimeout(resolve, 10));
 		await service.cancelAnalysis(storyId, userId, j.id);
-		await work;
+		await Promise.race([
+			work,
+			new Promise((_, reject) =>
+				setTimeout(() => reject(new Error('Cancellation did not wake retry wait')), 2000)
+			)
+		]);
 		expect((await job(j.id)).status).toBe('CANCELLED');
 		expect(provider.analyze).toHaveBeenCalledTimes(1);
 	});
@@ -294,6 +530,12 @@ describe.skipIf(!databaseUrl)('analysis retries and shared AI budgets', () => {
 		finish(result);
 		await work;
 		expect((await job(j.id)).status).toBe('CANCELLED');
+		expect(await prisma.storyAnalysisAttempt.findFirstOrThrow({ where: { jobId: j.id } })).toMatchObject({
+			status: 'CANCELLED',
+			errorCategory: 'USER_CANCELLED'
+		});
+		expect((await job(j.id)).resultSnapshot).toBeNull();
+		expect((await job(j.id)).successfulModel).toBeNull();
 		expect(await prisma.audioScene.count({ where: { storyId } })).toBe(0);
 		expect((await service.findOne(storyId, userId)).analysisStatus).toBe('PENDING');
 	});
@@ -478,7 +720,14 @@ describe.skipIf(!databaseUrl)('analysis retries and shared AI budgets', () => {
 		});
 		const j = (await service.analyze(storyId, userId))!;
 		await service.processAnalysisJob(j.id);
-		expect(await job(j.id)).toMatchObject({ status: 'COMPLETED', source: 'LOCAL_PARSER' });
+		expect(await job(j.id)).toMatchObject({
+			status: 'COMPLETED',
+			source: 'LOCAL_PARSER',
+			successfulModel: null,
+			successfulProvider: null
+		});
+		expect(await prisma.storyAnalysisAttempt.count({ where: { jobId: j.id } })).toBe(0);
+		expect((await job(j.id)).resultSnapshot).not.toBeNull();
 		expect(provider.analyze).not.toHaveBeenCalled();
 	});
 	it('denies diagnostic provider calls unless the user is explicitly allowlisted', async () => {

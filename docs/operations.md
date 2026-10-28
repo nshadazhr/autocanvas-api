@@ -166,8 +166,9 @@ machine, pull migration/code and run these commands before starting the backend.
 | `app_strings`      | Locale objects (`en`, `hi`), shared naming for future web/mobile/desktop consumers |
 | `app_settings`     | Public app configuration overrides                                                 |
 | `backend_settings` | `features` and `processing` objects                                                |
-| `gemini_settings`  | `analysisModel`, provider `enabled`, `credentialMode`                              |
+| `gemini_settings`  | legacy `analysisModel`, provider `enabled`, `credentialMode`                              |
 | `openai_settings`  | `outlineModel`, provider `enabled`, `credentialMode`                               |
+| `analysis_settings` | Analysis primary provider, per-provider primary/ordered models and bounded retry policy |
 | `credits_settings` | Analysis/audio/welcome rates                                                       |
 
 Resend sender/key and Razorpay activation remain environment-backed; they are not
@@ -266,3 +267,133 @@ No additional confirmed payment-signature, duplicate-credit
 or cross-owner authenticated audio-access issue was found in the inspected paths
 and existing isolated tests. This is a targeted audit, not a claim of complete
 production security or provider reliability.
+
+## Analysis HTTP status diagnostics (2026-10-27)
+
+Deploy migration `20261027060000_analysis_provider_http_status` before running the
+updated backend, then regenerate Prisma:
+
+```sh
+npx prisma migrate deploy --config prisma7.config.ts
+npx prisma generate --config prisma7.config.ts
+```
+
+This adds one nullable integer to StoryAnalysisJob, without a new table or
+backfill. Admin monitoring exposes the current provider HTTP error status;
+unknown/historical/local failures show no recorded code. Retry claims, success,
+cancellation and interruption clear it. User messages, user job DTOs, model
+selection and retry timing are unchanged. Per-attempt history/model statistics
+remain planned, not implemented.
+
+Migration deploy was verified against a fresh disposable local database; Prisma
+generation and backend/admin typechecks passed. All 88 audio/analysis tests,
+5 admin monitoring HTTP tests and 13 admin decoder tests passed. Provider calls
+were stubbed. Admin browser fixtures verified recorded/missing codes and
+360/393/768/1440px layouts with no page overflow or runtime errors. Application
+and production databases were not migrated during this verification.
+
+## Analysis routing rollout (2026-10-27)
+
+No additional schema migration is needed. Existing Configuration JSON stores
+`analysis_settings`. Until first dashboard save, use the previous Gemini model
+with bounded defaults: two delayed retries at five seconds. The new Super Admin
+Providers & Models form manages Gemini/OpenAI primary models, ordered backups,
+provider fallback and primary retry bounds. Provider Keys remains the single
+place for credentials. Global provider/analysis feature controls still apply.
+Audio generation and script-outline configuration are unchanged.
+
+A model must support the adapter's structured output API; format validation does
+not prove availability or accuracy. Configure valid credentials before enabling
+cross-provider fallback. Save affects new jobs only. Existing results remain
+cached. Runtime key/feature changes are not an immutable credential snapshot.
+Model snapshots, persistent per-attempt telemetry and success-rate charts remain
+planned; safe provider/model/error metadata is logged for failed attempts.
+
+Verification uses a newly migrated disposable local database and stubbed external
+providers/storage/payments. Routing unit tests cover primary-only, both provider
+orders, disabled models, finite primary retries, shared 429 skipping, configuration
+snapshots and terminal errors. PostgreSQL tests cover one reservation across
+provider switches, correct source, final failure/refund, and prompt cancellation
+of a 120-second delayed retry. Admin HTTP tests cover current-role/origin guards,
+configuration persistence and public-config exclusion. Browser fixture checks
+cover add/remove/disable/reorder/primary protection, save failure/retry/reload and
+360/393/768/1440px layouts without overflow or runtime errors. No live provider
+calls, paid accuracy tests or application routing configuration changes were made.
+
+Final routing checks: 101 audio/analysis tests, 69 admin/auth/settings tests and
+15 admin decoder tests passed; API/admin production builds and typechecks
+passed. The existing auth test's outdated partial user-service stub was replaced
+with the real UserService so profile/session regression checks run against the
+current implementation; production auth code was not changed. The running local
+API recognized the new routing endpoint and returned 401 without authentication.
+The disposable test database was removed after verification.
+
+## Analysis attempt history rollout (2026-10-27)
+
+This supersedes earlier notes saying model/attempt history was unrecorded.
+Deploy `20261027120000_analysis_attempt_history`, then regenerate Prisma:
+
+```sh
+npx prisma migrate deploy --config prisma7.config.ts
+npx prisma generate --config prisma7.config.ts
+```
+
+The additive migration creates StoryAnalysisAttempt plus nullable successful
+provider/model and resultSnapshot columns on StoryAnalysisJob. No existing
+records are backfilled and no configuration or pricing is changed. Save tracking
+and accepted result snapshots in the existing ownership/lease/credit transactions.
+Terminal cancellation/interruption remains fenced against late success.
+Database backup/restore includes these rows; normal story/job deletion cascades
+remove them, and no automatic diagnostic-history retention job is introduced.
+
+Future reports can use provider/model, outcome, errorCategory and durationMs.
+Count recorded terminal requests, not StoryAnalysisJob.attempts (which also counts
+local processing claims). Exclude RUNNING/CANCELLED/INTERRUPTED and distinguish
+COMMIT_FAILED and configuration/access problems when reporting model reliability.
+BUSY errors and 429 rate/quota errors stay separate. Successful structured output
+is not automatically accurate. The same-story input/output snapshots support
+manual checks; fallback-only samples are not a fair controlled model benchmark.
+
+Storage probes use synthetic fixtures, not a production-size claim. A one-scene
+result measured 300 logical JSON bytes / 376 stored JSONB bytes; one attempt row
+measured 214 bytes, excluding indexes, row/page/WAL overhead and repeated errors.
+Real script/result/model/error lengths affect size. Each job stores one successful
+snapshot, and attempts do not duplicate scripts or store failed result bodies.
+
+The varied synthetic 100-scene snapshot measured 51,056 logical JSON bytes and
+31,941 stored JSONB bytes in PostgreSQL. These fixtures do not estimate semantic
+quality or all production text/compression patterns. Final isolated regression
+checks passed: 106 audio/analysis, 70 admin/auth/settings and 16 admin decoder
+tests; API/admin production builds and typechecks passed. The migration matched
+the final Prisma schema with no drift. Browser fixture checks passed for paging
+failure/retry, historical/current result separation, legacy jobs, long model IDs
+and 360/393/768/1440px layouts with no overflow/runtime errors. All AI/storage/
+payment behavior in tests was stubbed; no live provider calls were made.
+
+The migration was subsequently applied to the verified local `autocanvas`
+application database; migrate status reported up to date and Prisma client was
+regenerated. No existing job histories/results were backfilled. The disposable
+history test database was removed after verification. Production deployment
+still requires the same migration/generation commands on its own target.
+
+## Analysis monitoring workspace (2026-10-27)
+
+The existing /providers route now provides Analysis Configuration/Monitoring tabs.
+Monitoring reads /admin/analysis-performance over existing StoryAnalysisAttempt
+rows. No new migration or application configuration save is required; deploy the
+previous attempt-history migration before enabling this backend. This supersedes
+earlier notes that all model-performance summaries were future work. Automatic
+accuracy scoring and monitoring for other product features remain planned.
+
+The API uses SQL aggregates/percentiles and bounded model pages; it does not load
+all request records into application memory. Use provider/exact-model and
+1/7/30/90-day request-start filters to keep reports focused. No query is made to
+Gemini/OpenAI and no key, generation or credit state is changed by reporting.
+Recent jobs are limited to 10 matching-request jobs; their successful model may
+be a later fallback. See the API overview for cohort and denominator rules.
+
+Verification: the disposable local database suite passed 74 admin/auth/settings
+checks including weighted totals, raw-success median versus model medians,
+exclusions, empty rates, provider/model filters, UTC start windows, cohort paging,
+role/realm guards and query validation. Admin decoder tests cover malformed/
+inconsistent metrics without substituting fake zeros. No live AI tests are implied.

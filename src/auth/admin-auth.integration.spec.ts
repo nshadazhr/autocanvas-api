@@ -1,3 +1,4 @@
+import { UserService } from '../user/user.service.js';
 import { PrismaService } from '../prisma/prisma.service.js';
 import { ConfigService } from '@nestjs/config';
 import 'reflect-metadata';
@@ -30,7 +31,7 @@ describe.skipIf(!databaseUrl)('admin/user auth with real PostgreSQL and HTTP', (
 	const jwt = new JwtService({ secret: 'isolated-auth-test-access', signOptions: { expiresIn: '15m' } });
 	const tokens = new TokenService(jwt, prisma as any);
 	const limits: Record<string, string> = {};
-	const users = { getUniqueEmail: (email: string) => prisma.user.findUnique({ where: { email } }) };
+	const users = new UserService(prisma as any);
 	const passwords = { verify: vi.fn(async (raw: string) => raw === 'correct-password') };
 	const auth = new AuthService({} as any, users as any, passwords as any, tokens, {} as any, {} as any, {} as any);
 	let app: INestApplication;

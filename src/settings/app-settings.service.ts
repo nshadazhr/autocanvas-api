@@ -27,6 +27,8 @@ export class AppSettingsService {
 		};
 	}
 	async setAnalysisModel(model: string | null) {
+		if (Object.keys(await readConfiguration(this.prisma, 'analysis_settings')).length)
+			throw new BadRequestException('Use analysis provider/model configuration after it has been saved');
 		await this.prisma.$transaction(tx => writeConfiguration(tx, 'gemini_settings', { analysisModel: model }));
 		return this.analysisModel();
 	}
