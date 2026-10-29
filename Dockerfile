@@ -14,6 +14,7 @@ COPY --from=builder /app/node_modules ./node_modules
 COPY --from=builder /app/dist ./dist
 COPY --from=builder /app/prisma ./prisma
 COPY --from=builder /app/prisma7.config.ts ./prisma7.config.ts
+COPY --from=builder /app/docker-start.sh ./docker-start.sh
 COPY package*.json ./
 RUN mkdir -p autocanvas-assets && chown node:node autocanvas-assets
 USER node
