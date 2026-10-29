@@ -10,6 +10,7 @@ vi.mock('@google/genai', () => ({
 }));
 import { GeminiTtsService } from './gemini-tts.service.js';
 import { ProviderRateLimitError } from '../errors/provider-rate-limit.error.js';
+import { AppSettingsService } from '../../settings/app-settings.service.js';
 import { AiCapacityError } from '../../ai/usage/ai-capacity.error.js';
 
 describe('single-key Gemini audio', () => {
@@ -45,6 +46,23 @@ describe('single-key Gemini audio', () => {
 		const audio = await generate();
 		expect(audio.subarray(0, 4).toString()).toBe('RIFF');
 		expect(sdk.keys).toEqual(['fixture-single-key']);
+		expect(sdk.generate).toHaveBeenCalledTimes(1);
+	});
+	it('blocks new admission during maintenance while accepted work can finish unless its provider is disabled', async () => {
+		const runtime = new AppSettingsService({} as any, {} as any);
+		const flags = { maintenanceMode: true, audioEnabled: true, geminiEnabled: true };
+		vi.spyOn(runtime, 'section').mockImplementation(async () => ({ values: { ...flags }, defaults: {} }));
+		const acceptedWork = new GeminiTtsService(credentials as any, runtime, usage as any);
+		await expect(acceptedWork.assertEnabled()).rejects.toThrow('temporarily disabled');
+		const audio = await acceptedWork.generateSpeech('Accepted before maintenance', 'Kore', 'fixture-model', {
+			userId: 1
+		});
+		expect(audio.subarray(0, 4).toString()).toBe('RIFF');
+		expect(sdk.generate).toHaveBeenCalledTimes(1);
+		flags.geminiEnabled = false;
+		await expect(
+			acceptedWork.generateSpeech('Accepted work', 'Kore', 'fixture-model', { userId: 1 })
+		).rejects.toThrow('temporarily disabled');
 		expect(sdk.generate).toHaveBeenCalledTimes(1);
 	});
 	it('treats an invalid-key HTTP 400 as terminal configuration failure without exposing the key', async () => {

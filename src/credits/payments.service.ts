@@ -1,3 +1,4 @@
+import { AppSettingsService } from '../settings/app-settings.service.js';
 import {
 	BadRequestException,
 	ConflictException,
@@ -15,22 +16,22 @@ export class PaymentsService {
 	constructor(
 		private readonly prisma: PrismaService,
 		private readonly credits: CreditsService,
-		private readonly config: ConfigService
+		private readonly config: ConfigService,
+		private readonly settings: AppSettingsService
 	) {}
 	private keys() {
 		const keyId = this.config.get<string>('RAZORPAY_KEY_ID')?.trim();
 		const secret = this.config.get<string>('RAZORPAY_KEY_SECRET')?.trim();
-		if (
-			this.config.get<string>('RAZORPAY_ENABLED') !== 'true' ||
-			!keyId ||
-			!secret ||
-			!this.config.get<string>('RAZORPAY_WEBHOOK_SECRET')?.trim()
-		)
+		if (!keyId || !secret || !this.config.get<string>('RAZORPAY_WEBHOOK_SECRET')?.trim())
 			throw new ServiceUnavailableException('Payments are not configured. Contact support.');
 		return { keyId, secret };
 	}
-	info() {
+	private async checkoutEnabled() {
+		return (await this.settings.section('payments')).values.checkoutEnabled === true;
+	}
+	async info() {
 		try {
+			if (!(await this.checkoutEnabled())) return { enabled: false, mode: 'disabled' };
 			return { enabled: true, mode: this.keys().keyId.startsWith('rzp_test_') ? 'test' : 'live' };
 		} catch {
 			return { enabled: false, mode: 'disabled' };
@@ -62,6 +63,10 @@ export class PaymentsService {
 		return timingSafeEqual(expected, Buffer.from(signature, 'hex'));
 	}
 	async create(userId: number, packId: string, requestId: string) {
+		if (!(await this.checkoutEnabled()))
+			throw new ServiceUnavailableException(
+				'New checkouts are currently disabled. Existing payments can still be verified.'
+			);
 		const { keyId } = this.keys();
 		const purchase = await this.prisma.$transaction(async tx => {
 			await tx.$queryRaw`SELECT id FROM "User" WHERE id = ${userId} FOR UPDATE`;

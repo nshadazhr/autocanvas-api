@@ -28,6 +28,28 @@ Default backend port is **4000** (`PORT` overrides it); Swagger UI is at `/swagg
 
 User frontend normally runs on `http://localhost:3000`, admin frontend on `http://localhost:3001`. Keep their origins and session flows separate.
 
+## Docker deployment
+
+Use the same Dockerfile for sandbox and production, with separate hosting environment values. Both build and runtime use Node 24 Alpine with OpenSSL. `npm ci --include=dev` installs the lockfile versions and build tools, then Prisma generation explicitly uses `prisma7.config.ts` before compiling Nest. Runtime includes that config alongside the CLI/schema/migrations, dependencies and compiled prompts. The API runs as the unprivileged `node` user using compiled `dist/main.js`, not TypeScript source; its local assets directory is writable by that user. Set `NODE_ENV=production` in Render for both hosted sandbox and production; the Dockerfile does not set it or select a database, storage provider or payment mode. `EXPOSE 4000` documents the API default; the actual listener honors the platform's `PORT` value. Real environment files, local recordings and generated Prisma sources are excluded from the build context; Prisma is regenerated inside the image. Build dependencies are retained because the runtime image also supplies the Prisma migration CLI.
+
+```sh
+docker build -t autocanvas-api:check .
+```
+
+The image build does not require production credentials or run database migrations. Supply backend secrets only at runtime through the host. Before starting against an intended database, apply reviewed migrations with:
+
+```sh
+npx prisma migrate deploy --config prisma7.config.ts
+```
+
+On Render select Docker, use `./Dockerfile`, leave Root Directory blank for this repository, and supply the matching web/admin origins and server-only credentials. Configure the migration command above as the **Pre-Deploy Command** on each paid service before enabling releases; leave Docker Command blank. Set HTTP Health Check Path to the existing `/app-config` endpoint, which exercises configuration/database reads, rather than relying only on an open TCP port. The order is image build, successful pending migrations, new API startup and platform health checks/traffic switch. Failed migration blocks the new deploy, but earlier successful migration statements might already have changed the shared database, so reviewed migrations must remain compatible with the old running app. Commit migrations with their schema/code changes; a local migration does not update remote databases. Auto-deploy on a Git push does not itself configure automatic migration. The default Docker command only starts the API and does not change a database. For a sandbox service without pre-deploy support, use this Docker Command override after confirming DATABASE_URL is the sandbox database:
+
+```sh
+/bin/sh -c 'npx prisma migrate deploy --config prisma7.config.ts && exec node dist/main.js'
+```
+
+Do not run migrations in an image build or copy production data into sandbox. Native Node Build/Start fields and Render's `NODE_VERSION` selection do not control this Docker image. Deployment and runtime smoke checks still require a working Docker daemon and deliberate environment configuration; a source build alone does not prove a container boot or remote deployment.
+
 ## Verification
 
 ```sh
@@ -70,7 +92,7 @@ and [audio flow](docs/audio-flow.md).
 
 ## Admin runtime controls
 
-Super Admin now manages shared web text (English/Hindi), public JSON app settings, new-AI/provider feature switches, analysis and outline model settings, multi-scene recovery settings and credits pricing. Read [API overview](docs/api-overview.md) and [audio flow](docs/audio-flow.md) before deployment. Provider credentials are managed only through backend GEMINI_API_KEY / OPENAI_API_KEY environment settings. Apply migration `20261028143000_env_only_provider_keys` and regenerate Prisma when upgrading; it removes stored credentials and source flags, preserving models and feature settings. Credits billing and Razorpay INR checkout are implemented; activation requires merchant configuration. See environment notes below and the retained API/auth guides for setup boundaries.
+Super Admin now manages shared web text (English/Hindi), public JSON app settings, new-AI/provider feature switches, analysis and outline model settings, multi-scene recovery settings, credits pricing and new-payment checkout enablement. Read [API overview](docs/api-overview.md) and [audio flow](docs/audio-flow.md) before deployment. Provider credentials are managed only through backend GEMINI_API_KEY / OPENAI_API_KEY environment settings. Apply migration `20261028143000_env_only_provider_keys` and regenerate Prisma when upgrading; it removes stored credentials and source flags, preserving models and feature settings. Credits billing and Razorpay INR checkout are implemented; activation requires merchant configuration. See environment notes below and the retained API/auth guides for setup boundaries.
 
 The public app bootstrap is `GET /app-config` returning appStrings/appSettings/locale/features. Local frontend defaults remain the fallback. Admin saves reuse one existing AppSetting writer; provider credentials stay in the backend environment. No generated string catalog, new config table or schema migration is required. See the frontend guide for the four-step request/context/hook flow.
 
@@ -120,3 +142,6 @@ Backend test config files include vitest.admin-auth.config.ts, vitest.audio-flow
 ## Documentation maintenance
 
 AGENTS.md owns contributor/AI-agent rules. This README owns local setup and command discovery; docs/api-overview.md, admin-auth.md, audio-flow.md and storage.md own necessary developer contracts. Detailed owner-only operations, cross-app architecture, planning and verification history live in a separate private documentation repository. Code maintenance must remain possible without private access; do not reproduce private runbooks here.
+
+
+Razorpay checkout enablement is managed only by Super Admin → Pricing & Credits → Payment checkout. Credentials remain backend environment values. A disabled checkout does not disable existing payment verification/reconciliation or signed webhook processing. See [payments contract](docs/api-overview.md#runtime-admin-controls). Existing installations should save and verify their current effective flag before manually removing legacy `RAZORPAY_ENABLED`; agents must not edit real environment files.
