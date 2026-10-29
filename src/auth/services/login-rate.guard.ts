@@ -1,22 +1,34 @@
-import { CanActivate, ExecutionContext, HttpException, HttpStatus, Injectable } from '@nestjs/common';
-import { ConfigService } from '@nestjs/config';
+import {
+	CanActivate,
+	ExecutionContext,
+	HttpException,
+	HttpStatus,
+	Injectable,
+	ServiceUnavailableException
+} from '@nestjs/common';
+import { AppSettingsService } from '../../settings/app-settings.service.js';
 import { createHash } from 'node:crypto';
 import { PrismaService } from '../../prisma/prisma.service.js';
 @Injectable()
 export class LoginRateGuard implements CanActivate {
 	constructor(
 		private readonly prisma: PrismaService,
-		private readonly config: ConfigService
+		private readonly settings: AppSettingsService
 	) {}
-	private limit(key: string, fallback: number) {
-		const value = Number(this.config.get(key));
-		return Number.isSafeInteger(value) && value > 0 ? value : fallback;
-	}
 	async canActivate(context: ExecutionContext): Promise<boolean> {
 		const http = context.switchToHttp();
 		const request = http.getRequest();
 		const admin = request.route?.path?.includes('/admin/') ?? false;
 		const realm = admin ? 'admin' : 'user';
+		const { values } = await this.settings.section('security');
+		const ipLimit = values[admin ? 'adminLoginIpLimit' : 'loginIpLimit'];
+		const accountLimit = values[admin ? 'adminLoginAccountLimit' : 'loginAccountLimit'];
+		if (
+			[ipLimit, accountLimit].some(
+				value => typeof value !== 'number' || !Number.isSafeInteger(value) || value < 1 || value > 1000000
+			)
+		)
+			throw new ServiceUnavailableException('Login security settings are invalid');
 		const windowMs = 15 * 60_000;
 		const now = Date.now();
 		const start = Math.floor(now / windowMs) * windowMs;
@@ -28,11 +40,11 @@ export class LoginRateGuard implements CanActivate {
 		const rules = [
 			{
 				key: `${realm}:ip:${hash(request.ip ?? 'unknown')}:${start}`,
-				max: this.limit(admin ? 'ADMIN_LOGIN_IP_LIMIT' : 'LOGIN_IP_LIMIT', admin ? 30 : 60)
+				max: Number(ipLimit)
 			},
 			{
 				key: `${realm}:email:${hash(email)}:${start}`,
-				max: this.limit(admin ? 'ADMIN_LOGIN_ACCOUNT_LIMIT' : 'LOGIN_ACCOUNT_LIMIT', admin ? 5 : 10)
+				max: Number(accountLimit)
 			}
 		];
 		await this.prisma.$transaction(

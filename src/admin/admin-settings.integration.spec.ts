@@ -1,14 +1,8 @@
 import { AdminAnalysisSettingsController, AnalysisSettingsDto } from './admin-analysis-settings.controller.js';
 import { AnalysisSettingsService, defaultAnalysisSettings } from '../settings/analysis-settings.service.js';
 import { AdminRuntimeSettingsController, SettingsPatchDto } from './admin-runtime-settings.controller.js';
-import {
-	AdminProviderKeysController,
-	AddProviderKeyDto,
-	ChangeProviderKeyDto
-} from './admin-provider-keys.controller.js';
 import { ConfigurationSnapshotService } from '../settings/configuration-snapshot.service.js';
 import { AppConfigController } from '../settings/app-config.controller.js';
-import { ProviderCredentialsService } from '../settings/provider-credentials.service.js';
 import 'reflect-metadata';
 import { beforeAll, beforeEach, afterAll, describe, expect, it, vi } from 'vitest';
 import { randomUUID } from 'node:crypto';
@@ -28,6 +22,7 @@ import { SuperAdminGuard } from '../auth/services/superadmin.guard.js';
 import { AuthOriginGuard } from '../auth/services/auth-origin.guard.js';
 import { AiService } from '../ai/ai.service.js';
 import { AiUsageService } from '../ai/usage/ai-usage.service.js';
+import { AiCapacityError } from '../ai/usage/ai-capacity.error.js';
 const url = process.env.AUDIO_FLOW_TEST_DATABASE_URL;
 if (url && (!['127.0.0.1', 'localhost'].includes(new URL(url).hostname) || !new URL(url).pathname.endsWith('_test')))
 	throw new Error('Disposable local test DB required');
@@ -36,7 +31,6 @@ describe.skipIf(!url)('Super Admin analysis-model settings', () => {
 	const configValues: Record<string, string> = { GEMINI_MODEL: 'gemini-test-env' };
 	const config = { get: (key: string, fallback?: string) => configValues[key] ?? fallback };
 	const settings = new AppSettingsService(prisma as any, config as any);
-	const credentials = new ProviderCredentialsService(prisma as any, config as any);
 	const jwt = new JwtService({ secret: 'settings-test-access' });
 	const tokens = new TokenService(jwt, prisma as any);
 	const endpoint = '/admin/settings/analysis-model';
@@ -46,7 +40,6 @@ describe.skipIf(!url)('Super Admin analysis-model settings', () => {
 	const oldSecret = process.env.JWT_REFRESH_SECRET;
 	beforeAll(async () => {
 		process.env.JWT_REFRESH_SECRET = 'settings-test-refresh';
-		configValues.AI_KEYS_ENCRYPTION_KEY = Buffer.alloc(32, 7).toString('base64');
 		configValues.GEMINI_API_KEY = 'AIza-fixture-secret-original';
 		await prisma.$connect();
 		for (const role of ['SUPERADMIN', 'ADMIN', 'USER'] as const) {
@@ -84,19 +77,6 @@ describe.skipIf(!url)('Super Admin analysis-model settings', () => {
 			AdminRuntimeSettingsController.prototype,
 			'save'
 		);
-		Reflect.defineMetadata('design:paramtypes', [ProviderCredentialsService], AdminProviderKeysController);
-		Reflect.defineMetadata(
-			'design:paramtypes',
-			[String, AddProviderKeyDto],
-			AdminProviderKeysController.prototype,
-			'add'
-		);
-		Reflect.defineMetadata(
-			'design:paramtypes',
-			[String, String, ChangeProviderKeyDto],
-			AdminProviderKeysController.prototype,
-			'change'
-		);
 		Reflect.defineMetadata('design:paramtypes', [AppSettingsService], AppConfigController);
 
 		const module = await Test.createTestingModule({
@@ -104,7 +84,6 @@ describe.skipIf(!url)('Super Admin analysis-model settings', () => {
 				AdminAnalysisSettingsController,
 				AdminSettingsController,
 				AdminRuntimeSettingsController,
-				AdminProviderKeysController,
 				AppConfigController
 			],
 			providers: [
@@ -112,9 +91,8 @@ describe.skipIf(!url)('Super Admin analysis-model settings', () => {
 				{ provide: AppSettingsService, useValue: settings },
 				{
 					provide: ConfigurationSnapshotService,
-					useValue: new ConfigurationSnapshotService(prisma as any, config as any, settings, credentials)
+					useValue: new ConfigurationSnapshotService(prisma as any, config as any, settings)
 				},
-				{ provide: ProviderCredentialsService, useValue: credentials },
 				{ provide: PrismaService, useValue: prisma },
 				{ provide: TokenService, useValue: tokens },
 				{ provide: AdminAuthGuard, useValue: new AdminAuthGuard(tokens) },
@@ -127,15 +105,12 @@ describe.skipIf(!url)('Super Admin analysis-model settings', () => {
 		await app.init();
 	});
 	beforeEach(async () => {
-		await prisma.providerCredential.deleteMany();
 		await prisma.configuration.deleteMany();
 		configValues.GEMINI_MODEL = 'gemini-test-env';
 		configValues.GEMINI_API_KEY = 'AIza-fixture-secret-original';
-		configValues.AI_KEYS_ENCRYPTION_KEY = Buffer.alloc(32, 7).toString('base64');
 	});
 	afterAll(async () => {
 		await app?.close();
-		await prisma.providerCredential.deleteMany();
 		await prisma.configuration.deleteMany();
 		await prisma.user.deleteMany({ where: { id: { in: users } } });
 		await prisma.$disconnect();
@@ -231,6 +206,24 @@ describe.skipIf(!url)('Super Admin analysis-model settings', () => {
 		delete configValues.GEMINI_MODEL;
 		expect(await settings.analysisModel()).toEqual({ model: 'gemini-3.5-flash', source: 'default' });
 	});
+	it('preserves scanner environment fallback, saves across instances and resets', async () => {
+		configValues.AUDIO_RETRY_SCAN_INTERVAL_MS = '45000';
+		try {
+			expect((await settings.section('processing')).values.retryScanIntervalMs).toBe(45000);
+			await request(app.getHttpServer())
+				.patch('/admin/config/processing')
+				.set(auth(superToken))
+				.send({ values: { retryScanIntervalMs: 15000 } })
+				.expect(200);
+			const withoutEnvironment = new AppSettingsService(prisma as any, { get: () => undefined } as any);
+			expect((await withoutEnvironment.section('processing')).values.retryScanIntervalMs).toBe(15000);
+			await settings.updateSection('processing', { retryScanIntervalMs: null });
+			expect((await settings.section('processing')).values.retryScanIntervalMs).toBe(45000);
+			expect((await withoutEnvironment.section('processing')).values.retryScanIntervalMs).toBe(30000);
+		} finally {
+			delete configValues.AUDIO_RETRY_SCAN_INTERVAL_MS;
+		}
+	});
 	it('persists changes across service instances and resets to env', async () => {
 		const result = await request(app.getHttpServer())
 			.patch(endpoint)
@@ -298,7 +291,7 @@ describe.skipIf(!url)('Super Admin analysis-model settings', () => {
 			settings,
 			configService: config,
 			aiPromptService: { getPrompt: async () => 'fixture' },
-			usage: new AiUsageService(prisma as any, config as any),
+			usage: new AiUsageService(prisma as any, config as any, settings),
 			geminiClient: async () => ({ models: { generateContent } })
 		});
 		await ai.analyzeStory('Hi', users[0]);
@@ -307,28 +300,184 @@ describe.skipIf(!url)('Super Admin analysis-model settings', () => {
 		await ai.analyzeStory('Hi', users[0]);
 		expect(generateContent.mock.calls[1][0].model).toBe('gemini-test-saved');
 	});
-	it('enforces permissions and origin checks on configuration and credentials', async () => {
-		for (const endpoint of ['/admin/config/web-settings', '/admin/provider-keys/gemini']) {
-			await request(app.getHttpServer()).get(endpoint).expect(401);
-			await request(app.getHttpServer()).get(endpoint).set(auth(memberToken)).expect(401);
-			await request(app.getHttpServer()).get(endpoint).set(auth(adminToken)).expect(403);
-		}
+	it('enforces permissions on configuration and removes provider key-management routes', async () => {
+		await request(app.getHttpServer()).get('/admin/config/web-settings').expect(401);
+		await request(app.getHttpServer()).get('/admin/config/web-settings').set(auth(memberToken)).expect(401);
+		await request(app.getHttpServer()).get('/admin/config/web-settings').set(auth(adminToken)).expect(403);
 		await request(app.getHttpServer())
 			.patch('/admin/config/features')
 			.set(auth(adminToken))
 			.send({ values: { audioEnabled: false } })
 			.expect(403);
+		for (const [method, path] of [
+			['get', 'gemini'],
+			['post', 'gemini'],
+			['post', 'gemini/import-environment'],
+			['post', 'gemini/use-environment'],
+			['patch', 'gemini/old-record'],
+			['delete', 'gemini/old-record']
+		] as const)
+			await request(app.getHttpServer())
+				[method]('/admin/provider-keys/' + path)
+				.set(auth(superToken))
+				.send({})
+				.expect(404);
+	});
+	it('restricts storage controls to Super Admin and persists a boolean without public exposure', async () => {
+		const route = '/admin/config/storage';
+		for (const method of ['get', 'patch'] as const) {
+			await request(app.getHttpServer())
+				[method](route)
+				.send(method === 'patch' ? { values: { cleanupEnabled: false } } : undefined)
+				.expect(401);
+			await request(app.getHttpServer())
+				[method](route)
+				.set(auth(memberToken))
+				.send(method === 'patch' ? { values: { cleanupEnabled: false } } : undefined)
+				.expect(401);
+			await request(app.getHttpServer())
+				[method](route)
+				.set(auth(adminToken))
+				.send(method === 'patch' ? { values: { cleanupEnabled: false } } : undefined)
+				.expect(403);
+		}
+		configValues.STORAGE_CLEANUP_ENABLED = 'false';
+		try {
+			expect((await settings.section('storage')).values.cleanupEnabled).toBe(false);
+			await request(app.getHttpServer())
+				.patch(route)
+				.set(auth(superToken))
+				.set('Origin', 'https://untrusted.invalid')
+				.send({ values: { cleanupEnabled: true } })
+				.expect(403);
+			for (const value of ['false', 0, 1])
+				await request(app.getHttpServer())
+					.patch(route)
+					.set(auth(superToken))
+					.send({ values: { cleanupEnabled: value } })
+					.expect(400);
+			await request(app.getHttpServer())
+				.patch(route)
+				.set(auth(superToken))
+				.send({ values: { cleanupEnabled: true } })
+				.expect(200);
+			const fresh = new AppSettingsService(prisma as any, { get: () => undefined } as any);
+			expect((await fresh.section('storage')).values.cleanupEnabled).toBe(true);
+			await request(app.getHttpServer())
+				.patch(route)
+				.set(auth(superToken))
+				.send({ values: { cleanupEnabled: false } })
+				.expect(200);
+			expect((await fresh.section('storage')).values.cleanupEnabled).toBe(false);
+			const read = await request(app.getHttpServer()).get(route).set(auth(superToken)).expect(200);
+			expect(read.headers['cache-control']).toBe('private, no-store');
+			const exported = await request(app.getHttpServer())
+				.get('/admin/config/debug')
+				.set(auth(superToken))
+				.expect(200);
+			expect(exported.body.effectiveConfig.backend_settings.storage.cleanupEnabled).toEqual({
+				value: false,
+				source: 'database'
+			});
+			expect(
+				JSON.stringify((await request(app.getHttpServer()).get('/app-config').expect(200)).body)
+			).not.toContain('cleanupEnabled');
+			await settings.updateSection('storage', { cleanupEnabled: null });
+			expect((await settings.section('storage')).values.cleanupEnabled).toBe(false);
+			expect((await fresh.section('storage')).values.cleanupEnabled).toBe(true);
+		} finally {
+			delete configValues.STORAGE_CLEANUP_ENABLED;
+		}
+	});
+	it('restricts login security reads/writes to current Super Admins and trusted origins', async () => {
+		const route = '/admin/config/security';
+		const payload = { values: { adminLoginAccountLimit: 6 } };
+		for (const method of ['get', 'patch'] as const) {
+			await request(app.getHttpServer())
+				[method](route)
+				.send(method === 'patch' ? payload : undefined)
+				.expect(401);
+			await request(app.getHttpServer())
+				[method](route)
+				.set(auth(memberToken))
+				.send(method === 'patch' ? payload : undefined)
+				.expect(401);
+			await request(app.getHttpServer())
+				[method](route)
+				.set(auth(adminToken))
+				.send(method === 'patch' ? payload : undefined)
+				.expect(403);
+		}
 		await request(app.getHttpServer())
-			.post('/admin/provider-keys/gemini')
-			.set(auth(adminToken))
-			.send({ name: 'No', key: 'secret-not-allowed' })
-			.expect(403);
-		await request(app.getHttpServer())
-			.post('/admin/provider-keys/gemini')
+			.patch(route)
 			.set(auth(superToken))
-			.set('Origin', 'https://bad.example')
-			.send({ name: 'No', key: 'secret-not-allowed' })
+			.set('Origin', 'https://untrusted.invalid')
+			.send(payload)
 			.expect(403);
+		await prisma.user.update({ where: { id: users[0] }, data: { role: 'ADMIN' } });
+		try {
+			await request(app.getHttpServer()).patch(route).set(auth(superToken)).send(payload).expect(403);
+		} finally {
+			await prisma.user.update({ where: { id: users[0] }, data: { role: 'SUPERADMIN' } });
+		}
+		expect(await prisma.configuration.count()).toBe(0);
+	});
+	it('stores login limits as plain numbers, preserves fallbacks and excludes them from public config', async () => {
+		configValues.ADMIN_LOGIN_ACCOUNT_LIMIT = '7';
+		try {
+			expect((await settings.section('security')).values.adminLoginAccountLimit).toBe(7);
+			const values = {
+				adminLoginAccountLimit: 5,
+				adminLoginIpLimit: 30,
+				loginAccountLimit: 10,
+				loginIpLimit: 60
+			};
+			await request(app.getHttpServer())
+				.patch('/admin/config/security')
+				.set(auth(superToken))
+				.send({ values })
+				.expect(200);
+			const root = (await prisma.configuration.findUniqueOrThrow({ where: { key: 'backend_settings' } }))
+				.value as any;
+			expect(root.security).toEqual(values);
+			const withoutEnv = new AppSettingsService(prisma as any, { get: () => undefined } as any);
+			expect((await withoutEnv.section('security')).values).toEqual(values);
+			const read = await request(app.getHttpServer())
+				.get('/admin/config/security')
+				.set(auth(superToken))
+				.expect(200);
+			expect(read.headers['cache-control']).toBe('private, no-store');
+			const debug = await request(app.getHttpServer())
+				.get('/admin/config/debug')
+				.set(auth(superToken))
+				.expect(200);
+			expect(debug.body.effectiveConfig.backend_settings.security.adminLoginAccountLimit).toEqual({
+				value: 5,
+				source: 'database'
+			});
+			const publicConfig = await request(app.getHttpServer()).get('/app-config').expect(200);
+			expect(JSON.stringify(publicConfig.body)).not.toContain('adminLoginAccountLimit');
+			await settings.updateSection('security', { adminLoginAccountLimit: null });
+			expect((await settings.section('security')).values.adminLoginAccountLimit).toBe(7);
+			expect((await withoutEnv.section('security')).values.adminLoginAccountLimit).toBe(5);
+		} finally {
+			delete configValues.ADMIN_LOGIN_ACCOUNT_LIMIT;
+		}
+	});
+	it('rejects invalid login limits without saving', async () => {
+		for (const field of ['adminLoginAccountLimit', 'adminLoginIpLimit', 'loginAccountLimit', 'loginIpLimit'])
+			for (const value of [0, -1, 1.5, 1000001, '5', true])
+				await request(app.getHttpServer())
+					.patch('/admin/config/security')
+					.set(auth(superToken))
+					.send({ values: { [field]: value } })
+					.expect(400);
+		await request(app.getHttpServer())
+			.patch('/admin/config/security')
+			.set(auth(superToken))
+			.send({ values: { unsupported: 5 } })
+			.expect(400);
+		expect(await prisma.configuration.count()).toBe(0);
 	});
 	it('serves a minimal anonymous startup configuration without private settings or credentials', async () => {
 		await settings.updateSection('models', { outlineModel: 'gpt-private-test' });
@@ -375,6 +524,15 @@ describe.skipIf(!url)('Super Admin analysis-model settings', () => {
 			['pricing', { analysisCredits: -1 }],
 			['processing', { maxRecoveryAttempts: 99 }],
 			['processing', { recoveryRetryDelayMs: 1 }],
+			['processing', { retryScanIntervalMs: 999 }],
+			['processing', { retryScanIntervalMs: 1000001 }],
+			['processing', { retryScanIntervalMs: 1.5 }],
+			['processing', { globalRequestsPerMinute: 0 }],
+			['processing', { globalRequestsPerMinute: 1.5 }],
+			['processing', { globalRequestsPerMinute: 1000001 }],
+			['processing', { userRequestsPerDay: 0 }],
+			['processing', { globalCharactersPerDay: 1000000001 }],
+			['processing', { userCharactersPerDay: '500' }],
 			['web-settings', { defaultLanguage: 'xx' }],
 			['web-strings', { arbitraryKey: 5 }]
 		])
@@ -391,6 +549,102 @@ describe.skipIf(!url)('Super Admin analysis-model settings', () => {
 		await request(app.getHttpServer()).get('/app-config?locale=xx').expect(400);
 	});
 
+	it('persists the global minute cap in admin and enforces live changes across service instances', async () => {
+		await prisma.aiUsageBucket.deleteMany();
+		await prisma.aiRequestLease.deleteMany();
+		const previous = configValues.AI_GLOBAL_REQUESTS_PER_MINUTE;
+		configValues.AI_GLOBAL_REQUESTS_PER_MINUTE = '7';
+		try {
+			expect((await settings.section('processing')).values.globalRequestsPerMinute).toBe(7);
+			await request(app.getHttpServer())
+				.patch('/admin/config/processing')
+				.set(auth(superToken))
+				.send({ values: { globalRequestsPerMinute: 1 } })
+				.expect(200);
+			const usage = new AiUsageService(prisma as any, config as any, settings);
+			const withoutEnvironment = {
+				get: (key: string) => (key === 'AI_GLOBAL_REQUESTS_PER_MINUTE' ? undefined : config.get(key))
+			};
+			const otherSettings = new AppSettingsService(prisma as any, withoutEnvironment as any);
+			const other = new AiUsageService(prisma as any, withoutEnvironment as any, otherSettings);
+			expect((await otherSettings.section('processing')).values.globalRequestsPerMinute).toBe(1);
+			const provider = vi.fn(async () => true);
+			await usage.execute(users[0], 'tts', 1, provider);
+			await expect(other.execute(users[0], 'tts', 1, provider)).rejects.toBeInstanceOf(AiCapacityError);
+			expect(provider).toHaveBeenCalledTimes(1);
+			await request(app.getHttpServer())
+				.patch('/admin/config/processing')
+				.set(auth(superToken))
+				.send({ values: { globalRequestsPerMinute: 2 } })
+				.expect(200);
+			await other.execute(users[0], 'tts', 1, provider);
+			await expect(usage.execute(users[0], 'tts', 1, provider)).rejects.toBeInstanceOf(AiCapacityError);
+			await other.execute(users[0], 'analysis', 1, provider);
+			expect(provider).toHaveBeenCalledTimes(3);
+			expect(await prisma.aiRequestLease.count()).toBe(0);
+		} finally {
+			if (previous === undefined) delete configValues.AI_GLOBAL_REQUESTS_PER_MINUTE;
+			else configValues.AI_GLOBAL_REQUESTS_PER_MINUTE = previous;
+			await prisma.aiUsageBucket.deleteMany();
+			await prisma.aiRequestLease.deleteMany();
+		}
+	});
+
+	it('enforces saved global and per-user character budgets without leaking leases', async () => {
+		await prisma.aiUsageBucket.deleteMany();
+		await prisma.aiRequestLease.deleteMany();
+		try {
+			await settings.updateSection('processing', {
+				globalRequestsPerMinute: 50,
+				globalRequestsPerDay: 50,
+				userRequestsPerMinute: 50,
+				userRequestsPerDay: 50,
+				globalCharactersPerDay: 10,
+				userCharactersPerDay: 6
+			});
+			const usage = new AiUsageService(prisma as any, config as any, settings);
+			const provider = vi.fn(async () => true);
+			await usage.execute(users[0], 'tts', 6, provider);
+			await expect(usage.execute(users[0], 'tts', 1, provider)).rejects.toBeInstanceOf(AiCapacityError);
+			await usage.execute(users[1], 'tts', 4, provider);
+			await expect(usage.execute(users[2], 'tts', 1, provider)).rejects.toBeInstanceOf(AiCapacityError);
+			expect(provider).toHaveBeenCalledTimes(2);
+			expect(await prisma.aiRequestLease.count()).toBe(0);
+		} finally {
+			await prisma.aiUsageBucket.deleteMany();
+			await prisma.aiRequestLease.deleteMany();
+		}
+	});
+
+	it.each(['globalRequestsPerDay', 'userRequestsPerMinute', 'userRequestsPerDay'])(
+		'enforces the saved %s budget',
+		async field => {
+			await prisma.aiUsageBucket.deleteMany();
+			await prisma.aiRequestLease.deleteMany();
+			try {
+				await settings.updateSection('processing', {
+					globalRequestsPerMinute: 50,
+					globalRequestsPerDay: 50,
+					userRequestsPerMinute: 50,
+					userRequestsPerDay: 50,
+					globalCharactersPerDay: 100,
+					userCharactersPerDay: 100,
+					[field]: 1
+				});
+				const usage = new AiUsageService(prisma as any, config as any, settings);
+				const provider = vi.fn(async () => true);
+				await usage.execute(users[0], 'tts', 1, provider);
+				await expect(
+					usage.execute(field === 'globalRequestsPerDay' ? users[1] : users[0], 'tts', 1, provider)
+				).rejects.toBeInstanceOf(AiCapacityError);
+				expect(provider).toHaveBeenCalledTimes(1);
+			} finally {
+				await prisma.aiUsageBucket.deleteMany();
+				await prisma.aiRequestLease.deleteMany();
+			}
+		}
+	);
+
 	it('preserves sibling backend groups and both language documents during concurrent writes', async () => {
 		await Promise.all([
 			settings.updateSection('features', { audioEnabled: false }),
@@ -404,20 +658,9 @@ describe.skipIf(!url)('Super Admin analysis-model settings', () => {
 		expect((await settings.section('web-strings', 'hi')).values.title).toBe('हिन्दी');
 		expect(await prisma.configuration.count()).toBe(2);
 	});
-	it('keeps model and credential mode together without losing either on reset', async () => {
-		await settings.setAnalysisModel('gemini-fixture-model');
-		await credentials.add('gemini', 'fixture', 'fixture-api-key-only');
-		expect((await settings.analysisModel()).model).toBe('gemini-fixture-model');
-		await settings.setAnalysisModel(null);
-		expect((await credentials.list('gemini')).managed).toBe(true);
-		await settings.setAnalysisModel('gemini-fixture-model-2');
-		await credentials.useEnvironment('gemini');
-		expect((await settings.analysisModel()).model).toBe('gemini-fixture-model-2');
-	});
 	it('exports grouped overrides and debug sources only to Super Admin without credentials', async () => {
 		await settings.replaceWebDocument('web-settings', { showStats: false, nested: { apiKey: 'do-not-export' } });
 		await settings.updateSection('processing', { maxRecoveryAttempts: 4 });
-		await credentials.add('gemini', 'fixture', 'fixture-api-key-only');
 		await prisma.configuration.create({ data: { key: 'future_service_settings', value: { enabled: true } } });
 		for (const route of ['export', 'debug']) {
 			await request(app.getHttpServer())
@@ -436,7 +679,8 @@ describe.skipIf(!url)('Super Admin analysis-model settings', () => {
 		expect(exported.body.allConfig.app_settings.showStats).toBe(false);
 		expect(exported.body.allConfig.future_service_settings.enabled).toBe(true);
 		expect(exported.body.allConfig.app_settings.nested.apiKey).toBe('[REDACTED]');
-		expect(JSON.stringify(exported.body)).not.toContain('fixture-api-key-only');
+		expect(JSON.stringify(exported.body)).not.toContain('AIza-fixture-secret-original');
+		expect(exported.body.providerStatus.gemini).toEqual({ source: 'environment', configured: true });
 		expect(JSON.stringify(exported.body)).not.toContain('do-not-export');
 		const debug = await request(app.getHttpServer()).get('/admin/config/debug').set(auth(superToken)).expect(200);
 		expect(debug.body.effectiveConfig.backend_settings.processing.maxRecoveryAttempts).toEqual({
@@ -560,104 +804,6 @@ describe.skipIf(!url)('Super Admin analysis-model settings', () => {
 		});
 		expect(await prisma.user.findMany({ where: { id: { in: users } }, orderBy: { id: 'asc' } })).toEqual(before);
 	});
-	it('encrypts imported credentials, masks responses and keeps disabled keys from falling back', async () => {
-		expect((await credentials.available('gemini'))[0].key).toBe('AIza-fixture-secret-original');
-		const imported = await request(app.getHttpServer())
-			.post('/admin/provider-keys/gemini/import-environment')
-			.set(auth(superToken))
-			.send({})
-			.expect(201);
-		expect(imported.body.managed).toBe(true);
-		expect(imported.body.keys).toHaveLength(1);
-		expect(JSON.stringify(imported.body)).not.toContain('AIza-fixture-secret-original');
-		const row = await prisma.providerCredential.findFirstOrThrow();
-		expect(row.encrypted).not.toContain('AIza-fixture-secret-original');
-		configValues.GEMINI_API_KEY = 'AIza-fixture-different-env';
-		expect(await credentials.primary('gemini')).toBe('AIza-fixture-secret-original');
-		await credentials.change('gemini', row.id, false);
-		expect(await credentials.available('gemini')).toEqual([]);
-		await expect(credentials.primary('gemini')).rejects.toThrow('No enabled');
-		await credentials.useEnvironment('gemini');
-		expect(await credentials.primary('gemini')).toBe('AIza-fixture-different-env');
-	});
-	it('adds, disables, enables and removes keys without returning full secrets', async () => {
-		const added = await request(app.getHttpServer())
-			.post('/admin/provider-keys/openai')
-			.set(auth(superToken))
-			.send({ name: 'Primary', key: 'sk-fixture-secret-one' })
-			.expect(201);
-		const id = added.body.keys[0].id;
-		expect(added.body.keys[0].maskedKey).toBe('••••-one');
-		expect(JSON.stringify(added.body)).not.toContain('sk-fixture-secret-one');
-		expect(await credentials.primary('openai')).toBe('sk-fixture-secret-one');
-		await request(app.getHttpServer())
-			.patch('/admin/provider-keys/openai/' + id)
-			.set(auth(superToken))
-			.send({ enabled: false })
-			.expect(200);
-		expect(await credentials.available('openai')).toEqual([]);
-		await credentials.change('openai', id, true);
-		expect(await credentials.primary('openai')).toBe('sk-fixture-secret-one');
-		await request(app.getHttpServer())
-			.delete('/admin/provider-keys/openai/' + id)
-			.set(auth(superToken))
-			.expect(200);
-		expect(await credentials.available('openai')).toEqual([]);
-		await request(app.getHttpServer())
-			.post('/admin/provider-keys/unknown')
-			.set(auth(superToken))
-			.send({ name: 'No', key: 'test-secret' })
-			.expect(400);
-	});
-	it('replaces the single key and detects tampering/wrong master keys without leaking secrets', async () => {
-		const saved = await credentials.add('gemini', 'One', 'AIza-fixture-secret-original');
-		const replaced = await credentials.add('gemini', 'Replacement', 'AIza-fixture-secret-original');
-		expect(replaced.keys[0].id).toBe(saved.keys[0].id);
-		expect(await prisma.providerCredential.count({ where: { provider: 'gemini' } })).toBe(1);
-		configValues.AI_KEYS_ENCRYPTION_KEY = Buffer.alloc(32, 8).toString('base64');
-		await expect(credentials.available('gemini')).rejects.toThrow('could not be decrypted');
-		configValues.AI_KEYS_ENCRYPTION_KEY = Buffer.alloc(32, 7).toString('base64');
-		const row = await prisma.providerCredential.findUniqueOrThrow({ where: { id: saved.keys[0].id } });
-		await prisma.providerCredential.update({
-			where: { id: row.id },
-			data: { encrypted: row.encrypted.slice(0, -4) + 'AAAA' }
-		});
-		await expect(credentials.available('gemini')).rejects.toThrow('could not be decrypted');
-	});
-	it('ignores multi-key environment flags and never falls through to legacy extra keys', async () => {
-		configValues.GEMINI_MULTI_KEY_ENABLED = 'true';
-		configValues.GEMINI_API_KEYS = 'AIza-unused-backup-one,AIza-unused-backup-two';
-		expect(await credentials.available('gemini')).toEqual([
-			{ id: 'environment', key: 'AIza-fixture-secret-original' }
-		]);
-		const selected = await credentials.importEnvironment('gemini');
-		const id = selected.keys[0].id;
-		const legacy = await prisma.providerCredential.create({
-			data: {
-				id: randomUUID(),
-				provider: 'gemini',
-				name: 'Legacy ignored backup',
-				encrypted: 'legacy-ciphertext-preserved',
-				fingerprint: randomUUID(),
-				suffix: 'old1',
-				createdAt: new Date(Date.now() + 10000)
-			}
-		});
-		await credentials.change('gemini', id, false);
-		expect(await credentials.available('gemini')).toEqual([]);
-		await expect(credentials.primary('gemini')).rejects.toThrow('No enabled');
-		await credentials.add('gemini', 'Replacement', 'AIza-new-single-key');
-		expect((await credentials.list('gemini')).keys).toHaveLength(1);
-		expect(await credentials.primary('gemini')).toBe('AIza-new-single-key');
-		expect(await prisma.providerCredential.count({ where: { provider: 'gemini' } })).toBe(2);
-		expect((await prisma.providerCredential.findUniqueOrThrow({ where: { id: legacy.id } })).encrypted).toBe(
-			'legacy-ciphertext-preserved'
-		);
-		await credentials.remove('gemini', id);
-		expect(await credentials.available('gemini')).toEqual([]);
-		expect((await credentials.list('gemini')).keys).toEqual([]);
-	});
-
 	it('enforces feature/provider switches and allows cancellation/download routes to remain independent', async () => {
 		await settings.updateSection('features', {
 			audioEnabled: false,

@@ -4,12 +4,14 @@ import { randomUUID } from 'node:crypto';
 import { PrismaService } from '../../prisma/prisma.service.js';
 import type { Prisma } from '../../generated/prisma/client.js';
 import { AiCapacityError } from './ai-capacity.error.js';
+import { AppSettingsService } from '../../settings/app-settings.service.js';
 
 @Injectable()
 export class AiUsageService {
 	constructor(
 		private readonly prisma: PrismaService,
-		private readonly config: ConfigService
+		private readonly config: ConfigService,
+		private readonly settings: AppSettingsService
 	) {}
 
 	limit(name: string, fallback: number) {
@@ -50,6 +52,24 @@ export class AiUsageService {
 		// Analysis has no application request/day/character budgets or AI concurrency caps.
 		// Authentication and request-size validation above still apply.
 		if (kind === 'analysis') return action();
+		const { values } = await this.settings.section('processing');
+		const quotas = {
+			globalRequestsPerMinute: Number(values.globalRequestsPerMinute),
+			globalRequestsPerDay: Number(values.globalRequestsPerDay),
+			userRequestsPerMinute: Number(values.userRequestsPerMinute),
+			userRequestsPerDay: Number(values.userRequestsPerDay),
+			globalCharactersPerDay: Number(values.globalCharactersPerDay),
+			userCharactersPerDay: Number(values.userCharactersPerDay)
+		};
+		if (
+			Object.entries(quotas).some(
+				([key, value]) =>
+					!Number.isSafeInteger(value) ||
+					value < 1 ||
+					value > (key.endsWith('CharactersPerDay') ? 1000000000 : 1000000)
+			)
+		)
+			throw new BadRequestException('AI usage settings are invalid');
 		const leaseId = randomUUID();
 		await this.prisma.$transaction(
 			async tx => {
@@ -74,26 +94,26 @@ export class AiUsageService {
 						{
 							scope: 'provider:global',
 							window: 60_000,
-							maxRequests: this.limit('AI_GLOBAL_REQUESTS_PER_MINUTE', 10),
+							maxRequests: quotas.globalRequestsPerMinute,
 							maxUnits: Number.MAX_SAFE_INTEGER
 						},
 						{
 							scope: 'provider:global',
 							window: 86_400_000,
-							maxRequests: this.limit('AI_GLOBAL_REQUESTS_PER_DAY', 300),
-							maxUnits: this.limit('AI_GLOBAL_CHARACTERS_PER_DAY', 500_000)
+							maxRequests: quotas.globalRequestsPerDay,
+							maxUnits: quotas.globalCharactersPerDay
 						},
 						{
 							scope: `provider:user:${userId}`,
 							window: 60_000,
-							maxRequests: this.limit('AI_USER_REQUESTS_PER_MINUTE', 5),
+							maxRequests: quotas.userRequestsPerMinute,
 							maxUnits: Number.MAX_SAFE_INTEGER
 						},
 						{
 							scope: `provider:user:${userId}`,
 							window: 86_400_000,
-							maxRequests: this.limit('AI_USER_REQUESTS_PER_DAY', 100),
-							maxUnits: this.limit('AI_USER_CHARACTERS_PER_DAY', 100_000)
+							maxRequests: quotas.userRequestsPerDay,
+							maxUnits: quotas.userCharactersPerDay
 						}
 					],
 					units

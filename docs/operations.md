@@ -23,25 +23,43 @@ See the web repository's `docs/development.md` for the three local applications/
 | ------------------------------ | ------------------------------------------------------------------------------------------------------------------------------- |
 | DB and auth                    | DATABASE_URL, JWT_SECRET, JWT_REFRESH_SECRET; `prisma7.config.ts`, `src/auth/`.                                                 |
 | Server                         | PORT, NODE_ENV; `src/main.ts`.                                                                                                  |
-| Origins and login limits       | REQUEST_ORIGIN_PORT, ADMIN_ORIGIN, additional application origins and limit names documented in [admin-auth.md](admin-auth.md). |
+| Origins and login limits       | REQUEST_ORIGIN_PORT, ADMIN_ORIGIN, both origins are explicit in production (localhost defaults are development-only); login limits are managed in admin Login security with legacy environment fallbacks, as documented in [admin-auth.md](admin-auth.md). |
 | Email / Google                 | RESEND_API_KEY, optional RESEND_FROM_EMAIL; GOOGLE_CLIENT_ID.                                                                   |
 | AI                             | GEMINI_API_KEY and optional GEMINI_MODEL; OPENAI_API_KEY and optional OPENAI_MODEL for script outlines.                         |
 | Shared provider/admission caps | AI_* and ANALYSIS_* names/defaults in [audio-flow.md](audio-flow.md).                                                           |
-| Audio recovery                 | AUDIO_MAX_RECOVERY_ATTEMPTS, AUDIO_RECOVERY_RETRY_DELAY_MS, AUDIO_RETRY_SCAN_INTERVAL_MS.                                       |
-| Storage                        | STORAGE_PROVIDER; Supabase URL/service-role key/bucket when selected. See [storage.md](storage.md).                             |
+| Audio recovery                 | Admin Audio Configuration stores attempts/delay in `backend_settings.processing`; legacy environment fallbacks remain supported. `retryScanIntervalMs` is also editable there (1,000–1,000,000 ms, default 30,000); legacy `AUDIO_RETRY_SCAN_INTERVAL_MS` is a fallback. |
+| Storage                        | STORAGE_PROVIDER selects local/Supabase/R2; configure the selected provider and retain historical-reader credentials. See [storage.md](storage.md).                             |
 | Diagnostics                    | AI_DIAGNOSTICS_USER_IDS; no implicit role bypass.                                                                               |
 
 The environment example is not a complete runnable configuration. Never commit a real `.env`, provider key, signing secret, refresh cookie or connection credential. NEXT_PUBLIC frontend variables must not contain backend secrets. Current application startup constructs AI/email clients even if a particular request does not use them.
 
+Password recovery requires migration `20261028100000_password_reset`, Prisma regeneration and existing `RESEND_API_KEY`/`RESEND_FROM_EMAIL` sender configuration. Set `REQUEST_ORIGIN_PORT` to the actual web origin so emailed links open the correct app. No API keys belong in the frontend. See [password recovery](admin-auth.md#password-recovery) for single-use tokens, limits, generic delivery-failure responses and the isolated test command. Production migration deployment and live inbox delivery require deployment-environment verification; local tests do not verify inbox delivery.
+
 ## Operating boundaries
+
+Storage root convention: local new writes go under `autocanvas-assets/`; Supabase sandbox and R2 production use bucket `autocanvas-assets`. The local adapter uses only that assets root. Raw filesystem paths and old root/export compatibility have been removed for the planned data reset; no data reset or deletion was performed by this code change. Before changing a Supabase bucket setting, copy/verify all referenced objects at the same logical keys and retain the old bucket; changing environment configuration alone does not migrate files. For the current sandbox, private bucket `autocanvas-assets` was created and six database-referenced objects were server-side copied from `autocanvas-audio`; all six were byte/hash verified. Old files/bucket and database references were preserved. The local `.env` remains unchanged: manually set `SUPABASE_STORAGE_BUCKET=autocanvas-assets` and restart the backend to use the verified copies. See [storage setup](storage.md#environment-setup). The application does not rewrite `.env`.
+
+Storage cleanup rollout: drain/stop old workers, apply `20261028170000_storage_cleanup` and `20261028173000_storage_cleanup_fence` using the existing migrate-deploy command and regenerate Prisma before deploying this code. New upload receipts support hourly collection after a 24-hour grace period, with database-reference/job checks and row-lock fencing. The additive migration was applied locally; existing scene/asset references were identical afterward and no storage files were touched. Existing/manual objects are not backfilled or deleted. Super Admin → Storage controls cleanup enablement through private saved configuration. The worker checks every 30 seconds and before each file; an in-flight deletion may finish. Legacy environment values are fallbacks until saved, then code default true. The local enabled value (true) was saved under `backend_settings.storage.cleanupEnabled` and verified through a fresh settings service with `STORAGE_CLEANUP_ENABLED` omitted. The local `.env` was unchanged; that entry can now be removed manually. On other installations, preserve their effective value before removing the override. No schema migration is required for this setting move. Keep old provider namespaces available for tracked cleanup. See [storage cleanup](storage.md#automatic-cleanup-of-tracked-uploads) for retention, race handling and scope limitations.
+
+Password-login account/IP caps are managed by Super Admins in **Login security** (`/security-settings`) and stored as ordinary JSON numbers under `backend_settings.security`. Effective precedence is database, legacy environment, code default. The local migration preserved admin account/IP limits 5/30 and user account/IP limits 10/60. A fresh settings service returned identical values with all four environment overrides omitted; `.env` was not edited. These four local entries may now be removed manually. Preserve all four effective values before manually removing the matching `ADMIN_LOGIN_*_LIMIT` / `LOGIN_*_LIMIT` entries from another installation. Reset restores environment/default values; changes do not clear login counters. JWT secrets and API credentials remain server-only and are unaffected. See [login limits](admin-auth.md#password-login-rate-limits) for bounds and access checks. No schema migration is needed.
+
+Audio retry scanning now reads `backend_settings.processing.retryScanIntervalMs` at startup and after each periodic scan. Changes apply after the next scan without restarting. Scans do not overlap; temporary configuration-read failures retain the last known interval. Startup recovery, waiting-job selection and actual retry eligibility are unchanged. The local effective value of 30,000 ms was saved and verified through a fresh settings service with `AUDIO_RETRY_SCAN_INTERVAL_MS` omitted; the `.env` file was left unchanged, so this local entry can now be removed manually. On other installations, first persist their effective interval and verify without that override. No schema migration is required.
+
+The six shared admission limits are editable in admin **Audio Configuration** and persisted in `backend_settings.processing`. The local migration preserved the effective limits: global requests 20/minute and 100/day, user requests 10/minute and 100/day, global characters 2,000,000/day and user characters 500,000/day. A fresh settings-service instance returned identical values with all six legacy environment overrides omitted. The `.env` file was not edited. The user may now manually remove `AI_GLOBAL_REQUESTS_PER_MINUTE`, `AI_GLOBAL_REQUESTS_PER_DAY`, `AI_USER_REQUESTS_PER_MINUTE`, `AI_USER_REQUESTS_PER_DAY`, `AI_GLOBAL_CHARACTERS_PER_DAY` and `AI_USER_CHARACTERS_PER_DAY` from this local installation. For other environments, save their own effective values first. Resetting these fields restores environment fallbacks when present, otherwise code defaults; it does not restore the migrated local values. Limits apply on subsequent admissions without resetting usage counters; analysis remains excluded. Backend guards still restrict configuration to Super Admins. No schema migration is needed.
+
+Keep deployment/security/credential configuration on the server: database, JWT secrets, provider keys, email/Google configuration, origins and storage configuration. Login throttles are private admin configuration, not encrypted secrets. Keep Supabase read credentials while historical assets reference that storage even when new writes use local storage. Public frontend API URL and Google client ID remain required where used; they are not server secrets.
+
+The next local move preserves the outline model as `openai_settings.outlineModel=gpt-4.1`, editable in admin **Script Configuration** (`/script-settings`). A fresh settings-service instance returned the same value with `OPENAI_MODEL` omitted from its configuration, so the local user can remove that environment entry manually. The `.env` file was left unchanged for this move. Keep `OPENAI_API_KEY` (credential) separate from `OPENAI_MODEL` (model identifier). The following Gemini move removes the diagnostics endpoint's direct environment lookup: it now uses the enabled Gemini primary from admin Providers & Models. If Gemini has no configured primary, diagnostics fails explicitly rather than silently selecting a different model. Its existing allowlist, provider-enable check and usage limits remain enforced. Saved analysis routing and the legacy saved model were verified unchanged with `GEMINI_MODEL` omitted from a fresh settings-service instance, so the local user may now remove that entry manually. The environment file was not edited. Legacy environment fallback in AppSettingsService remains supported for installations without saved configuration. No generation or analysis-provider routing was changed; only the diagnostic model now follows admin selection.
+
+For the first local environment-to-admin move, the effective recovery settings were persisted as `backend_settings.processing.maxRecoveryAttempts=3` and `recoveryRetryDelayMs=60000`. Only `AUDIO_MAX_RECOVERY_ATTEMPTS` and `AUDIO_RECOVERY_RETRY_DELAY_MS` were removed from the local backend `.env`, after confirming a fresh settings-service instance returned identical values without those overrides. Manage them in admin **Audio Configuration** (`/audio-settings`). The existing Super Admin/origin guards and numeric validation remain in force; no API, UI, credential, scanner interval or generation behavior changed. Legacy environment fallbacks remain for other installations; Reset to default falls back to code defaults when those variables are absent. When repeating the move elsewhere, preserve that installation's effective values before removing its overrides.
 
 - At least one healthy Nest process must remain available for the in-process scanners/workers. Analysis/audio job state is persisted in PostgreSQL; there is no requirement to install a Redis/BullMQ stack for the implemented pipeline.
 - Do not manually toggle active job/item states to force progress. Inspect retry time, worker lease/heartbeat, safe errors and provider/application quotas first.
 - Shared provider limits are conservative request/character caps, not exact billing/credit accounting. The credit badge is backed by the real wallet; subscription plan labels remain demo data.
-- Supabase and local data must be backed up with database references. Retain existing storage providers/buckets when switching new-write destinations.
+- R2, Supabase and local data must be backed up with database references. Retain existing storage providers/buckets when switching new-write destinations.
 - If deployed behind a reverse proxy, review Express trust proxy for known proxy addresses. Current main.ts does not provide a magic TRUST_PROXY environment handler; do not assume X-Forwarded-For is trusted or trust arbitrary forwarded headers. The IP login limiter otherwise sees the network peer.
 - NODE_ENV=production selects Secure cookies. Configure real HTTPS user/admin origins; do not rely on development defaults for a deployed admin app.
-- Restrict the existing local `/uploads/` static route if recordings need privacy; its behavior differs from authorized API streaming. Review how Swagger is exposed at the deployment edge.
+- Restrict the existing local `/autocanvas-assets/` static route if recordings need privacy; its behavior differs from authorized API streaming. Review how Swagger is exposed at the deployment edge.
 
 ## Auth and superadmin rollout
 
@@ -85,28 +103,24 @@ After a relevant change, verify only the affected flows and their boundaries. Us
 
 Log safe resource IDs, status/error codes and timestamps. Redact tokens/credentials and avoid logging full scripts/provider responses or user password records. Historical handoffs are reference material; code and these current docs are the implementation contract.
 
-## Dashboard runtime controls and encrypted provider keys
+## Dashboard runtime controls and environment-only provider keys
 
-Apply migration `20261025011500_provider_credentials` and regenerate Prisma before deploying these controls. Keep the existing analysis-model AppSetting migration as well. Local development verification uses the configured development database; tests use a separate disposable `_test` database.
+Gemini and OpenAI credentials are managed only through backend `GEMINI_API_KEY` and `OPENAI_API_KEY`. The admin key page, credential mutations and dashboard-source selection have been removed. Never put provider keys in public app settings, app strings or NEXT_PUBLIC variables. Update deployment environment values and restart the API when changing keys; already-sent requests keep their captured key. Missing provider keys produce a terminal configuration error, without key rotation or database fallback.
+
+Before upgrading an existing installation, configure both required environment keys and deploy the new migration, then regenerate Prisma:
 
 ```sh
 npx prisma migrate deploy --config prisma7.config.ts
 npx prisma generate --config prisma7.config.ts
 ```
 
-`AI_KEYS_ENCRYPTION_KEY` is a server-only, base64-encoded 32-byte key. Generate it securely, store it in the backend environment/hosting secret store, and back it up separately from the database. Never commit it or put it in NEXT_PUBLIC variables. Provider credentials use AES-256-GCM with a random IV and provider/record identity as authenticated context. API responses contain only masked suffixes. A missing master key disables add/import; unreadable encrypted keys fail safely. Changing the master key without re-encrypting existing records makes those records unreadable; master-key rotation/re-encryption is not implemented.
+Migration `20261028143000_env_only_provider_keys` intentionally drops the old saved-credential table and removes only the credential-source field from Gemini/OpenAI configuration groups. Models, provider-enabled flags, routing, credits and audio settings are preserved. The local migration deleted three saved credential rows; a configuration comparison confirmed all non-credential values were preserved. Both provider environment keys were present, and `.env` was unchanged. Historical migrations remain immutable. The former provider-key encryption master variable is no longer read and may be removed manually after this migration; the application never rewrites `.env`.
 
-Before first save/import, each provider uses its single environment key (GEMINI_API_KEY or OPENAI_API_KEY). Save/import explicitly replaces the selected dashboard key after UI confirmation; the record identity stays stable. There is no automatic key rotation or fallback on errors. Disabled, removed or unreadable selected keys fail clearly. Environment mode is restored only by the explicit admin action. Existing legacy extra credential rows are preserved, ignored by selection and hidden from the single-key UI. Remove clears the selected encrypted value and leaves a disabled primary row, so old extras never become an automatic fallback. No schema migration or bulk deletion runs. Already-sent requests may finish using their captured key.
-
-GEMINI_API_KEYS, GEMINI_MULTI_KEY_ENABLED and GEMINI_RPM_LIMIT/GEMINI_RPD_LIMIT are no longer read; remove these obsolete entries from deployment configuration when convenient. Runtime processing controls now cover recovery attempts and retry delay only. Shared AI usage protections remain.
-
-Non-secret runtime configuration stays in Configuration, separate from ProviderCredential. Backend .env retains infrastructure/auth/mail/storage secrets, server origins, the encryption master key, scanner timing and fallback values. Dashboard changes do not rewrite .env. Login protection is unchanged. Configuration/key change history is not added to the existing role-audit UI in this change.
-
-Feature switches block new analysis/audio/outline submissions. Maintenance blocks new AI work without blocking admin login, existing reads/downloads or cancellation. Provider switches also prevent subsequent provider requests; they do not abort a request already sent. Multi-scene recovery attempts/delay are read for new processing/recovery work; scanner interval remains deployment configuration. Script outlines reuse OpenAIProvider and resolve saved outline model and the current enabled key on each request.
+Non-secret runtime configuration remains in Configuration. Feature switches, analysis/outline models, audio recovery/scanning, request/character budgets and login limits retain their existing guarded admin controls. Provider disable blocks subsequent calls without recalling an already-sent request. Script outlines reuse OpenAIProvider and the configured outline model. Shared usage protections and login security remain enforced. No live provider probe is performed by key cleanup.
 
 App Strings accepts arbitrary text keys; generated catalogs/export scripts are no longer needed. App Settings accepts arbitrary public JSON configuration. PUT /admin/config/web-strings and /admin/config/web-settings replace the whole override document (body: {values, locale}); PATCH remains partial and null removes a field. Omitted keys fall back locally, nested objects merge and arrays replace in the web resolver. Important controls edit the same JSON keys. Both documents are public; never store credentials there. Text HTML/placeholders stay data. Root must be an object; text values must be strings. Known home setting types/language, 64 KB document size, nesting depth and unsafe object keys are validated. Private backend sections retain strict allowlists and cannot use PUT. Hardcoded copy in other untouched pages is not automatically migrated. Credit pricing is enforced by wallet reservations and settlement; Razorpay activation requires the backend credentials below.
 
-Public configuration flow: `GET /app-config` -> frontend AppConfigProvider -> existing text/settings hooks. Response fields are appStrings/appSettings/locale/features; the old /public/config route is removed. Deploy web and API together. Each browser load fetches once; published changes require reload. There is no focus timer, polling or frontend secret. The Configuration migration below preserves existing configuration data. Both save APIs reuse one transaction writer; PATCH merges fields while PUT replaces only the web override document. Legacy AppSetting keys are consolidated by the Configuration migration; encrypted ProviderCredential rows are unchanged. ProviderCredential remains separate because public JSON must never contain provider keys.
+Public configuration flow: `GET /app-config` -> frontend AppConfigProvider -> existing text/settings hooks. Response fields are appStrings/appSettings/locale/features; the old /public/config route is removed. Deploy web and API together. Each browser load fetches once; published changes require reload. There is no focus timer, polling or frontend secret. The Configuration migration below preserves existing configuration data. Both save APIs reuse one transaction writer; PATCH merges fields while PUT replaces only the web override document. Legacy AppSetting keys are consolidated by the Configuration migration. Public JSON must never contain provider keys; provider secrets are read only from backend environment configuration.
 
 ## Credits and Razorpay INR
 
@@ -155,7 +169,7 @@ The web UI was connected to this real isolated API for wallet/refund-history che
 
 Migration `20261026060000_configuration_groups` renames `AppSetting` to
 `Configuration`, converts text to native JSONB and folds rows into groups. It
-preserves saved values/timestamps and never decrypts or moves ProviderCredential.
+preserves saved values/timestamps. The later environment-only credential migration removes the former saved-credential table.
 Stop old API processes before migration, back up configuration/database, run the
 existing migrate-deploy and generate commands above, then start the new API.
 Do not run an old API binary against the renamed table. On another development
@@ -166,8 +180,8 @@ machine, pull migration/code and run these commands before starting the backend.
 | `app_strings`      | Locale objects (`en`, `hi`), shared naming for future web/mobile/desktop consumers |
 | `app_settings`     | Public app configuration overrides                                                 |
 | `backend_settings` | `features` and `processing` objects                                                |
-| `gemini_settings`  | legacy `analysisModel`, provider `enabled`, `credentialMode`                              |
-| `openai_settings`  | `outlineModel`, provider `enabled`, `credentialMode`                               |
+| `gemini_settings`  | legacy `analysisModel`, provider `enabled`                              |
+| `openai_settings`  | `outlineModel`, provider `enabled`                               |
 | `analysis_settings` | Analysis primary provider, per-provider primary/ordered models and bounded retry policy |
 | `credits_settings` | Analysis/audio/welcome rates                                                       |
 
@@ -179,7 +193,7 @@ retain existing environment/code defaults. Settings HTTP section names and publi
 `/app-config` fields remain compatible. Central mappings and the shared read/write
 helpers are in `src/settings/configuration-store.ts`. All grouped writers use the
 same transaction lock, so languages and provider/backend sibling fields survive
-concurrent updates. Credentials remain encrypted in their existing table.
+concurrent updates. Provider credentials remain in backend environment configuration.
 
 Super Admin → Global Settings offers **Export configuration** and **View debug
 snapshot**. Export `GET /admin/config/export` returns schemaVersion 1, exportedAt,
@@ -235,7 +249,7 @@ were used. The temporary test database was removed after verification.
 ### Remaining high-priority findings — identified, not fixed
 
 1. **Private local storage has a public static bypass.** `src/main.ts` mounts
-   the entire uploads directory at /uploads without authentication. Someone
+   the local assets directory at /autocanvas-assets without authentication. Someone
    possessing a private file's path can bypass the owned audio stream APIs.
    The same static mount returned a synthetic file with HTTP 200 and no token
    in an isolated Nest app; actual uploads were not read. This is already noted
@@ -298,8 +312,7 @@ No additional schema migration is needed. Existing Configuration JSON stores
 `analysis_settings`. Until first dashboard save, use the previous Gemini model
 with bounded defaults: two delayed retries at five seconds. The new Super Admin
 Providers & Models form manages Gemini/OpenAI primary models, ordered backups,
-provider fallback and primary retry bounds. Provider Keys remains the single
-place for credentials. Global provider/analysis feature controls still apply.
+provider fallback and primary retry bounds. Credentials are managed only through the backend environment. Global provider/analysis feature controls still apply.
 Audio generation and script-outline configuration are unchanged.
 
 A model must support the adapter's structured output API; format validation does
@@ -397,3 +410,16 @@ checks including weighted totals, raw-success median versus model medians,
 exclusions, empty rates, provider/model filters, UTC start windows, cohort paging,
 role/realm guards and query validation. Admin decoder tests cover malformed/
 inconsistent metrics without substituting fake zeros. No live AI tests are implied.
+
+
+### Live storage and audio verification — 2026-10-29
+
+Real configured local, Supabase and R2 adapters passed upload, metadata, byte-exact full read, partial read, duplicate-upload rejection without overwrite, delete and missing-after-delete checks. Each probe used a new UUID path under `temp/`; only its own probe object was deleted. An initial verification-script receipt timestamp error was corrected before rerunning; it was not a storage adapter failure.
+
+An isolated synthetic local-development account generated three short Hindi single-character stories and three two-scene/two-voice multi-character stories using real Gemini requests. All single generations and multi jobs completed. Real provider 429 responses were observed: multi jobs entered WAITING and the running backend recovered them; the failed single attempt was retried after the rate-limit window and succeeded. No quota/feature settings or existing users' balances were changed. All test reservations settled to COMPLETED/REFUNDED, with no active test sessions left.
+
+The running backend's configured writer remained R2. Its recovery therefore saved the waiting Supabase test's scenes in R2; those two generated test scenes were copied byte-exact through StorageService into Supabase at identical logical keys, and only their test-account references were updated after upload confirmation. Supabase scene reads and its combined export were then verified from Supabase. This checks real provider delivery without claiming that recovery captures the original storage writer. Environment files were unchanged.
+
+Actual authenticated HTTP requests to the running backend passed for all six cases: single-file downloads; both multi-scene streams including byte ranges returning 206; combined WAV downloads; ZIP downloads; private/no-store headers; and anonymous requests rejected with 401. Generated files were valid non-silent mono 24 kHz 16-bit WAVs. Every ZIP passed CRC checks and contained the two ordered Hindi scene filenames, with valid WAV entries. Test recordings were retained under the isolated account; existing recordings and manual bucket objects were untouched.
+
+Scope: generation was invoked through the actual backend services, then delivery through actual HTTP/session guards. Multi-character scenes/voice assignments were explicitly authored for this storage-focused check; AI analysis, browser sign-in, audible listening, production-scale load and payment processing were not retested. The temporary session was revoked. These results supplement, rather than replace, the earlier browser and automated regression checks.

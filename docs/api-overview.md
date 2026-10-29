@@ -15,6 +15,10 @@ Start with this route map, then read the controller/DTO for exact validation and
 
 See [admin-auth.md](admin-auth.md) for the complete route table, body/cookie contracts, superadmin role management and first-account command. Registration creates normal users. Superadmin is a backend permission, not a separate login implementation.
 
+Password recovery uses `POST /auth/forgot-password` with `{ email }` and `POST /auth/reset-password` with `{ token, password }`. Both are public, user-origin protected, independently rate-limited and return no-store responses. Reset links expire in 30 minutes, are single-use and revoke all prior sessions when consumed. Invalid/expired/reused links return 400 with `RESET_TOKEN_INVALID`; limits return 429 with Retry-After. See [password recovery](admin-auth.md#password-recovery) for eligibility, email configuration and migration/test requirements.
+
+`GET /ai/test` is an allowlisted diagnostic, not a free health check. It uses the enabled Gemini primary from admin Providers & Models, retaining provider-enable and shared usage checks. Missing Gemini model configuration rejects the test before a provider request; it does not fall through to a separate environment model. Provider calls in diagnostic regression tests are mocked.
+
 ## Admin dashboard reporting
 
 `GET /admin/dashboard?days=7|30` requires an active admin-audience session and
@@ -165,11 +169,11 @@ No database migration or generation/provider calls are needed for this section.
 
 `GET /admin/settings/analysis-model` returns `{ model, source }`, where source is `database`, `environment` or `default`. `PATCH` accepts `{ "model": "exact-gemini-model-id" }`; `{ "model": null }` deletes the override and restores the backend fallback. Before a new analysis routing configuration is saved, this legacy endpoint controls the Gemini default. After first routing save, PATCH returns 400 directing callers to the routing endpoint; GET remains a legacy value, not the effective routed provider. Both require an admin-realm session and the current SUPERADMIN database role. Writes enforce the existing admin-origin guard. Responses are private/no-store. Unknown fields and invalid model IDs are rejected.
 
-Saving only validates a model ID's format (lowercase letters, digits, dots, underscores and hyphens, up to 120 characters). It does not call Google, list available models or guarantee access. This model endpoint does not manage credentials or select a different provider; the runtime controls below manage encrypted keys separately.
+Saving only validates a model ID's format (lowercase letters, digits, dots, underscores and hyphens, up to 120 characters). It does not call Google, list available models or guarantee access. This model endpoint does not manage credentials or select a different provider; provider credentials are read only from backend environment configuration.
 
 ## Runtime admin controls
 
-All `/admin/config/*` and `/admin/provider-keys/*` routes require an admin-realm session, current SUPERADMIN role and the existing origin guard for writes. Responses are private/no-store. Admin clients use their existing auth/refresh flow; user sessions cannot access these routes.
+All `/admin/config/*` routes require an admin-realm session, current SUPERADMIN role and the existing origin guard for writes. Responses are private/no-store. Admin clients use their existing auth/refresh flow; user sessions cannot access these routes.
 
 | Route                                                       | Purpose                                                                                                                                                                                            |
 | ----------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -177,18 +181,16 @@ All `/admin/config/*` and `/admin/provider-keys/*` routes require an admin-realm
 | PATCH /admin/config/:section                                | `{ values: { allowedKey: valueOrNull }, locale?: "en"                                                                                                                                              | "hi" }`; null removes an override.                                                      |
 | PUT /admin/config/web-strings or /admin/config/web-settings | `{ values: { ...JSON }, locale?: "en"                                                                                                                                                              | "hi" }`; replaces the whole web override document, omitted keys restore local fallback. |
 | GET /app-config?locale=en                                   | Public startup response `{ appSettings, appStrings, locale, features }`; private backend settings and provider credentials are never included. Omit locale to use the configured default language. |
-| GET /admin/provider-keys/:provider                          | Masked saved keys, environment/dashboard mode and encryption readiness.                                                                                                                            |
-| POST /admin/provider-keys/:provider                         | Add `{ name, key }` and switch to dashboard-managed mode.                                                                                                                                          |
-| POST /admin/provider-keys/:provider/import-environment      | Copy the single server environment key into encrypted management; replaces the selected key.                                                                                                       |
-| POST /admin/provider-keys/:provider/use-environment         | Explicitly restore environment mode; saved encrypted keys remain stored.                                                                                                                           |
-| PATCH /admin/provider-keys/:provider/:id                    | `{ enabled: boolean }`.                                                                                                                                                                            |
-| DELETE /admin/provider-keys/:provider/:id                   | Clear the selected encrypted key and disable its row. Managed mode remains active; legacy extras/environment keys are not automatically selected.                                                  |
 
-Allowed config sections: `web-settings`, `web-strings`, `features`, `models`, `processing`, `pricing`. Allowed credential providers: `gemini`, `openai`. Private backend sections reject unknown fields, wrong types and invalid ranges. Web documents accept arbitrary keys: App Strings requires text values; App Settings supports nested JSON objects/arrays, booleans, numbers, null and text. Existing home-setting types and en/hi language values are validated. Unsafe object keys are rejected or stripped by request transformation; documents are limited to 64 KB and 20 nesting levels. No generated catalog or cross-repository sync is required. Web JSON is public, so credentials belong in Provider Keys. Dashboard values override local values; nested objects merge, arrays replace, and false/0/empty text remain overrides. HTML/placeholders are stored as text and are not automatically executed/expanded. Missing keys/translations fall back to local defaults. Important settings controls edit the same JSON keys; no separate store exists. Whole-document publishes use last-publish-wins; private sections do not accept PUT.
+Allowed config sections: `web-settings`, `web-strings`, `features`, `models`, `processing`, `security`, `storage`, `pricing`. Private backend sections reject unknown fields, wrong types and invalid ranges. Web documents accept arbitrary keys: App Strings requires text values; App Settings supports nested JSON objects/arrays, booleans, numbers, null and text. Existing home-setting types and en/hi language values are validated. Unsafe object keys are rejected or stripped by request transformation; documents are limited to 64 KB and 20 nesting levels. No generated catalog or cross-repository sync is required. Web JSON is public, so credentials belong only in backend environment configuration. Dashboard values override local values; nested objects merge, arrays replace, and false/0/empty text remain overrides. HTML/placeholders are stored as text and are not automatically executed/expanded. Missing keys/translations fall back to local defaults. Important settings controls edit the same JSON keys; no separate store exists. Whole-document publishes use last-publish-wins; private sections do not accept PUT.
+
+The private `storage` section contains boolean `cleanupEnabled` (default true). GET/PATCH `/admin/config/storage` reuse current Super Admin/session/origin guards and private/no-store responses. Saved values are stored as typed JSON under `backend_settings.storage`, never returned by public app-config. A null patch removes the override and restores legacy environment/default behavior. The cleanup worker checks before each file and polls configuration every 30 seconds; already-started deletion may finish. Settings failures do not allow deletion.
+
+The private `security` section stores four numeric password-login limits: `adminLoginAccountLimit`, `adminLoginIpLimit`, `loginAccountLimit`, `loginIpLimit` (integers 1–1,000,000). Super Admin-only access is enforced by the existing runtime controller guards. They use `backend_settings.security`, with legacy environment/default fallback and null-to-reset behavior. Changes affect the next login attempt without clearing persistent counters. These settings are not credentials and are not encrypted; email/IP counter identifiers remain hashed. See [login limits](admin-auth.md#password-login-rate-limits).
 
 Pricing drives wallet reservations and settlement; see Wallet and payments below. Analysis provider/model selection and fallback use the separate routing endpoint below. Gemini audio and OpenAI outlines retain their existing configuration. Each provider has one selected key; analysis, outlines and audio have no automatic key rotation. TTS rate limits may schedule a job retry with the same key. The legacy analysis-model endpoint remains writable only until routing configuration is saved.
 
-The /app-config endpoint replaces /public/config; update web/API deployments together. The backend does not load ProviderCredential or private section values into this response. The browser fetches once per load and uses local defaults on failure. No frontend client secret is required for public data. Admin reads/writes retain independent admin-session/current-role/origin checks.
+The /app-config endpoint replaces /public/config; update web/API deployments together. The backend does not load provider credentials or private section values into this response. The browser fetches once per load and uses local defaults on failure. No frontend client secret is required for public data. Admin reads/writes retain independent admin-session/current-role/origin checks.
 
 ## Wallet and payments
 
@@ -204,10 +206,10 @@ Super Admin only: GET `/admin/credits/users?search=...`, GET `/admin/credits/use
 pack definitions and safe credential/payment availability. `GET /admin/config/debug`
 adds effective backend values and their sources. Both reuse origin/admin/superadmin
 guards and private/no-store headers; ordinary admins/users cannot access them.
-No full credentials, encrypted credentials or environment dump is returned.
+No credentials or environment dump is returned.
 There is no import route. See [operations](operations.md#grouped-configuration-storage-and-diagnostics)
 for group names, migration and verification boundaries. Existing section URLs,
-analysis-model/key management and public app-config payloads are unchanged.
+analysis-model configuration and public app-config payloads remain available; provider keys are managed only through backend environment configuration.
 
 ## Admin analysis monitoring
 

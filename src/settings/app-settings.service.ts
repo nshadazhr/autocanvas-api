@@ -1,7 +1,13 @@
 import { Injectable, BadRequestException, ServiceUnavailableException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { PrismaService } from '../prisma/prisma.service.js';
-import { runtimeDefaults, type RuntimeSection, type RuntimeValues } from './runtime-settings.js';
+import {
+	loginSecurityEnvironment,
+	processingEnvironment,
+	runtimeDefaults,
+	type RuntimeSection,
+	type RuntimeValues
+} from './runtime-settings.js';
 
 import { configurationGroups, readConfiguration, writeConfiguration, objectValue } from './configuration-store.js';
 type Values = Record<string, unknown>;
@@ -44,12 +50,15 @@ export class AppSettingsService {
 		const stored = path ? objectValue(root[path]) : root;
 		if (name === 'web-strings' || name === 'web-settings') return { values: stored, defaults: {} };
 		const defaults: RuntimeValues = { ...runtimeDefaults[name as RuntimeSection] };
+		if (name === 'storage') {
+			const value = this.config.get<string>('STORAGE_CLEANUP_ENABLED');
+			if (value !== undefined) defaults.cleanupEnabled = value !== 'false';
+		}
 		if (name === 'models') defaults.outlineModel = this.config.get<string>('OPENAI_MODEL')?.trim() || 'gpt-4.1';
-		if (name === 'processing') {
-			for (const [field, env] of Object.entries({
-				maxRecoveryAttempts: 'AUDIO_MAX_RECOVERY_ATTEMPTS',
-				recoveryRetryDelayMs: 'AUDIO_RECOVERY_RETRY_DELAY_MS'
-			})) {
+		if (name === 'processing' || name === 'security') {
+			for (const [field, env] of Object.entries(
+				name === 'security' ? loginSecurityEnvironment : processingEnvironment
+			)) {
 				const value = Number(this.config.get<string>(env));
 				if (Number.isSafeInteger(value) && value > 0) defaults[field] = value;
 			}
@@ -135,13 +144,17 @@ export class AppSettingsService {
 					throw new BadRequestException('Invalid setting type: ' + field);
 				if (
 					typeof value === 'number' &&
-					(!Number.isSafeInteger(value) || value < (name === 'pricing' ? 0 : 1) || value > 1000000)
+					(!Number.isSafeInteger(value) ||
+						value < (name === 'pricing' ? 0 : 1) ||
+						value > (name === 'processing' && field.endsWith('CharactersPerDay') ? 1000000000 : 1000000))
 				)
 					throw new BadRequestException('Numeric setting is out of range');
 				if (field === 'outlineModel' && !/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,119}$/.test(String(value)))
 					throw new BadRequestException('Invalid model ID');
 				if (field === 'maxRecoveryAttempts' && Number(value) > 10)
 					throw new BadRequestException('Recovery attempts must be 1–10');
+				if (field === 'retryScanIntervalMs' && Number(value) < 1000)
+					throw new BadRequestException('Retry scan interval must be at least 1000 ms');
 				if (field === 'recoveryRetryDelayMs' && Number(value) < 1000)
 					throw new BadRequestException('Retry delay must be at least 1000 ms');
 			}

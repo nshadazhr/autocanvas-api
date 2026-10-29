@@ -125,7 +125,7 @@ export class AudioGenerationController {
 		// Verify ownership and retrieve file metadata
 		const file = await this.audioGenerationService.getExportedAudioFile(assetId, req.user.id);
 
-		// Read exported WAV from Local or Supabase
+		// Read exported WAV from its saved storage provider.
 		const storedFile = await this.storageService.getFile(file.filePath);
 
 		res.setHeader('Content-Type', file.mimeType);

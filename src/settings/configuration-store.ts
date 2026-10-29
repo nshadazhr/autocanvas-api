@@ -6,6 +6,8 @@ export const configurationGroups = {
 	'web-strings': ['app_strings'],
 	features: ['backend_settings', 'features'],
 	processing: ['backend_settings', 'processing'],
+	security: ['backend_settings', 'security'],
+	storage: ['backend_settings', 'storage'],
 	models: ['openai_settings'],
 	pricing: ['credits_settings']
 } as const;

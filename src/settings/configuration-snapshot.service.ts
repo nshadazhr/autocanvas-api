@@ -2,7 +2,7 @@ import { Injectable } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { PrismaService } from '../prisma/prisma.service.js';
 import { AppSettingsService } from './app-settings.service.js';
-import { ProviderCredentialsService } from './provider-credentials.service.js';
+import { loginSecurityEnvironment, processingEnvironment } from './runtime-settings.js';
 import { configurationGroups, objectValue } from './configuration-store.js';
 /** Scrub arbitrary public JSON too: never expose credential-like fields in diagnostics. */
 export function redactConfiguration(value: unknown): unknown {
@@ -23,8 +23,7 @@ export class ConfigurationSnapshotService {
 	constructor(
 		private readonly prisma: PrismaService,
 		private readonly config: ConfigService,
-		private readonly settings: AppSettingsService,
-		private readonly credentials: ProviderCredentialsService
+		private readonly settings: AppSettingsService
 	) {}
 	async snapshot(debug = false) {
 		const { rows, creditPacks } = await this.prisma.$transaction(
@@ -40,11 +39,11 @@ export class ConfigurationSnapshotService {
 		const allConfig = Object.fromEntries(rows.map(row => [row.key, row.value]));
 		const providerStatus: Record<string, unknown> = {};
 		for (const provider of ['gemini', 'openai']) {
-			const status = await this.credentials.list(provider);
 			providerStatus[provider] = {
-				source: status.managed ? 'dashboard' : 'environment',
-				configured: status.managed ? status.keys.some(key => key.enabled) : status.environmentKeyCount > 0,
-				encryptionReady: status.encryptionReady
+				source: 'environment',
+				configured: !!this.config
+					.get<string>(provider === 'gemini' ? 'GEMINI_API_KEY' : 'OPENAI_API_KEY')
+					?.trim()
 			};
 		}
 		providerStatus.resend = {
@@ -67,26 +66,28 @@ export class ConfigurationSnapshotService {
 		};
 		if (debug) {
 			const effectiveConfig: Record<string, unknown> = {};
-			for (const name of ['features', 'processing', 'models', 'pricing'] as const) {
+			for (const name of ['features', 'processing', 'security', 'storage', 'models', 'pricing'] as const) {
 				const section = await this.settings.section(name);
 				const [group, path] = configurationGroups[name] as readonly string[];
 				const root = objectValue(allConfig[group!]);
 				const saved = path ? objectValue(root[path]) : root;
 				const fields = Object.fromEntries(
 					Object.entries(section.values).map(([key, value]) => {
-						const env =
-							key === 'outlineModel'
-								? 'OPENAI_MODEL'
-								: key === 'maxRecoveryAttempts'
-									? 'AUDIO_MAX_RECOVERY_ATTEMPTS'
-									: key === 'recoveryRetryDelayMs'
-										? 'AUDIO_RECOVERY_RETRY_DELAY_MS'
-										: null;
+						const env = (
+							{
+								outlineModel: 'OPENAI_MODEL',
+								cleanupEnabled: 'STORAGE_CLEANUP_ENABLED',
+								...processingEnvironment,
+								...loginSecurityEnvironment
+							} as Record<string, string>
+						)[key];
 						const raw = env ? this.config.get<string>(env) : undefined;
 						const fromEnvironment =
-							key === 'outlineModel'
-								? !!raw?.trim()
-								: raw !== undefined && Number.isSafeInteger(Number(raw)) && Number(raw) > 0;
+							key === 'cleanupEnabled'
+								? raw !== undefined
+								: key === 'outlineModel'
+									? !!raw?.trim()
+									: raw !== undefined && Number.isSafeInteger(Number(raw)) && Number(raw) > 0;
 						return [
 							key,
 							{

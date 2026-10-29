@@ -111,14 +111,38 @@ Deploy migration `20261024050000_revocable_auth_sessions` before starting the up
 
 ## Browser origins and request protections
 
-- REQUEST_ORIGIN_PORT: primary user application origin; retained for compatibility (default `http://localhost:3000`).
-- CORS_ALLOWED_ORIGINS: comma-separated additional **user** origins.
+- REQUEST_ORIGIN_PORT: primary user application origin; local default `http://localhost:3000`. Set the real HTTPS origin explicitly in production.
 - ADMIN_ORIGIN: primary admin origin; local default `http://localhost:3001`. Set the real HTTPS origin explicitly in production.
-- ADMIN_ALLOWED_ORIGINS: comma-separated additional **admin** origins.
 
-Global CORS allows those explicit origins with credentials. Auth mutations additionally validate Origin against the corresponding application allowlist; the user application's origin cannot refresh/logout the admin session. Untrusted origins and cross-site requests missing Origin are rejected. Non-browser clients without Origin remain supported and must possess the appropriate credentials/token.
+Both apps use localhost fallbacks only outside production. In production, a missing origin leaves that app's allowlist empty; password-reset requests also fail before creating a token or sending email when the user origin is missing. Global CORS allows configured origins with credentials. Auth mutations additionally validate Origin against the corresponding application allowlist; the user application's origin cannot refresh/logout the admin session. Untrusted origins and cross-site requests missing Origin are rejected. Non-browser clients without Origin remain supported and must possess the appropriate credentials/token.
 
 JWT_SECRET and JWT_REFRESH_SECRET must be strong independent server-only secrets. Missing refresh-secret configuration fails backend initialization; it never falls back to the access-token signing key.
+
+## Password recovery
+
+`PasswordResetController`, `PasswordResetService` and `PasswordResetRateGuard` implement public user-origin recovery using the existing Prisma, PasswordHasher, EmailService and AuthRateBucket infrastructure. Login/registration/OTP handlers are unchanged.
+
+- `POST /auth/forgot-password` accepts `{ email }` (trimmed/lowercased, maximum 254 characters). HTTP 200 has the same generic response for known, unknown, unverified and Google-only accounts. Only verified accounts with a password receive mail. Google-only users continue using Google sign-in; recovery does not create a password for them.
+- Email uses existing `RESEND_API_KEY` and optional `RESEND_FROM_EMAIL`. Links use the trusted primary `REQUEST_ORIGIN_PORT` origin (local default `http://localhost:3000`), never request-supplied host fields. Use the deployed HTTPS origin in production. Missing API-key configuration returns 500 for all requests. Provider-delivery failure logs a generic warning, removes that failed issuance and retains the generic response without exposing account eligibility. Check provider delivery if mail does not arrive.
+- Links use `/reset-password#token=...`: the fragment is absent from HTTP page requests/referrers. A 32-byte random token expires after 30 minutes. `PasswordReset` stores only its SHA-256 digest, with at most one outstanding record per user. A new request replaces the previous token. Never log passwords, tokens, reset URLs or email-provider errors.
+- `POST /auth/reset-password` accepts `{ token, password }`: token must be 64 lowercase hex characters; password must be strong (8–1024 characters, upper/lowercase, number, symbol). Invalid, expired, replaced or used links return 400 with `code: RESET_TOKEN_INVALID`. Input validation failures are also 400.
+- Token consumption, saving the password hash and revocation of **all user/admin sessions** occur in one transaction. Only one concurrent submission succeeds. Transaction failure preserves the prior password/token. Success returns 200, clears both refresh cookies and asks the user to log in; no new session is issued. Existing access/refresh tokens fail normal session guards.
+- Responses use `Cache-Control: no-store`. AuthOriginGuard rejects untrusted origins. Separate fixed 15-minute buckets allow 3 requests per normalized email and 20 per peer IP; reset submissions allow 30 per peer IP. Excess requests return 429 with `Retry-After`. Reset traffic does not consume password-login buckets. Forwarded IP handling follows the existing trusted-proxy rules.
+
+Deploy additive migration `20261028100000_password_reset` and regenerate Prisma before using these endpoints:
+
+```sh
+npx prisma migrate deploy --config prisma7.config.ts
+npx prisma generate --config prisma7.config.ts
+```
+
+With `AUDIO_FLOW_TEST_DATABASE_URL` pointing to a disposable localhost database ending in `_test`, run:
+
+```sh
+npx vitest run --config vitest.password-reset.config.ts
+```
+
+The PostgreSQL/HTTP suite covers eligibility/generic response bodies, digest storage, expiry/replacement/replay, real password login before/after reset, both session realms, concurrent consumption, transaction rollback, input/origin/rate protections and mocked mail failures. Sender tests do not send real email. All 7 reset tests and 20 existing auth tests passed against an isolated local database. Migration deployment was verified there and the single additive migration was applied to the verified local app database. Live inbox delivery remains an operational verification.
 
 ## Password-login rate limits
 
@@ -129,7 +153,9 @@ Limits are persisted in AuthRateBucket, shared across backend replicas, and enfo
 | Per normalized email | 5     | 10   |
 | Per peer IP          | 30    | 60   |
 
-Configure ADMIN_LOGIN_ACCOUNT_LIMIT, ADMIN_LOGIN_IP_LIMIT, LOGIN_ACCOUNT_LIMIT and LOGIN_IP_LIMIT with positive integers. Exceeding a limit returns HTTP 429 with Retry-After. Email/IP bucket identifiers are hashed. Arbitrary X-Forwarded-For headers are ignored; behind a reverse proxy, configure Express trust proxy for the known proxy addresses before relying on forwarded client IPs. Do not blindly trust all forwarded headers.
+Super Admins manage these four limits in admin **Login security** (`/security-settings`) through `GET/PATCH /admin/config/security`. Values are normal JSON numbers in `Configuration.backend_settings.security`, not encrypted credentials. Keys are `adminLoginAccountLimit`, `adminLoginIpLimit`, `loginAccountLimit` and `loginIpLimit`; accepted values are integers 1–1,000,000, with no zero/disable option. Private reads and writes require an admin-realm session and the current SUPERADMIN database role; writes retain the existing origin guard. These values never enter public `/app-config`.
+
+Saved overrides take priority over legacy `ADMIN_LOGIN_ACCOUNT_LIMIT`, `ADMIN_LOGIN_IP_LIMIT`, `LOGIN_ACCOUNT_LIMIT` and `LOGIN_IP_LIMIT`, then the defaults above. Reset removes saved overrides, restoring the environment/default values. Each password-login attempt reads effective settings; edits apply without restart and do not reset existing counters, separate user/admin scopes or the 15-minute window. A settings-read error or invalid saved limit does not bypass throttling. Registration, Google login, refresh and password-reset throttles keep their existing flows. Preserve effective values and verify with these four environment entries omitted before removing them manually. Exceeding a limit returns HTTP 429 with Retry-After. Email/IP bucket identifiers are hashed. Arbitrary X-Forwarded-For headers are ignored; behind a reverse proxy, configure Express trust proxy for the known proxy addresses before relying on forwarded client IPs. Do not blindly trust all forwarded headers.
 
 ## Verification
 

@@ -36,9 +36,10 @@ export class audioGenerationService implements OnModuleInit, OnModuleDestroy {
 	) {
 		this.retryScanIntervalMs = this.readPositiveEnv('AUDIO_RETRY_SCAN_INTERVAL_MS', 30_000);
 	}
-	private retryTimer: ReturnType<typeof setInterval> | null = null;
+	private retryTimer: ReturnType<typeof setTimeout> | null = null;
+	private retryScannerStopped = true;
 	private retryScanRunning = false;
-	private readonly retryScanIntervalMs: number;
+	private retryScanIntervalMs: number;
 
 	private readPositiveEnv(name: string, fallback: number): number {
 		const raw = this.configService.get<string>(name);
@@ -239,6 +240,7 @@ export class audioGenerationService implements OnModuleInit, OnModuleDestroy {
 					data: { status: 'COMPLETED', error: null, completed_at: new Date() }
 				});
 			}
+			await this.storageService.confirmUpload(tx, filePath);
 			return tx.sceneAudio.create({
 				data: {
 					sceneId: scene.id,
@@ -876,6 +878,7 @@ export class audioGenerationService implements OnModuleInit, OnModuleDestroy {
 	}
 
 	async onModuleInit() {
+		this.retryScannerStopped = false;
 		const recovered = await this.recoverInterruptedJobs();
 
 		if (recovered > 0) {
@@ -883,16 +886,47 @@ export class audioGenerationService implements OnModuleInit, OnModuleDestroy {
 		}
 		await this.resumeWaitingJobs();
 
-		this.retryTimer = setInterval(() => {
-			void this.resumeWaitingJobs().catch((error: unknown) => {
-				console.error('Failed to resume waiting audio jobs:', error);
-			});
+		if (this.retryScannerStopped) return;
+		await this.refreshRetryScanInterval();
+		this.scheduleRetryScan();
+	}
+
+	private async refreshRetryScanInterval() {
+		try {
+			const { values } = await this.settings.section('processing');
+			const value = Number(values.retryScanIntervalMs);
+			if (!Number.isSafeInteger(value) || value < 1000 || value > 1000000)
+				throw new Error('Invalid audio retry scan interval');
+			this.retryScanIntervalMs = value;
+		} catch (error) {
+			// Keep scanning at the last known interval if configuration cannot be read.
+			console.error('Failed to refresh audio retry scan interval:', error);
+		}
+	}
+
+	private scheduleRetryScan() {
+		if (this.retryScannerStopped) return;
+		this.retryTimer = setTimeout(() => {
+			this.retryTimer = null;
+			void (async () => {
+				try {
+					await this.resumeWaitingJobs();
+				} catch (error) {
+					console.error('Failed to resume waiting audio jobs:', error);
+				} finally {
+					if (!this.retryScannerStopped) {
+						await this.refreshRetryScanInterval();
+						this.scheduleRetryScan();
+					}
+				}
+			})();
 		}, this.retryScanIntervalMs);
 	}
 
 	onModuleDestroy() {
+		this.retryScannerStopped = true;
 		if (this.retryTimer) {
-			clearInterval(this.retryTimer);
+			clearTimeout(this.retryTimer);
 			this.retryTimer = null;
 		}
 	}
@@ -1159,7 +1193,7 @@ export class audioGenerationService implements OnModuleInit, OnModuleDestroy {
 			// Ownership verification
 			const audioFile = await this.getAudioFile(audioId, userId);
 
-			// Read from Local or Supabase Storage
+			// Read from the provider recorded with the asset.
 			const storedFile = await this.storageService.getFile(audioFile.filePath);
 
 			const audioBuffer = await this.streamToBuffer(storedFile.stream);
@@ -1184,16 +1218,19 @@ export class audioGenerationService implements OnModuleInit, OnModuleDestroy {
 			contentType: 'audio/wav'
 		});
 
-		const asset = await this.prisma.audioAsset.create({
-			data: {
-				storyId,
-				type: 'COMBINED_AUDIO',
-				filePath: filePath,
-				format: 'wav',
-				mimeType: 'audio/wav',
-				fileSizeBytes: BigInt(mergedBuffer.length),
-				durationMs: durationMs
-			}
+		const asset = await this.prisma.$transaction(async tx => {
+			await this.storageService.confirmUpload(tx, filePath);
+			return tx.audioAsset.create({
+				data: {
+					storyId,
+					type: 'COMBINED_AUDIO',
+					filePath: filePath,
+					format: 'wav',
+					mimeType: 'audio/wav',
+					fileSizeBytes: BigInt(mergedBuffer.length),
+					durationMs: durationMs
+				}
+			});
 		});
 
 		return {

@@ -1,3 +1,4 @@
+import { AppSettingsService } from '../settings/app-settings.service.js';
 import { AdminAnalysisJobsService } from '../admin/admin-analysis-jobs.service.js';
 import { defaultAnalysisSettings } from '../settings/analysis-settings.service.js';
 import { AnalysisRun } from '../ai/analysis/analysis-runner.service.js';
@@ -29,7 +30,11 @@ describe.skipIf(!databaseUrl)('analysis retries and shared AI budgets', () => {
 	const prisma = new PrismaClient({ adapter: new PrismaPg({ connectionString: databaseUrl! }) });
 	const limits: Record<string, string> = {};
 	const config = { get: (key: string) => limits[key] };
-	const usage = new AiUsageService(prisma as any, config as any);
+	const usage = new AiUsageService(
+		prisma as any,
+		config as any,
+		new AppSettingsService(prisma as any, config as any)
+	);
 	const provider = {
 		analyze: vi.fn(),
 		assertEnabled: vi.fn().mockResolvedValue(undefined),
@@ -659,7 +664,11 @@ describe.skipIf(!databaseUrl)('analysis retries and shared AI budgets', () => {
 	it('shares a daily TTS budget across service instances', async () => {
 		limits.AI_USER_REQUESTS_PER_DAY = '1';
 		await usage.execute(userId, 'tts', 10, async () => true);
-		const otherUsage = new AiUsageService(prisma as any, config as any);
+		const otherUsage = new AiUsageService(
+			prisma as any,
+			config as any,
+			new AppSettingsService(prisma as any, config as any)
+		);
 		const action = vi.fn();
 		await expect(otherUsage.execute(userId, 'tts', 10, action)).rejects.toBeInstanceOf(AiCapacityError);
 		expect(action).not.toHaveBeenCalled();
@@ -677,7 +686,11 @@ describe.skipIf(!databaseUrl)('analysis retries and shared AI budgets', () => {
 				})
 		);
 		for (let i = 0; i < 100 && !finish; i++) await new Promise(r => setTimeout(r, 10));
-		const other = new AiUsageService(prisma as any, config as any);
+		const other = new AiUsageService(
+			prisma as any,
+			config as any,
+			new AppSettingsService(prisma as any, config as any)
+		);
 		await expect(other.execute(userId, 'tts', 1, async () => true)).rejects.toBeInstanceOf(AiCapacityError);
 		finish();
 		await active;

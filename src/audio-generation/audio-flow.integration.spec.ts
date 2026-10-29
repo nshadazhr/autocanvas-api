@@ -48,6 +48,7 @@ describe.skipIf(!databaseUrl)('audio flow with real PostgreSQL and stubbed Gemin
 		generateSpeech: vi.fn(async (_text: string, _voice: string, _model: string) => wav)
 	};
 	const storage = {
+		confirmUpload: async () => undefined,
 		upload: vi.fn(async ({ key, buffer }: { key: string; buffer: Buffer }) => {
 			files.set(key, buffer);
 			return key;
@@ -721,6 +722,54 @@ describe.skipIf(!databaseUrl)('audio flow with real PostgreSQL and stubbed Gemin
 			.auth(token, { type: 'bearer' })
 			.expect(200)
 			.expect('Content-Type', /application\/zip/);
+	});
+
+	it('serves R2-prefixed scene playback, ZIP and combined exports with existing ownership checks', async () => {
+		const originalUpload = storage.upload.getMockImplementation()!;
+		storage.upload.mockImplementation(async ({ key, buffer }) => {
+			const location = 'r2://' + key;
+			files.set(location, buffer);
+			return location;
+		});
+		try {
+			const job = await service.createGenerationJob(story.id, userId);
+			await service.processGenerationJob(job.id);
+			const history = await service.getStoryAudioHistory(story.id, userId);
+			const audioId = history.scenes[0].latestAudio!.id;
+			expect((await service.getAudioFile(audioId, userId)).filePath).toMatch(/^r2:\/\//);
+			await request(app.getHttpServer())
+				.get(`/audio-generation/audio/${audioId}/stream`)
+				.auth(token, { type: 'bearer' })
+				.set('Range', 'bytes=0-43')
+				.expect(206)
+				.expect('Content-Length', '44')
+				.expect('Content-Range', `bytes 0-43/${wav.length}`);
+			await request(app.getHttpServer())
+				.get(`/audio-generation/stories/${story.id}/download-zip`)
+				.auth(token, { type: 'bearer' })
+				.expect(200)
+				.expect('Content-Type', /application\/zip/);
+			const exported = await service.exportStoryWav(story.id, userId);
+			const asset = await service.getExportedAudioFile(exported.id, userId);
+			expect(asset.filePath).toMatch(/^r2:\/\//);
+			await request(app.getHttpServer())
+				.get(`/audio-generation/exports/${exported.id}/download`)
+				.auth(token, { type: 'bearer' })
+				.expect(200)
+				.expect('Content-Type', /audio\/wav/);
+			await request(app.getHttpServer()).get(`/audio-generation/exports/${exported.id}/download`).expect(401);
+			const otherToken = jwt.sign({ id: userId + 99999 });
+			await request(app.getHttpServer())
+				.get(`/audio-generation/audio/${audioId}/stream`)
+				.auth(otherToken, { type: 'bearer' })
+				.expect(404);
+			await request(app.getHttpServer())
+				.get(`/audio-generation/exports/${exported.id}/download`)
+				.auth(otherToken, { type: 'bearer' })
+				.expect(404);
+		} finally {
+			storage.upload.mockImplementation(originalUpload);
+		}
 	});
 
 	it('HTTP concurrent generation requests return one 201 and one 409', async () => {

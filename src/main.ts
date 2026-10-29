@@ -30,8 +30,8 @@ async function bootstrap() {
 
 	app.use(cookieParser());
 
-	app.useStaticAssets(join(process.cwd(), 'uploads'), {
-		prefix: '/uploads/'
+	app.useStaticAssets(join(process.cwd(), 'autocanvas-assets'), {
+		prefix: '/autocanvas-assets/'
 	});
 
 	const config = new DocumentBuilder()

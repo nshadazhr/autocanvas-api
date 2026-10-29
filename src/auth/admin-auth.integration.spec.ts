@@ -1,3 +1,4 @@
+import { AppSettingsService } from '../settings/app-settings.service.js';
 import { UserService } from '../user/user.service.js';
 import { PrismaService } from '../prisma/prisma.service.js';
 import { ConfigService } from '@nestjs/config';
@@ -31,6 +32,7 @@ describe.skipIf(!databaseUrl)('admin/user auth with real PostgreSQL and HTTP', (
 	const jwt = new JwtService({ secret: 'isolated-auth-test-access', signOptions: { expiresIn: '15m' } });
 	const tokens = new TokenService(jwt, prisma as any);
 	const limits: Record<string, string> = {};
+	const settings = new AppSettingsService(prisma as any, { get: (key: string) => limits[key] } as any);
 	const users = new UserService(prisma as any);
 	const passwords = { verify: vi.fn(async (raw: string) => raw === 'correct-password') };
 	const auth = new AuthService({} as any, users as any, passwords as any, tokens, {} as any, {} as any, {} as any);
@@ -66,6 +68,7 @@ describe.skipIf(!databaseUrl)('admin/user auth with real PostgreSQL and HTTP', (
 			controllers: [AuthController],
 			providers: [
 				{ provide: PrismaService, useValue: prisma },
+				{ provide: AppSettingsService, useValue: settings },
 				{ provide: ConfigService, useValue: { get: (key: string) => limits[key] } },
 				{ provide: TokenService, useValue: tokens },
 				{ provide: AuthService, useValue: auth },
@@ -75,7 +78,7 @@ describe.skipIf(!databaseUrl)('admin/user auth with real PostgreSQL and HTTP', (
 				{ provide: AuthOriginGuard, useValue: new AuthOriginGuard() },
 				{
 					provide: LoginRateGuard,
-					useValue: new LoginRateGuard(prisma as any, { get: (key: string) => limits[key] } as any)
+					useValue: new LoginRateGuard(prisma as any, settings)
 				}
 			]
 		}).compile();
@@ -89,6 +92,7 @@ describe.skipIf(!databaseUrl)('admin/user auth with real PostgreSQL and HTTP', (
 		for (const key of Object.keys(limits)) delete limits[key];
 		await prisma.authSession.deleteMany();
 		await prisma.authRateBucket.deleteMany();
+		await prisma.configuration.deleteMany({ where: { key: 'backend_settings' } });
 		await prisma.user.update({ where: { id: admin.id }, data: { role: 'ADMIN' } });
 		passwords.verify.mockClear();
 	});
@@ -97,6 +101,7 @@ describe.skipIf(!databaseUrl)('admin/user auth with real PostgreSQL and HTTP', (
 		if (admin && user && superadmin)
 			await prisma.user.deleteMany({ where: { id: { in: [admin.id, user.id, superadmin.id] } } });
 		await prisma.authRateBucket.deleteMany();
+		await prisma.configuration.deleteMany({ where: { key: 'backend_settings' } });
 		await prisma.$disconnect();
 		if (oldSecret === undefined) delete process.env.JWT_REFRESH_SECRET;
 		else process.env.JWT_REFRESH_SECRET = oldSecret;
@@ -207,6 +212,43 @@ describe.skipIf(!databaseUrl)('admin/user auth with real PostgreSQL and HTTP', (
 			.send({ email: user.email, password: 'x'.repeat(1025) })
 			.expect(400);
 	});
+	it.each([
+		['adminLoginAccountLimit', true, false],
+		['adminLoginIpLimit', true, true],
+		['loginAccountLimit', false, false],
+		['loginIpLimit', false, true]
+	] as const)(
+		'enforces saved %s immediately and preserves current buckets',
+		async (field, adminMode, differentEmail) => {
+			const person = adminMode ? admin : user;
+			const attempt = (email = person.email) =>
+				request(app.getHttpServer())
+					.post(adminMode ? '/auth/admin/login' : '/auth/login')
+					.send({ email, password: 'wrong' });
+			await attempt().expect(401);
+			await settings.updateSection('security', { [field]: 1 });
+			const blocked = await attempt(differentEmail ? 'other@example.test' : person.email).expect(429);
+			expect(Number(blocked.headers['retry-after'])).toBeGreaterThan(0);
+			expect(passwords.verify).toHaveBeenCalledTimes(1);
+			await settings.updateSection('security', { [field]: 2 });
+			await attempt().expect(401);
+			await attempt().expect(429);
+			expect(passwords.verify).toHaveBeenCalledTimes(2);
+			// User and admin realms keep separate counters and settings.
+			await request(app.getHttpServer())
+				.post(adminMode ? '/auth/login' : '/auth/admin/login')
+				.send({ email: person.email, password: 'wrong' })
+				.expect(401);
+		}
+	);
+	it('does not bypass throttling when saved login security configuration is invalid', async () => {
+		await prisma.configuration.create({
+			data: { key: 'backend_settings', value: { security: { adminLoginAccountLimit: 0 } } }
+		});
+		await login(admin).expect(503);
+		expect(passwords.verify).not.toHaveBeenCalled();
+		expect(await prisma.authRateBucket.count()).toBe(0);
+	});
 	it('returns 429 with Retry-After before more password checks', async () => {
 		limits.ADMIN_LOGIN_ACCOUNT_LIMIT = '2';
 		for (let i = 0; i < 2; i++)
@@ -298,6 +340,17 @@ describe.skipIf(!databaseUrl)('admin/user auth with real PostgreSQL and HTTP', (
 		}
 	});
 	it('origin configuration rejects URLs with paths or credentials', () => {
+		const origins = {
+			REQUEST_ORIGIN_PORT: 'https://app.example',
+			ADMIN_ORIGIN: 'https://admin.example'
+		};
+		expect(authAllowedOrigins(origins, 'user')).toEqual(['https://app.example']);
+		expect(authAllowedOrigins(origins, 'admin')).toEqual(['https://admin.example']);
+		expect(authAllowedOrigins({ NODE_ENV: 'production' }, 'admin')).toEqual([]);
+		expect(authAllowedOrigins({ NODE_ENV: 'production' }, 'user')).toEqual([]);
+		expect(authAllowedOrigins({ NODE_ENV: 'production' })).toEqual([]);
+		expect(authAllowedOrigins({})).toEqual(['http://localhost:3000', 'http://localhost:3001']);
+		expect(authAllowedOrigins(origins)).toEqual(['https://app.example', 'https://admin.example']);
 		expect(() => authAllowedOrigins({ ADMIN_ORIGIN: 'https://example.com/path' })).toThrow();
 		expect(() => authAllowedOrigins({ ADMIN_ORIGIN: 'https://user:password@example.com' })).toThrow();
 	});

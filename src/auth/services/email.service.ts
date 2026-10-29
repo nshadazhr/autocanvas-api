@@ -5,6 +5,16 @@ import { Resend } from 'resend';
 export class EmailService {
   constructor(private readonly resend: Resend) {}
 
+  async sendPasswordReset(email: string, link: string) {
+    const { data, error } = await this.resend.emails.send({
+      from: process.env.RESEND_FROM_EMAIL || 'AutoCanvas <onboarding@resend.dev>',
+      to: email,
+      subject: 'Reset your AutoCanvas password',
+      text: `Reset your password: ${link}\n\nThis link expires in 30 minutes and can be used once. If you did not request this, ignore this email. Your password stays unchanged until the link is used.`
+    });
+    if (error || !data?.id) throw new InternalServerErrorException('Unable to send password reset email');
+  }
+
   async sendRegistrationOtp(email: string, otp: string) {
     const { data, error } = await this.resend.emails.send({
       from:

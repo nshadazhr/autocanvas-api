@@ -104,15 +104,9 @@ export function attachment(filename: string) {
 	return `attachment; filename="audio.${filename.endsWith('.zip') ? 'zip' : 'wav'}"; filename*=UTF-8''${encodeURIComponent(filename).replace(/['()*]/g, c => '%' + c.charCodeAt(0).toString(16).toUpperCase())}`;
 }
 export function ownedExportKey(location: string, storyId: number) {
-	const key = location
-		.replace(/\\/g, '/')
-		.replace(/^(local|supabase):\/\//, '')
-		.replace(/^uploads\//, '');
+	const key = location.replace(/^(local|supabase|r2):\/\//, '');
 	if (key.split('/').some(p => !p || p === '.' || p === '..')) return false;
-	return (
-		key.startsWith(`audio-stories/${storyId}/exports/`) ||
-		new RegExp(
-			`^audio-stories/multiple-voice/story_${storyId}_[A-Za-z0-9_]+/exports/export-[a-f0-9-]+/[A-Za-z0-9_]+\\.wav$`
-		).test(key)
-	);
+	return new RegExp(
+		`^audio-stories/multiple-voice/story_${storyId}_[A-Za-z0-9_]+/exports/export-[a-f0-9-]+/[A-Za-z0-9_]+\\.wav$`
+	).test(key);
 }

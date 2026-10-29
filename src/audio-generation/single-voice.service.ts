@@ -473,6 +473,7 @@ export class SingleVoiceService implements OnModuleInit, OnModuleDestroy {
 				});
 				if (!story) return;
 				const config = story.analysisResult as { voiceId: number; style?: string };
+				await this.storageService.confirmUpload(tx, filePath);
 				await this.credits.finish(tx, 'single:' + attemptId, true);
 				await tx.audioAsset.create({
 					data: {

@@ -34,6 +34,7 @@ model User {
   creditPurchases CreditPurchase[]
 
   authSessions AuthSession[]
+  passwordReset PasswordReset?
   identities AuthIdentity[]
   projects   Project[]
   scripts    Script[]
@@ -43,6 +44,16 @@ model User {
   audioJobs         AudioGenerationJob[]
   analysisJobs      StoryAnalysisJob[]
   animationProjects AnimationProject[]
+}
+
+model PasswordReset {
+  userId    Int      @id
+  tokenHash String   @unique
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([expiresAt])
 }
 
 model PendingRegistration {
@@ -330,6 +341,7 @@ model SceneAudio {
 
   jobItem AudioGenerationJobItem? @relation(fields: [jobItemId], references: [id], onDelete: SetNull)
 
+  @@index([filePath])
   @@index([sceneId])
   @@index([voiceId])
 }
@@ -351,6 +363,7 @@ model AudioAsset {
 
   story AudioStory @relation(fields: [storyId], references: [id], onDelete: Cascade)
 
+  @@index([filePath])
   @@index([storyId])
 }
 
@@ -541,24 +554,11 @@ model AdminRoleAudit {
   @@index([targetId, id])
 }
 
-// Non-secret configuration only. Provider keys are encrypted in ProviderCredential, never in public appConfig.
+// Non-secret configuration only. Provider keys stay in backend environment configuration.
 model Configuration {
   key       String   @id
   value     Json
   updatedAt DateTime @updatedAt
-}
-
-model ProviderCredential {
-  id          String   @id @default(uuid())
-  provider    String
-  name        String
-  encrypted   String
-  fingerprint String
-  suffix      String
-  enabled     Boolean  @default(true)
-  createdAt   DateTime @default(now())
-  @@unique([provider, fingerprint])
-  @@index([provider, enabled])
 }
 
 // Ledger references make reservations, refunds, grants and payment credits idempotent.
@@ -604,4 +604,17 @@ model CreditPurchase {
   user User @relation(fields: [userId], references: [id], onDelete: Restrict)
   @@unique([userId, requestId])
   @@index([userId, createdAt])
+}
+
+// Upload receipts and deletion tombstones. No provider credentials are stored here.
+model StorageObject {
+  id String @id @default(uuid())
+  location String @unique
+  scope String
+  cleanupToken String?
+  status String @default("UPLOADING")
+  nextCleanupAt DateTime
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  @@index([status, nextCleanupAt])
 }

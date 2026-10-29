@@ -9,7 +9,7 @@ NestJS backend for the separate AutoCanvas user/admin applications. PostgreSQL +
 | [Admin/user auth and superadmin](docs/admin-auth.md) | Simple flow, file map, permissions, sessions, bootstrap, optional features and security decisions. |
 | [API overview](docs/api-overview.md)                 | Current route families, client contracts and response/error conventions.                           |
 | [Audio and analysis flow](docs/audio-flow.md)        | Job states, retries, cancellation, usage limits and relevant service files.                        |
-| [Storage and download names](docs/storage.md)        | Actual local/Supabase layout, playback/export behavior and pending storage work.                   |
+| [Storage and download names](docs/storage.md)        | Actual local/Supabase/R2 layout, playback/exports and tracked-upload cleanup.                   |
 | [Operations and troubleshooting](docs/operations.md) | Setup, migration/build/test commands and operating boundaries.                                     |
 
 For the three-repository architecture and user UI, see `autocanvas-web/docs/architecture.md` and its README in the frontend repository. Admin frontend status lives in the `autocanvas-admin` README.
@@ -71,11 +71,11 @@ and [audio flow](docs/audio-flow.md).
 
 ## Admin runtime controls
 
-Super Admin now manages shared web text (English/Hindi), public JSON app settings, new-AI/provider feature switches, analysis and outline model settings, one encrypted key per provider (Gemini/OpenAI), multi-scene recovery settings and credits pricing. Read [API overview](docs/api-overview.md), [operations](docs/operations.md) and [audio flow](docs/audio-flow.md) before deployment. Apply the ProviderCredential migration and configure server-only AI_KEYS_ENCRYPTION_KEY before adding/importing keys. Existing .env credentials remain fallback until managed mode is explicitly enabled. Credits billing and Razorpay INR checkout are implemented; activation requires merchant configuration. See operations for setup and limitations.
+Super Admin now manages shared web text (English/Hindi), public JSON app settings, new-AI/provider feature switches, analysis and outline model settings, multi-scene recovery settings and credits pricing. Read [API overview](docs/api-overview.md), [operations](docs/operations.md) and [audio flow](docs/audio-flow.md) before deployment. Provider credentials are managed only through backend GEMINI_API_KEY / OPENAI_API_KEY environment settings. Apply migration `20261028143000_env_only_provider_keys` and regenerate Prisma when upgrading; it removes stored credentials and source flags, preserving models and feature settings. Credits billing and Razorpay INR checkout are implemented; activation requires merchant configuration. See operations for setup and limitations.
 
-The public app bootstrap is `GET /app-config` returning appStrings/appSettings/locale/features. Local frontend defaults remain the fallback. Admin saves reuse one existing AppSetting writer; encrypted provider credentials stay separate. No generated string catalog, new config table or schema migration is required. See the frontend guide for the four-step request/context/hook flow.
+The public app bootstrap is `GET /app-config` returning appStrings/appSettings/locale/features. Local frontend defaults remain the fallback. Admin saves reuse one existing AppSetting writer; provider credentials stay in the backend environment. No generated string catalog, new config table or schema migration is required. See the frontend guide for the four-step request/context/hook flow.
 
-Automatic provider key switching is removed. Only GEMINI_API_KEY / OPENAI_API_KEY or one explicitly managed key per provider are used; legacy multi-key env flags and per-key quota controls are ignored. See operations for safe handling of legacy saved rows.
+Automatic provider key switching is removed. Only GEMINI_API_KEY / OPENAI_API_KEY are used; legacy multi-key env flags and per-key quota controls are ignored. See operations for environment-only credential deployment.
 
 
 Configuration uses the native-JSON `Configuration` Prisma model. Before running

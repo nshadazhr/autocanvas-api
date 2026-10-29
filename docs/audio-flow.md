@@ -80,9 +80,11 @@ Shared PostgreSQL limits below apply to TTS and restricted diagnostics, across i
 | AUDIO_RECOVERY_RETRY_DELAY_MS                              | 60,000                   |
 | AUDIO_RETRY_SCAN_INTERVAL_MS                               | 30,000                   |
 
-Configured limits must be positive integers. Shared time buckets use fixed UTC boundaries. Provider calls have a 90-second timeout.
+The six request/character budgets above are managed in admin **Audio Configuration** (`/audio-settings`) and stored in `Configuration.backend_settings.processing`. Saved values take precedence over the listed legacy environment variables, then code defaults. Each new non-analysis admission reads the settings; existing usage buckets are preserved when limits change. Request budgets accept integers 1–1,000,000; daily character budgets accept 1–1,000,000,000. Recovery attempts/delay and `retryScanIntervalMs` also use this saved section. The scan interval defaults to 30,000 ms and accepts integers 1,000–1,000,000 ms. Saved changes apply after the next scan without restarting the API. The next timer starts after the current scan completes, preventing overlapping scanner ticks. A settings-read failure retains the last known interval (startup falls back to legacy environment/default), and shutdown prevents rescheduling. Concurrency, per-call size and analysis bounds remain environment-backed.
 
-Gemini TTS, Gemini/OpenAI analysis and OpenAI outlines use each provider's single configured key. Analysis model/provider routing is independent of credentials: there is no automatic key rotation, key fallback pool or per-key RPM/RPD counter. GEMINI_API_KEYS, GEMINI_MULTI_KEY_ENABLED and the old GEMINI_RPM_LIMIT/GEMINI_RPD_LIMIT settings are ignored. Shared AI usage/security controls remain independent. A TTS 429 returns ProviderRateLimitError with the provider retry hint (or 60 seconds), allowing the existing multi-scene job scheduler to wait and retry the same key; the provider client does not try another key. Authentication/content errors are returned without key failover. Existing single-voice errors, cancellation, network recovery and downloads retain their flow. Manual key replacement affects subsequent requests; an in-flight SDK request keeps its captured key.
+Shared time buckets use fixed UTC boundaries. These budgets count admitted attempts (including failed provider calls) and input characters, not tokens or wallet credits. Analysis still bypasses these budgets and concurrency leases. Provider calls have a 90-second timeout.
+
+Gemini TTS, Gemini/OpenAI analysis and OpenAI outlines use each provider's single backend environment key (`GEMINI_API_KEY` / `OPENAI_API_KEY`). Analysis model/provider routing is independent of credentials: there is no automatic key rotation, key fallback pool or per-key RPM/RPD counter. GEMINI_API_KEYS, GEMINI_MULTI_KEY_ENABLED and the old GEMINI_RPM_LIMIT/GEMINI_RPD_LIMIT settings are ignored. Shared AI usage/security controls remain independent. A TTS 429 returns ProviderRateLimitError with the provider retry hint (or 60 seconds), allowing the existing multi-scene job scheduler to wait and retry the same key; the provider client does not try another key. Authentication/content errors are returned without key failover. Existing single-voice errors, cancellation, network recovery and downloads retain their flow. Updating environment keys requires restarting the backend; an in-flight SDK request keeps its captured key.
 
 ## Verification and maintenance
 
@@ -90,7 +92,7 @@ Use `vitest.audio-flow.config.ts` with a disposable local `_test` database. It c
 
 Before changing this flow, check no-job, first generation, waiting, partial failure, cancellation, reload and previous-audio scenarios. Reuse the existing locks/revision/adapter helpers. Do not couple file naming to guessed URLs or replace persisted retry state with browser-only state.
 
-Runtime controls: new analysis/audio/outline submissions enforce their feature flag and maintenance setting. Provider-disabled or missing-credential configuration errors are terminal, not Google busy retries. Multi-scene recovery reads configured attempts/delay at processing start; Gemini audio RPM/RPD settings are refreshed with the key list. Credentials do not change an already-sent request. See operations.md for environment/managed-mode and encryption details. Pricing values are not used for charging in this change.
+Runtime controls: new analysis/audio/outline submissions enforce their feature flag and maintenance setting. Provider-disabled or missing-credential configuration errors are terminal, not Google busy retries. Multi-scene recovery reads configured attempts/delay at processing start; shared request/character budgets are read at each non-analysis admission. Credentials do not change an already-sent request. See operations.md for environment-only credential setup and migration. Pricing values are not used for charging in this change.
 
 ## Credit settlement
 
@@ -185,3 +187,7 @@ UTC cohort, latency and pagination semantics. Metrics cover currently recorded
 analysis requests; audio/script/images/key-specific monitoring are not inferred
 from this data. Original script/results/attempts remain available through linked
 job details for manual quality review.
+
+## Upload retention and orphan cleanup
+
+New uploads receive durable StorageObject receipts before provider I/O. Scene audio, single-voice assets and combined exports validate/lock the receipt in their asset-save transaction; billing and job ownership checks retain their existing transactions. An expired/claimed upload fails safely rather than creating a broken reference. Hourly cleanup removes only unreferenced tracked audio/temp files after a 24-hour grace period, preserving saved history and active work. Failed/late provider operations retain retryable cleanup state. Existing/manual objects are untouched. Apply the storage-cleanup migration before deployment; see [storage cleanup](storage.md#automatic-cleanup-of-tracked-uploads).

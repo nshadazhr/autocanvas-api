@@ -1,7 +1,8 @@
 import { ProviderCredentialsService } from '../settings/provider-credentials.service.js';
 import { AppSettingsService } from '../settings/app-settings.service.js';
+import { AnalysisSettingsService } from '../settings/analysis-settings.service.js';
 import { AiUsageService } from './usage/ai-usage.service.js';
-import { ForbiddenException } from '@nestjs/common';
+import { ForbiddenException, ServiceUnavailableException } from '@nestjs/common';
 import { Injectable } from '@nestjs/common';
 import { GoogleGenAI } from '@google/genai';
 import { ConfigService } from '@nestjs/config';
@@ -15,7 +16,8 @@ export class AiService {
 		private readonly aiPromptService: AiPromptService,
 		private readonly usage: AiUsageService,
 		private readonly settings: AppSettingsService,
-		private readonly credentials: ProviderCredentialsService
+		private readonly credentials: ProviderCredentialsService,
+		private readonly analysisSettings: AnalysisSettingsService
 	) {}
 
 	async assertAnalysisEnabled() {
@@ -40,11 +42,16 @@ export class AiService {
 
 	async testGemini(userId: number) {
 		this.assertDiagnosticsAccess(userId);
+		const model = (await this.analysisSettings.get()).providers.gemini.primaryModel;
+		if (!model)
+			throw new ServiceUnavailableException(
+				'Configure an enabled Gemini model in Providers & Models before testing Gemini.'
+			);
 		return this.usage.execute(userId, 'diagnostics', 40, async () => {
 			const response = await (
 				await this.geminiClient()
 			).models.generateContent({
-				model: this.configService.get<string>('GEMINI_MODEL', 'gemini-3.5-flash'),
+				model,
 				contents: 'Reply with exactly: Gemini connected'
 			});
 			return response.text;
