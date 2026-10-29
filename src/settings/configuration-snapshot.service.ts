@@ -58,7 +58,7 @@ export class ConfigurationSnapshotService {
 			providerStatus,
 			paymentStatus: {
 				provider: 'razorpay',
-				enabled: this.config.get<string>('RAZORPAY_ENABLED') === 'true',
+				enabled: (await this.settings.section('payments')).values.checkoutEnabled === true,
 				configured: ['RAZORPAY_KEY_ID', 'RAZORPAY_KEY_SECRET', 'RAZORPAY_WEBHOOK_SECRET'].every(
 					key => !!this.config.get<string>(key)?.trim()
 				)
@@ -66,7 +66,16 @@ export class ConfigurationSnapshotService {
 		};
 		if (debug) {
 			const effectiveConfig: Record<string, unknown> = {};
-			for (const name of ['features', 'processing', 'security', 'storage', 'models', 'pricing'] as const) {
+			for (const name of [
+				'features',
+				'maintenance',
+				'processing',
+				'security',
+				'storage',
+				'payments',
+				'models',
+				'pricing'
+			] as const) {
 				const section = await this.settings.section(name);
 				const [group, path] = configurationGroups[name] as readonly string[];
 				const root = objectValue(allConfig[group!]);
@@ -77,13 +86,14 @@ export class ConfigurationSnapshotService {
 							{
 								outlineModel: 'OPENAI_MODEL',
 								cleanupEnabled: 'STORAGE_CLEANUP_ENABLED',
+								checkoutEnabled: 'RAZORPAY_ENABLED',
 								...processingEnvironment,
 								...loginSecurityEnvironment
 							} as Record<string, string>
 						)[key];
 						const raw = env ? this.config.get<string>(env) : undefined;
 						const fromEnvironment =
-							key === 'cleanupEnabled'
+							key === 'cleanupEnabled' || key === 'checkoutEnabled'
 								? raw !== undefined
 								: key === 'outlineModel'
 									? !!raw?.trim()

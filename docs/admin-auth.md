@@ -6,7 +6,7 @@ Is document ka purpose hai ki auth code baad mein samajhna aasaan rahe. Function
 
 - **USER**: normal application use karta hai.
 - **ADMIN**: admin login/check use kar sakta hai; doosre accounts ke roles manage nahi kar sakta.
-- **SUPERADMIN**: admin access ke saath role management aur role-audit APIs use kar sakta hai. Sensitive settings ke future endpoints is guard ko reuse kar sakte hain; settings feature abhi implement nahi hua hai.
+- **SUPERADMIN**: admin access ke saath role management aur role-audit APIs use kar sakta hai. Private runtime settings endpoints bhi current SUPERADMIN guard enforce karte hain.
 
 User, admin aur superadmin ke liye teen alag login systems nahi hain. User/admin dono `AuthService.login()` aur `TokenService` reuse karte hain. Superadmin bhi admin login use karta hai; uske permissions current database role se decide hote hain.
 
@@ -142,7 +142,7 @@ With `AUDIO_FLOW_TEST_DATABASE_URL` pointing to a disposable localhost database 
 npx vitest run --config vitest.password-reset.config.ts
 ```
 
-The PostgreSQL/HTTP suite covers eligibility/generic response bodies, digest storage, expiry/replacement/replay, real password login before/after reset, both session realms, concurrent consumption, transaction rollback, input/origin/rate protections and mocked mail failures. Sender tests do not send real email. All 7 reset tests and 20 existing auth tests passed against an isolated local database. Migration deployment was verified there and the single additive migration was applied to the verified local app database. Live inbox delivery remains an operational verification.
+The PostgreSQL/HTTP suite covers eligibility/generic response bodies, digest storage, expiry/replacement/replay, real password login before/after reset, both session realms, concurrent consumption, transaction rollback, input/origin/rate protections and mocked mail failures. Sender tests do not send real email. Migration deployment was verified there and the single additive migration was applied to the verified local app database. Live inbox delivery remains an operational verification.
 
 ## Password-login rate limits
 
@@ -167,7 +167,7 @@ AUDIO_FLOW_TEST_DATABASE_URL=postgresql://postgres@127.0.0.1:55439/autocanvas_au
 
 The HTTP/PostgreSQL suite covers roles, sensitive logging, logout/replay, cross-application tokens, demotion, invalid/legacy tokens, input validation, concurrency/rate limits, independent sessions, origin checks and production cookie attributes. The audio/analysis regression suite remains separate under vitest.audio-flow.config.ts and uses a JWT-verification test double; real session enforcement is exercised by the auth suite.
 
-The admin frontend was not changed. Production deployment, live administrator accounts and email/Google provider calls were not used for these tests.
+Automated fixtures do not establish production deployment or live provider delivery.
 
 ## Superadmin role management
 

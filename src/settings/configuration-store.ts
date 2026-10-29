@@ -5,9 +5,11 @@ export const configurationGroups = {
 	'web-settings': ['app_settings'],
 	'web-strings': ['app_strings'],
 	features: ['backend_settings', 'features'],
+	maintenance: ['backend_settings', 'maintenance'],
 	processing: ['backend_settings', 'processing'],
 	security: ['backend_settings', 'security'],
 	storage: ['backend_settings', 'storage'],
+	payments: ['backend_settings', 'payments'],
 	models: ['openai_settings'],
 	pricing: ['credits_settings']
 } as const;

@@ -92,7 +92,7 @@ Use `vitest.audio-flow.config.ts` with a disposable local `_test` database. It c
 
 Before changing this flow, check no-job, first generation, waiting, partial failure, cancellation, reload and previous-audio scenarios. Reuse the existing locks/revision/adapter helpers. Do not couple file naming to guessed URLs or replace persisted retry state with browser-only state.
 
-Runtime controls: new analysis/audio/outline submissions enforce their feature flag and maintenance setting. Provider-disabled or missing-credential configuration errors are terminal, not Google busy retries. Multi-scene recovery reads configured attempts/delay at processing start; shared request/character budgets are read at each non-analysis admission. Credentials do not change an already-sent request. See operations.md for environment-only credential setup and migration. Pricing values are not used for charging in this change.
+Runtime controls: new analysis/audio/outline submissions enforce their feature flag and maintenance setting. Maintenance closes new admission; accepted jobs may continue scene/provider work because provider checks enforce only their explicit provider switch. Turning a provider OFF can still stop later calls in an accepted job. Maintenance does not automatically drain workers, cancel jobs or suppress credits/ownership checks. Provider-disabled or missing-credential configuration errors are terminal, not Google busy retries. Multi-scene recovery reads configured attempts/delay at processing start; shared request/character budgets are read at each non-analysis admission. Credentials do not change an already-sent request. See README.md for environment-only credential setup and migration. Pricing values are not used for charging in this change.
 
 ## Credit settlement
 
@@ -158,7 +158,7 @@ a concurrently leased worker. Terminal-failure coverage also replaces worker own
 between the optimistic check and settlement, verifies the hold stays reserved,
 and verifies the replacement’s successful audio completes the charge. These use real disposable PostgreSQL with stubbed
 providers/storage and assert credit reservations/settlement as well as status.
-See the remaining critical audit findings in [operations](operations.md#critical-audit-after-recovery-fixes-2026-10-27).
+See the remaining critical audit findings in [developer setup](../README.md).
 
 ## Analysis code ownership
 

@@ -389,6 +389,225 @@ describe.skipIf(!url)('Super Admin analysis-model settings', () => {
 			delete configValues.STORAGE_CLEANUP_ENABLED;
 		}
 	});
+
+	it('allows only Super Admin notice edits and publishes an allowlisted advance warning', async () => {
+		const route = '/admin/config/maintenance';
+		const values = {
+			noticeEnabled: true,
+			message: '  Please save your work.  ',
+			earlyReminderMinutes: 45,
+			soonReminderMinutes: 15,
+			finalReminderMinutes: 3,
+			startsAt: new Date(Date.now() + 3600000).toISOString(),
+			endsAt: new Date(Date.now() + 7200000).toISOString()
+		};
+		for (const method of ['get', 'patch'] as const) {
+			for (const [token, status] of [
+				[undefined, 401],
+				[memberToken, 401],
+				[adminToken, 403]
+			] as const) {
+				const req = request(app.getHttpServer())[method](route);
+				if (token) req.set(auth(token));
+				await req.send(method === 'patch' ? { values } : undefined).expect(status);
+			}
+		}
+		await request(app.getHttpServer())
+			.patch(route)
+			.set(auth(superToken))
+			.set('Origin', 'https://untrusted.invalid')
+			.send({ values })
+			.expect(403);
+		await request(app.getHttpServer()).patch(route).set(auth(superToken)).send({ values }).expect(200);
+		const read = await request(app.getHttpServer()).get(route).set(auth(superToken)).expect(200);
+		expect(read.headers['cache-control']).toBe('private, no-store');
+		const config = await request(app.getHttpServer()).get('/app-config').expect(200);
+		expect(config.headers['cache-control']).toBe('no-store');
+		expect(config.body.maintenanceNotice).toEqual({
+			enabled: true,
+			message: values.message.trim(),
+			startsAt: values.startsAt,
+			endsAt: values.endsAt,
+			reminderMinutes: [45, 15, 3]
+		});
+		expect(config.body.features.maintenanceMode).toBe(false);
+		expect(config.body).not.toHaveProperty('maintenance');
+		expect(JSON.stringify(config.body)).not.toContain('noticeEnabled');
+		expect((await new AppSettingsService(prisma as any, config as any).section('maintenance')).values.message).toBe(
+			values.message.trim()
+		);
+		const debug = await request(app.getHttpServer()).get('/admin/config/debug').set(auth(superToken)).expect(200);
+		expect(debug.body.effectiveConfig.backend_settings.maintenance.noticeEnabled).toEqual({
+			value: true,
+			source: 'database'
+		});
+	});
+	it('validates notice types, bounded plain text and UTC window atomically, including partial resets', async () => {
+		const values = {
+			noticeEnabled: true,
+			message: '<b>Literal notice</b>',
+			earlyReminderMinutes: 30,
+			soonReminderMinutes: 10,
+			finalReminderMinutes: 2,
+			startsAt: new Date(Date.now() + 3600000).toISOString(),
+			endsAt: new Date(Date.now() + 7200000).toISOString()
+		};
+		await settings.updateSection('maintenance', values);
+		for (const patch of [
+			{ noticeEnabled: 'true' },
+			{ earlyReminderMinutes: 0 },
+			{ earlyReminderMinutes: 1441 },
+			{ soonReminderMinutes: 1.5 },
+			{ finalReminderMinutes: '2' },
+			{ soonReminderMinutes: 30 },
+			{ earlyReminderMinutes: 5 },
+			{ finalReminderMinutes: 10 },
+			{ message: 'x'.repeat(501) },
+			{ message: '   ' },
+			{ startsAt: '2026-10-29T10:00' },
+			{ startsAt: '2026-02-30T00:00:00.000Z' },
+			{ endsAt: values.startsAt },
+			{ startsAt: null },
+			{ apiKey: 'not-accepted' }
+		]) {
+			await request(app.getHttpServer())
+				.patch('/admin/config/maintenance')
+				.set(auth(superToken))
+				.send({ values: patch })
+				.expect(400);
+			expect((await settings.section('maintenance')).values).toEqual(values);
+		}
+		await settings.updateSection('maintenance', { noticeEnabled: false });
+		expect((await settings.appConfig()).maintenanceNotice).toBeNull();
+		await settings.updateSection('maintenance', {
+			noticeEnabled: null,
+			message: null,
+			startsAt: null,
+			endsAt: null
+		});
+		expect((await settings.section('maintenance')).values).toEqual({
+			noticeEnabled: false,
+			message: '',
+			startsAt: '',
+			endsAt: '',
+			earlyReminderMinutes: 30,
+			soonReminderMinutes: 10,
+			finalReminderMinutes: 2
+		});
+	});
+	it('replaces legacy interval settings with threshold defaults and serializes competing schedule edits', async () => {
+		await prisma.configuration.upsert({
+			where: { key: 'backend_settings' },
+			create: { key: 'backend_settings', value: { maintenance: { reminderIntervalMinutes: 5 } } },
+			update: { value: { maintenance: { reminderIntervalMinutes: 5 } } }
+		});
+		const values = (await settings.section('maintenance')).values;
+		expect(values).toMatchObject({ earlyReminderMinutes: 30, soonReminderMinutes: 10, finalReminderMinutes: 2 });
+		expect(values).not.toHaveProperty('reminderIntervalMinutes');
+		const result = await Promise.allSettled([
+			settings.updateSection('maintenance', { earlyReminderMinutes: 11 }),
+			settings.updateSection('maintenance', { soonReminderMinutes: 20 })
+		]);
+		expect(result.filter(item => item.status === 'rejected')).toHaveLength(1);
+		const saved = (await settings.section('maintenance')).values;
+		expect(Number(saved.earlyReminderMinutes)).toBeGreaterThan(Number(saved.soonReminderMinutes));
+		expect(Number(saved.soonReminderMinutes)).toBeGreaterThan(Number(saved.finalReminderMinutes));
+		const raw = await prisma.configuration.findUnique({ where: { key: 'backend_settings' } });
+		expect((raw!.value as any).maintenance).not.toHaveProperty('reminderIntervalMinutes');
+	});
+	it('expires announcements without toggling real maintenance and preserves valid concurrent edits', async () => {
+		await settings.updateSection('features', { maintenanceMode: true });
+		await settings.updateSection('maintenance', {
+			noticeEnabled: true,
+			message: 'Past window',
+			startsAt: new Date(Date.now() - 7200000).toISOString(),
+			endsAt: new Date(Date.now() - 3600000).toISOString()
+		});
+		expect((await settings.appConfig()).maintenanceNotice).toBeNull();
+		expect((await settings.section('features')).values.maintenanceMode).toBe(true);
+		await settings.updateSection('maintenance', {
+			noticeEnabled: false,
+			startsAt: new Date(Date.now() + 3600000).toISOString(),
+			endsAt: new Date(Date.now() + 7200000).toISOString()
+		});
+		const result = await Promise.allSettled([
+			settings.updateSection('maintenance', { noticeEnabled: true }),
+			settings.updateSection('maintenance', { startsAt: null })
+		]);
+		expect(result.filter(x => x.status === 'rejected')).toHaveLength(1);
+		const current = (await settings.section('maintenance')).values;
+		expect(
+			current.noticeEnabled === false || (typeof current.startsAt === 'string' && current.startsAt.length > 0)
+		).toBe(true);
+		expect((await settings.section('features')).values.maintenanceMode).toBe(true);
+	});
+	it('restricts checkout control to Super Admin and preserves private persisted overrides without the env flag', async () => {
+		const route = '/admin/config/payments';
+		for (const method of ['get', 'patch'] as const) {
+			for (const [token, status] of [
+				[undefined, 401],
+				[memberToken, 401],
+				[adminToken, 403]
+			] as const) {
+				const req = request(app.getHttpServer())[method](route);
+				if (token) req.set(auth(token));
+				await req.send(method === 'patch' ? { values: { checkoutEnabled: true } } : undefined).expect(status);
+			}
+		}
+		configValues.RAZORPAY_ENABLED = 'true';
+		try {
+			expect((await settings.section('payments')).values.checkoutEnabled).toBe(true);
+			await request(app.getHttpServer())
+				.patch(route)
+				.set(auth(superToken))
+				.set('Origin', 'https://untrusted.invalid')
+				.send({ values: { checkoutEnabled: false } })
+				.expect(403);
+			for (const value of ['true', 0, 1])
+				await request(app.getHttpServer())
+					.patch(route)
+					.set(auth(superToken))
+					.send({ values: { checkoutEnabled: value } })
+					.expect(400);
+			await request(app.getHttpServer())
+				.patch(route)
+				.set(auth(superToken))
+				.send({ values: { apiKey: 'not-accepted' } })
+				.expect(400);
+			await request(app.getHttpServer())
+				.patch(route)
+				.set(auth(superToken))
+				.send({ values: { checkoutEnabled: false } })
+				.expect(200);
+			const fresh = new AppSettingsService(prisma as any, { get: () => undefined } as any);
+			expect((await fresh.section('payments')).values.checkoutEnabled).toBe(false);
+			await request(app.getHttpServer())
+				.patch(route)
+				.set(auth(superToken))
+				.send({ values: { checkoutEnabled: true } })
+				.expect(200);
+			expect((await fresh.section('payments')).values.checkoutEnabled).toBe(true);
+			const read = await request(app.getHttpServer()).get(route).set(auth(superToken)).expect(200);
+			expect(read.headers['cache-control']).toBe('private, no-store');
+			const debug = await request(app.getHttpServer())
+				.get('/admin/config/debug')
+				.set(auth(superToken))
+				.expect(200);
+			expect(debug.body.effectiveConfig.backend_settings.payments.checkoutEnabled).toEqual({
+				value: true,
+				source: 'database'
+			});
+			expect(debug.body.paymentStatus.enabled).toBe(true);
+			expect(
+				JSON.stringify((await request(app.getHttpServer()).get('/app-config').expect(200)).body)
+			).not.toContain('checkoutEnabled');
+			await settings.updateSection('payments', { checkoutEnabled: null });
+			expect((await settings.section('payments')).values.checkoutEnabled).toBe(true);
+			expect((await fresh.section('payments')).values.checkoutEnabled).toBe(false);
+		} finally {
+			delete configValues.RAZORPAY_ENABLED;
+		}
+	});
 	it('restricts login security reads/writes to current Super Admins and trusted origins', async () => {
 		const route = '/admin/config/security';
 		const payload = { values: { adminLoginAccountLimit: 6 } };
@@ -485,7 +704,13 @@ describe.skipIf(!url)('Super Admin analysis-model settings', () => {
 			.get('/app-config')
 			.expect(200)
 			.expect('Cache-Control', 'no-store');
-		expect(Object.keys(result.body).sort()).toEqual(['appSettings', 'appStrings', 'features', 'locale']);
+		expect(Object.keys(result.body).sort()).toEqual([
+			'appSettings',
+			'appStrings',
+			'features',
+			'locale',
+			'maintenanceNotice'
+		]);
 		expect(result.body.appSettings).toEqual({});
 		expect(result.body.appStrings).toEqual({});
 		expect(JSON.stringify(result.body)).not.toContain('gpt-private-test');
@@ -815,6 +1040,11 @@ describe.skipIf(!url)('Super Admin analysis-model settings', () => {
 		await settings.updateSection('features', { analysisEnabled: true });
 		await expect(settings.assertEnabled('analysisEnabled')).resolves.toBeUndefined();
 		await settings.updateSection('features', { maintenanceMode: true });
-		await expect(settings.assertEnabled('analysisEnabled')).rejects.toThrow('temporarily disabled');
+		for (const key of ['audioEnabled', 'analysisEnabled', 'scriptEnabled'] as const)
+			await expect(settings.assertEnabled(key)).rejects.toThrow('temporarily disabled');
+		for (const key of ['geminiEnabled', 'openaiEnabled'] as const)
+			await expect(settings.assertEnabled(key)).resolves.toBeUndefined();
+		await settings.updateSection('features', { geminiEnabled: false });
+		await expect(settings.assertEnabled('geminiEnabled')).rejects.toThrow('temporarily disabled');
 	});
 });

@@ -15,6 +15,46 @@ After every code change:
 Start with README.md for the documentation index. Update the relevant existing
 guide in docs/ and update the index if documentation is added or moved.
 
+## Required workflow for every agent
+
+1. Before making changes, read this repository's AGENTS.md, any applicable
+   nested instructions and README.md. Identify the existing guides affected by
+   the requested work; do not rely only on conversation history or old handoffs.
+2. For cross-repository changes, read the rules in every affected checkout. If
+   the private docs checkout is available with authorized access, read its
+   AGENTS.md and README.md and identify the owning internal guide as well.
+3. Before completing the task, update affected developer contracts and available
+   private guides in the same work session. Update indexes and references for
+   moved/added documents. Do not touch unrelated docs merely to show activity.
+4. If private docs or a sibling checkout cannot be accessed, continue authorized
+   work and explicitly identify the pending documentation update and reason.
+   Never claim all documentation is synchronized when an affected update is
+   pending. Do not copy restricted content into an accessible code repository.
+5. In the final handoff, state which docs changed (or why none were needed),
+   checks performed, commands not executed and any pending cross-repo update.
+   Documentation is part of task completion, not an optional follow-up. These
+   instructions require agent action; they are not automatic background sync.
+
+## Documentation navigation for agents
+
+- Read this file for rules, then README.md for local setup/checks and the
+  developer documentation index. Frontends retain docs/frontend-guide.md;
+  backend retains API/auth/audio/storage contracts listed in README.md.
+- Detailed architecture, owner operations, environment/release planning and
+  verification history are maintained in the separate private sibling checkout
+  ../autocanvas-internal-docs. If available and authorized, read its AGENTS.md
+  and README.md, then update the affected primary guide after relevant work.
+- Update necessary developer contracts here as well. Keep one primary location
+  per topic; do not copy private runbooks/plans/history into this repository or
+  recreate removed architecture/development/operations/handoff documents here.
+- A developer without private access must still be able to run this app and
+  maintain its contracts. Continue authorized code work; report the specific
+  private-doc update as pending when that checkout/access is unavailable.
+- Verify current source before changing implemented/pending claims. Separate
+  current behavior, historical checks and deployment plans. Never invent test
+  results, and verify links/commands appropriate to the change.
+
+
 # Runtime configuration and environment rules
 
 - New or changed non-secret runtime controls (feature/maintenance switches,

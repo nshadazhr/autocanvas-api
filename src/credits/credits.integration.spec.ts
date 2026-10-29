@@ -1,3 +1,4 @@
+import { AppSettingsService } from '../settings/app-settings.service.js';
 import 'reflect-metadata';
 import { beforeAll, afterAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { randomUUID, createHmac } from 'node:crypto';
@@ -29,13 +30,15 @@ if (url && (new URL(url).hostname !== '127.0.0.1' || !new URL(url).pathname.ends
 describe.skipIf(!url)('Credit ledger and captured Razorpay payments', () => {
 	const prisma = new PrismaClient({ adapter: new PrismaPg({ connectionString: url! }) });
 	const credits = new CreditsService(prisma as any);
-	const settings = {
+	const settings: Record<string, string> = {
 		RAZORPAY_ENABLED: 'true',
 		RAZORPAY_KEY_ID: 'rzp_test_fixture',
 		RAZORPAY_KEY_SECRET: 'fixture-secret',
 		RAZORPAY_WEBHOOK_SECRET: 'fixture-webhook'
 	};
-	const payments = new PaymentsService(prisma as any, credits, new ConfigService(settings));
+	const config = new ConfigService(settings);
+	const runtime = new AppSettingsService(prisma as any, config);
+	const payments = new PaymentsService(prisma as any, credits, config, runtime);
 	const fakeFetch = vi.fn();
 	const users: number[] = [];
 	const packs: string[] = [];
@@ -138,6 +141,8 @@ describe.skipIf(!url)('Credit ledger and captured Razorpay payments', () => {
 		await app.init();
 	});
 	beforeEach(async () => {
+		settings.RAZORPAY_ENABLED = 'true';
+		await runtime.updateSection('payments', { checkoutEnabled: null });
 		await prisma.creditTransaction.deleteMany({ where: { userId: { in: users } } });
 		await prisma.creditPurchase.deleteMany({ where: { userId: { in: users } } });
 		await prisma.user.updateMany({
@@ -187,7 +192,80 @@ describe.skipIf(!url)('Credit ledger and captured Razorpay payments', () => {
 		await prisma.audioStory.deleteMany({ where: { userId: { in: users } } });
 		await prisma.user.deleteMany({ where: { id: { in: users } } });
 		await pricing({});
+		await runtime.updateSection('payments', { checkoutEnabled: null });
 		await prisma.$disconnect();
+	});
+
+	it('disables new orders without creating purchase rows or calling the provider, and resumes without restart', async () => {
+		await runtime.updateSection('payments', { checkoutEnabled: false });
+		const read = await request(app.getHttpServer())
+			.get('/credits/payments/config')
+			.set('Authorization', 'Bearer ' + userToken)
+			.expect(200);
+		expect(read.body).toEqual({ enabled: false, mode: 'disabled' });
+		expect(read.headers['cache-control']).toBe('private, no-store');
+		await request(app.getHttpServer())
+			.post('/credits/payments/orders')
+			.set('Authorization', 'Bearer ' + userToken)
+			.set('Origin', 'http://localhost:3100')
+			.send({ packId, requestId: randomUUID() })
+			.expect(503);
+		expect(await prisma.creditPurchase.count({ where: { userId } })).toBe(0);
+		expect(fakeFetch).not.toHaveBeenCalled();
+		await runtime.updateSection('payments', { checkoutEnabled: true });
+		expect(await payments.info()).toEqual({ enabled: true, mode: 'test' });
+		await order();
+		expect(fakeFetch).toHaveBeenCalledTimes(1);
+	});
+	it('verifies an existing captured payment while checkout is disabled', async () => {
+		const value = await order();
+		await runtime.updateSection('payments', { checkoutEnabled: false });
+		await request(app.getHttpServer())
+			.post('/credits/payments/' + value.purchaseId + '/verify')
+			.set('Authorization', 'Bearer ' + userToken)
+			.set('Origin', 'http://localhost:3100')
+			.send({ paymentId: 'pay_fixture', signature: signature(value.orderId) })
+			.expect(201);
+		expect(await balance()).toBe(150);
+		await webhook();
+		expect(await balance()).toBe(150);
+	});
+	it('reconciles existing orders and processes capture/refund/dispute webhooks while checkout is disabled', async () => {
+		const value = await order();
+		await runtime.updateSection('payments', { checkoutEnabled: false });
+		expect(await payments.refresh(userId, value.purchaseId)).toEqual({ status: 'PAID' });
+		await webhook();
+		expect(await balance()).toBe(150);
+		providerPayment.amount_refunded = 100;
+		await webhook('refund.processed');
+		await webhook('payment.dispute.created');
+		expect((await credits.wallet(userId)).blocked).toBe(true);
+		expect(await balance()).toBe(150);
+	});
+	it('fails closed on unavailable settings but preserves existing payment verification', async () => {
+		const value = await order();
+		const failed = vi.spyOn(runtime, 'section').mockRejectedValue(new Error('Settings unavailable'));
+		try {
+			expect(await payments.info()).toEqual({ enabled: false, mode: 'disabled' });
+			await expect(payments.create(userId, packId, randomUUID())).rejects.toThrow('Settings unavailable');
+			expect(await payments.verify(userId, value.purchaseId, 'pay_fixture', signature(value.orderId))).toEqual({
+				status: 'PAID'
+			});
+		} finally {
+			failed.mockRestore();
+		}
+	});
+	it('does not enable checkout without credentials even when the saved switch is enabled', async () => {
+		await runtime.updateSection('payments', { checkoutEnabled: true });
+		const secret = settings.RAZORPAY_KEY_SECRET;
+		delete settings.RAZORPAY_KEY_SECRET;
+		try {
+			expect(await payments.info()).toEqual({ enabled: false, mode: 'disabled' });
+			await expect(payments.create(userId, packId, randomUUID())).rejects.toThrow('not configured');
+			expect(fakeFetch).not.toHaveBeenCalled();
+		} finally {
+			settings.RAZORPAY_KEY_SECRET = secret;
+		}
 	});
 	it('reserves once, captures once, and cannot refund a completed generation', async () => {
 		await Promise.all([reserve('fixture:same'), reserve('fixture:same')]);

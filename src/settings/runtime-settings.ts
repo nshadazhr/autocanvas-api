@@ -8,8 +8,18 @@ export const runtimeDefaults = {
 		geminiEnabled: true,
 		openaiEnabled: true
 	},
+	maintenance: {
+		noticeEnabled: false,
+		message: '',
+		startsAt: '',
+		endsAt: '',
+		earlyReminderMinutes: 30,
+		soonReminderMinutes: 10,
+		finalReminderMinutes: 2
+	},
 	models: { outlineModel: 'gpt-4.1' },
 	storage: { cleanupEnabled: true },
+	payments: { checkoutEnabled: false },
 	security: { adminLoginAccountLimit: 5, adminLoginIpLimit: 30, loginAccountLimit: 10, loginIpLimit: 60 },
 	processing: {
 		maxRecoveryAttempts: 3,
