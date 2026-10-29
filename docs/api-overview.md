@@ -207,8 +207,7 @@ pack definitions and safe credential/payment availability. `GET /admin/config/de
 adds effective backend values and their sources. Both reuse origin/admin/superadmin
 guards and private/no-store headers; ordinary admins/users cannot access them.
 No credentials or environment dump is returned.
-There is no import route. See [operations](operations.md#grouped-configuration-storage-and-diagnostics)
-for group names, migration and verification boundaries. Existing section URLs,
+There is no import route. [configuration-store.ts](../src/settings/configuration-store.ts) defines the section/group mapping; see [developer setup](../README.md) for migration and test commands. Existing section URLs,
 analysis-model configuration and public app-config payloads remain available; provider keys are managed only through backend environment configuration.
 
 ## Admin analysis monitoring

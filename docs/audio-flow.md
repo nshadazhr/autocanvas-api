@@ -158,7 +158,7 @@ a concurrently leased worker. Terminal-failure coverage also replaces worker own
 between the optimistic check and settlement, verifies the hold stays reserved,
 and verifies the replacement’s successful audio completes the charge. These use real disposable PostgreSQL with stubbed
 providers/storage and assert credit reservations/settlement as well as status.
-See the remaining critical audit findings in [operations](operations.md#critical-audit-after-recovery-fixes-2026-10-27).
+See the remaining critical audit findings in [developer setup](../README.md).
 
 ## Analysis code ownership
 
