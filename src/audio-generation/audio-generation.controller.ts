@@ -1,3 +1,4 @@
+import { attachment } from './utils/audio-storage-names.js';
 import { Controller, Get, Param, ParseIntPipe, Post, Req, UseGuards } from '@nestjs/common';
 import { audioGenerationService } from './audio-generation.service.js';
 import type { AuthenticatedRequest } from '../common/interfaces/authenticated-request.interface.js';
@@ -124,12 +125,12 @@ export class AudioGenerationController {
 		// Verify ownership and retrieve file metadata
 		const file = await this.audioGenerationService.getExportedAudioFile(assetId, req.user.id);
 
-		// Read exported WAV from Local or Supabase
+		// Read exported WAV from its saved storage provider.
 		const storedFile = await this.storageService.getFile(file.filePath);
 
 		res.setHeader('Content-Type', file.mimeType);
 		res.setHeader('Content-Length', storedFile.size);
-		res.setHeader('Content-Disposition', `attachment; filename="${file.filename}"`);
+		res.setHeader('Content-Disposition', attachment(file.filename));
 		res.setHeader('Cache-Control', 'private, no-store');
 
 		return new StreamableFile(storedFile.stream);
@@ -154,7 +155,7 @@ export class AudioGenerationController {
 		const { stream, filename } = await this.audioGenerationService.downloadStoryAudioZip(storyId, req.user.id);
 
 		res.setHeader('Content-Type', 'application/zip');
-		res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+		res.setHeader('Content-Disposition', attachment(filename));
 		res.setHeader('Cache-Control', 'private, no-store');
 
 		return new StreamableFile(stream);

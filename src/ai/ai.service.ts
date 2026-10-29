@@ -1,5 +1,8 @@
+import { ProviderCredentialsService } from '../settings/provider-credentials.service.js';
+import { AppSettingsService } from '../settings/app-settings.service.js';
+import { AnalysisSettingsService } from '../settings/analysis-settings.service.js';
 import { AiUsageService } from './usage/ai-usage.service.js';
-import { ForbiddenException } from '@nestjs/common';
+import { ForbiddenException, ServiceUnavailableException } from '@nestjs/common';
 import { Injectable } from '@nestjs/common';
 import { GoogleGenAI } from '@google/genai';
 import { ConfigService } from '@nestjs/config';
@@ -8,17 +11,22 @@ import { StoryAnalysisSchema, type StoryAnalysisResult } from './schemas/story-a
 import { AiPromptService } from './services/ai-prompt.service.js';
 @Injectable()
 export class AiService {
-	private readonly gemini: GoogleGenAI;
-
 	constructor(
 		private readonly configService: ConfigService,
 		private readonly aiPromptService: AiPromptService,
-		private readonly usage: AiUsageService
-	) {
-		const apiKey = process.env.GEMINI_API_KEY;
+		private readonly usage: AiUsageService,
+		private readonly settings: AppSettingsService,
+		private readonly credentials: ProviderCredentialsService,
+		private readonly analysisSettings: AnalysisSettingsService
+	) {}
 
-		this.gemini = new GoogleGenAI({
-			apiKey,
+	async assertAnalysisEnabled() {
+		await this.settings.assertEnabled('analysisEnabled');
+	}
+	private async geminiClient() {
+		await this.settings.assertEnabled('geminiEnabled');
+		return new GoogleGenAI({
+			apiKey: await this.credentials.primary('gemini'),
 			httpOptions: { timeout: 90_000 }
 		});
 	}
@@ -34,9 +42,16 @@ export class AiService {
 
 	async testGemini(userId: number) {
 		this.assertDiagnosticsAccess(userId);
+		const model = (await this.analysisSettings.get()).providers.gemini.primaryModel;
+		if (!model)
+			throw new ServiceUnavailableException(
+				'Configure an enabled Gemini model in Providers & Models before testing Gemini.'
+			);
 		return this.usage.execute(userId, 'diagnostics', 40, async () => {
-			const response = await this.gemini.models.generateContent({
-				model: this.configService.get<string>('GEMINI_MODEL', 'gemini-3.5-flash'),
+			const response = await (
+				await this.geminiClient()
+			).models.generateContent({
+				model,
 				contents: 'Reply with exactly: Gemini connected'
 			});
 			return response.text;
@@ -47,7 +62,7 @@ export class AiService {
 		this.assertDiagnosticsAccess(userId);
 		return this.usage.execute(userId, 'diagnostics', 1, async () => {
 			const models = [];
-			for await (const model of await this.gemini.models.list())
+			for await (const model of await (await this.geminiClient()).models.list())
 				models.push({
 					name: model.name,
 					displayName: model.displayName,
@@ -57,15 +72,27 @@ export class AiService {
 		});
 	}
 
-	async analyzeStory(content: string, userId: number): Promise<StoryAnalysisResult> {
-		const model = this.configService.get<string>('GEMINI_MODEL', 'gemini-3.5-flash');
+	async getAnalysisModel(): Promise<string> {
+		return (await this.settings.analysisModel()).model;
+	}
+
+	async analyzeStory(
+		content: string,
+		userId: number,
+		selectedModel?: string,
+		onRequest?: () => Promise<void>
+	): Promise<StoryAnalysisResult> {
+		const model = selectedModel ?? (await this.getAnalysisModel());
 		const systemInstruction = await this.aiPromptService.getPrompt('story-analysis');
-		const response = await this.usage.execute(userId, 'analysis', content.length, () =>
-			this.gemini.models.generateContent({
+		const response = await this.usage.execute(userId, 'analysis', content.length, async () => {
+			const client = await this.geminiClient();
+			await onRequest?.();
+			return client.models.generateContent({
 				model,
 				contents: content,
 				config: {
 					systemInstruction: systemInstruction,
+					httpOptions: { retryOptions: { attempts: 1 } },
 					maxOutputTokens: 16_384,
 					responseMimeType: 'application/json',
 					responseSchema: {
@@ -101,8 +128,8 @@ export class AiService {
 						required: ['characters', 'scenes']
 					}
 				}
-			})
-		);
+			});
+		});
 
 		if (!response.text) {
 			throw new Error('Gemini returned an empty analysis response');
@@ -111,7 +138,9 @@ export class AiService {
 		try {
 			return StoryAnalysisSchema.parse(JSON.parse(response.text));
 		} catch {
-			throw Object.assign(new Error('AI returned invalid analysis data'), { code: 'INVALID_ANALYSIS_RESPONSE' });
+			throw Object.assign(new Error('AI returned invalid analysis data'), {
+				code: 'INVALID_ANALYSIS_RESPONSE'
+			});
 		}
 	}
 
@@ -120,8 +149,8 @@ export class AiService {
 			throw new Error('Speech text cannot be empty');
 		}
 
-		const response = await this.usage.execute(userId, 'tts', text.length, () =>
-			this.gemini.models.generateContent({
+		const response = await this.usage.execute(userId, 'tts', text.length, async () =>
+			(await this.geminiClient()).models.generateContent({
 				model,
 				contents: [
 					{
@@ -158,8 +187,9 @@ export class AiService {
 
 	async getGeminiStudioVoices(userId: number) {
 		this.assertDiagnosticsAccess(userId);
+		await this.settings.assertEnabled('geminiEnabled');
 		const ai = new GoogleGenAI({
-			apiKey: process.env.GEMINI_API_KEY!,
+			apiKey: await this.credentials.primary('gemini'),
 			httpOptions: { timeout: 90_000 }
 		});
 

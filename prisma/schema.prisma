@@ -11,8 +11,15 @@ datasource db {
 // USER & AUTHENTICATION
 // ==========================================
 
+enum UserRole {
+  USER
+  ADMIN
+  SUPERADMIN
+}
+
 model User {
   id                Int       @id @default(autoincrement())
+  role              UserRole  @default(USER)
   email             String    @unique
   name              String?
   password          String?
@@ -20,6 +27,14 @@ model User {
   created_at        DateTime  @default(now())
   email_verified_at DateTime?
 
+  creditBalance Int @default(0)
+  creditWelcomeGranted Boolean @default(false)
+  creditsBlocked Boolean @default(false)
+  creditTransactions CreditTransaction[]
+  creditPurchases CreditPurchase[]
+
+  authSessions AuthSession[]
+  passwordReset PasswordReset?
   identities AuthIdentity[]
   projects   Project[]
   scripts    Script[]
@@ -29,6 +44,16 @@ model User {
   audioJobs         AudioGenerationJob[]
   analysisJobs      StoryAnalysisJob[]
   animationProjects AnimationProject[]
+}
+
+model PasswordReset {
+  userId    Int      @id
+  tokenHash String   @unique
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([expiresAt])
 }
 
 model PendingRegistration {
@@ -130,10 +155,10 @@ model AudioStory {
 
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)
 
-  characters AudioCharacter[]
-  scenes     AudioScene[]
-  jobs       AudioGenerationJob[]
-  assets     AudioAsset[]
+  characters   AudioCharacter[]
+  scenes       AudioScene[]
+  jobs         AudioGenerationJob[]
+  assets       AudioAsset[]
   analysisJobs StoryAnalysisJob[]
 
   @@index([userId])
@@ -316,6 +341,7 @@ model SceneAudio {
 
   jobItem AudioGenerationJobItem? @relation(fields: [jobItemId], references: [id], onDelete: SetNull)
 
+  @@index([filePath])
   @@index([sceneId])
   @@index([voiceId])
 }
@@ -337,6 +363,7 @@ model AudioAsset {
 
   story AudioStory @relation(fields: [storyId], references: [id], onDelete: Cascade)
 
+  @@index([filePath])
   @@index([storyId])
 }
 
@@ -408,41 +435,186 @@ enum StoryAnalysisJobStatus {
 }
 
 model StoryAnalysisJob {
-  id              String @id @default(uuid())
-  storyId         Int
-  userId          Int
-  contentHash     String
-  contentSnapshot String
-  status          StoryAnalysisJobStatus @default(QUEUED)
-  attempts        Int @default(0)
-  nextRetryAt     DateTime?
-  leaseToken      String?
-  leaseExpiresAt  DateTime?
-  errorCode       String?
-  errorMessage    String?
-  source          String?
-  createdAt       DateTime @default(now())
-  updatedAt       DateTime @updatedAt
-  completedAt     DateTime?
-  story AudioStory @relation(fields: [storyId], references: [id], onDelete: Cascade)
-  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  id                 String                 @id @default(uuid())
+  storyId            Int
+  userId             Int
+  contentHash        String
+  contentSnapshot    String
+  resultSnapshot     Json?
+  successfulProvider String?
+  successfulModel    String?
+  attemptHistory     StoryAnalysisAttempt[]
+  status             StoryAnalysisJobStatus @default(QUEUED)
+  attempts           Int                    @default(0)
+  nextRetryAt        DateTime?
+  leaseToken         String?
+  leaseExpiresAt     DateTime?
+  errorCode          String?
+  providerHttpStatus Int?
+  errorMessage       String?
+  source             String?
+  createdAt          DateTime               @default(now())
+  updatedAt          DateTime               @updatedAt
+  completedAt        DateTime?
+  story              AudioStory             @relation(fields: [storyId], references: [id], onDelete: Cascade)
+  user               User                   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
   @@index([status, nextRetryAt])
   @@index([userId, status])
   @@index([storyId, createdAt])
 }
 
+enum AnalysisAttemptStatus {
+  RUNNING
+  COMPLETED
+  FAILED
+  CANCELLED
+  INTERRUPTED
+}
+
+enum AnalysisAttemptKind {
+  INITIAL
+  MODEL_FALLBACK
+  PROVIDER_FALLBACK
+  PRIMARY_RETRY
+}
+
+model StoryAnalysisAttempt {
+  id                 String                @id @default(uuid())
+  jobId              String
+  sequence           Int
+  provider           String
+  model              String
+  kind               AnalysisAttemptKind
+  status             AnalysisAttemptStatus @default(RUNNING)
+  startedAt          DateTime              @default(now())
+  responseAt         DateTime?
+  finishedAt         DateTime?
+  durationMs         Int?
+  errorCategory      String?
+  providerHttpStatus Int?
+  providerErrorCode  String?
+  errorMessage       String?
+  job                StoryAnalysisJob      @relation(fields: [jobId], references: [id], onDelete: Cascade)
+
+  @@unique([jobId, sequence])
+  @@index([provider, model, status, startedAt])
+}
+
 model AiUsageBucket {
-  key       String @id
-  requests  Int @default(0)
-  units     Int @default(0)
+  key       String   @id
+  requests  Int      @default(0)
+  units     Int      @default(0)
   expiresAt DateTime
 }
 
 model AiRequestLease {
-  id        String @id @default(uuid())
+  id        String   @id @default(uuid())
   userId    Int
   kind      String
   expiresAt DateTime
+
   @@index([expiresAt])
   @@index([userId, expiresAt])
+}
+
+// Revocable, independent browser sessions for the user app and admin dashboard.
+model AuthSession {
+  id String @id @default(uuid())
+  userId Int
+  realm String
+  refreshHash String
+  expiresAt DateTime
+  revokedAt DateTime?
+  createdAt DateTime @default(now())
+  user User @relation(fields:[userId],references:[id],onDelete:Cascade)
+  @@index([userId, realm])
+  @@index([expiresAt])
+}
+
+model AuthRateBucket {
+  key String @id
+  attempts Int @default(0)
+  expiresAt DateTime
+  @@index([expiresAt])
+}
+
+// Immutable role-change records; IDs/emails are snapshots, retained if accounts are removed.
+model AdminRoleAudit {
+  id Int @id @default(autoincrement())
+  actorId Int?
+  actorEmail String?
+  targetId Int
+  targetEmail String
+  action String
+  fromRole UserRole
+  toRole UserRole
+  reason String
+  createdAt DateTime @default(now())
+  @@index([targetId, id])
+}
+
+// Non-secret configuration only. Provider keys stay in backend environment configuration.
+model Configuration {
+  key       String   @id
+  value     Json
+  updatedAt DateTime @updatedAt
+}
+
+// Ledger references make reservations, refunds, grants and payment credits idempotent.
+model CreditTransaction {
+  id String @id @default(uuid())
+  userId Int
+  reference String @unique
+  amount Int
+  type String
+  status String
+  reason String
+  actorId Int?
+  storyId Int?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  user User @relation(fields: [userId], references: [id], onDelete: Restrict)
+  @@index([userId, createdAt, id])
+}
+model CreditPack {
+  id String @id @default(uuid())
+  name String
+  credits Int
+  amountPaise Int
+  active Boolean @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+model CreditPurchase {
+  id String @id @default(uuid())
+  userId Int
+  requestId String
+  packId String
+  packName String
+  credits Int
+  amountPaise Int
+  currency String @default("INR")
+  providerKeyId String
+  orderId String? @unique
+  paymentId String? @unique
+  status String @default("CREATING")
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  user User @relation(fields: [userId], references: [id], onDelete: Restrict)
+  @@unique([userId, requestId])
+  @@index([userId, createdAt])
+}
+
+// Upload receipts and deletion tombstones. No provider credentials are stored here.
+model StorageObject {
+  id String @id @default(uuid())
+  location String @unique
+  scope String
+  cleanupToken String?
+  status String @default("UPLOADING")
+  nextCleanupAt DateTime
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  @@index([status, nextCleanupAt])
 }

@@ -1,3 +1,5 @@
+import { storyFolder, storyDownloadName, storageLabel } from './utils/audio-storage-names.js';
+import { CreditsService } from '../credits/credits.service.js';
 import { AiCapacityError } from '../ai/usage/ai-capacity.error.js';
 import { safeAiError } from '../ai/usage/safe-ai-error.js';
 import { BadRequestException, Injectable, NotFoundException, OnModuleInit, OnModuleDestroy } from '@nestjs/common';
@@ -40,7 +42,8 @@ export class SingleVoiceService implements OnModuleInit, OnModuleDestroy {
 	constructor(
 		private readonly prisma: PrismaService,
 		private readonly tts: GeminiTtsService,
-		private readonly storageService: StorageService
+		private readonly storageService: StorageService,
+		private readonly credits: CreditsService
 	) {}
 
 	async create(userId: number, title: string, content: string) {
@@ -129,6 +132,7 @@ export class SingleVoiceService implements OnModuleInit, OnModuleDestroy {
 			const story = await tx.audioStory.findFirst({ where: { id: storyId, userId } });
 			if (!story?.status.startsWith('SINGLE_')) throw new NotFoundException('Single Voice project not found');
 			if (!['SINGLE_PENDING', 'SINGLE_PROCESSING'].includes(story.status)) return;
+			if (story.analysisAttemptId) await this.credits.finish(tx, 'single:' + story.analysisAttemptId, false);
 			await tx.audioStory.update({
 				where: { id: storyId },
 				data: { status: 'SINGLE_CANCELLED', analysisAttemptId: null, analysisError: null }
@@ -144,6 +148,7 @@ export class SingleVoiceService implements OnModuleInit, OnModuleDestroy {
 		style?: string,
 		draft?: { title?: string; content?: string }
 	) {
+		await this.tts.assertEnabled();
 		const selectedStyle = style?.trim() || '';
 		if (selectedStyle && !SPEAKING_STYLES.some(item => item.toLowerCase() === selectedStyle.toLowerCase()))
 			throw new BadRequestException('Invalid speaking style');
@@ -159,6 +164,8 @@ export class SingleVoiceService implements OnModuleInit, OnModuleDestroy {
 			const voice = await tx.voice.findUnique({ where: { id: voiceId } });
 			if (!voice?.isActive || !['GOOGLE', 'GEMINI'].includes(voice.provider.toUpperCase()))
 				throw new BadRequestException('Voice is unavailable');
+			const attemptId = randomUUID();
+			await this.credits.reserve(tx, userId, 'single:' + attemptId, 'SINGLE_AUDIO', [content], storyId);
 			const previous = story.analysisResult as Record<string, any> | null;
 			await tx.audioStory.update({
 				where: { id: storyId },
@@ -166,6 +173,7 @@ export class SingleVoiceService implements OnModuleInit, OnModuleDestroy {
 					title: draft?.title?.trim() || story.title,
 					content,
 					status: 'SINGLE_PENDING',
+					analysisAttemptId: attemptId,
 					analysisError: null,
 					analysisResult: {
 						mode: 'single',
@@ -181,9 +189,14 @@ export class SingleVoiceService implements OnModuleInit, OnModuleDestroy {
 	}
 
 	private async processPending(storyId: number) {
-		const attemptId = randomUUID();
-		const claimed = await this.prisma.audioStory.updateMany({
+		const pending = await this.prisma.audioStory.findFirst({
 			where: { id: storyId, status: 'SINGLE_PENDING' },
+			select: { analysisAttemptId: true }
+		});
+		if (!pending) return;
+		const attemptId = pending.analysisAttemptId ?? randomUUID();
+		const claimed = await this.prisma.audioStory.updateMany({
+			where: { id: storyId, status: 'SINGLE_PENDING', analysisAttemptId: pending.analysisAttemptId },
 			data: { status: 'SINGLE_PROCESSING', analysisAttemptId: attemptId }
 		});
 		if (claimed.count !== 1) return;
@@ -213,12 +226,15 @@ export class SingleVoiceService implements OnModuleInit, OnModuleDestroy {
 				story.userId
 			);
 		} catch (error) {
-			await this.prisma.audioStory.updateMany({
-				where: { id: storyId, status: 'SINGLE_PROCESSING', analysisAttemptId: attemptId },
-				data: {
-					status: 'SINGLE_FAILED',
-					analysisError: safeAiError(error)
-				}
+			await this.prisma.$transaction(async tx => {
+				await this.credits.finish(tx, 'single:' + attemptId, false);
+				await tx.audioStory.updateMany({
+					where: { id: storyId, status: 'SINGLE_PROCESSING', analysisAttemptId: attemptId },
+					data: {
+						status: 'SINGLE_FAILED',
+						analysisError: safeAiError(error)
+					}
+				});
 			});
 		} finally {
 			clearInterval(heartbeat);
@@ -230,10 +246,23 @@ export class SingleVoiceService implements OnModuleInit, OnModuleDestroy {
 		this.scanning = true;
 		try {
 			// Only stale processors are recovered; healthy replicas refresh updated_at.
-			await this.prisma.audioStory.updateMany({
-				where: { status: 'SINGLE_PROCESSING', updated_at: { lt: new Date(Date.now() - 5 * 60_000) } },
-				data: { status: 'SINGLE_FAILED', analysisError: 'Generation was interrupted. Please retry.' }
+			const stale = await this.prisma.audioStory.findMany({
+				where: { status: 'SINGLE_PROCESSING', updated_at: { lt: new Date(Date.now() - 5 * 60_000) } }
 			});
+			for (const story of stale)
+				await withStoryLock(this.prisma, story.id, async tx => {
+					const changed = await tx.audioStory.updateMany({
+						where: {
+							id: story.id,
+							status: 'SINGLE_PROCESSING',
+							analysisAttemptId: story.analysisAttemptId,
+							updated_at: { lt: new Date(Date.now() - 5 * 60_000) }
+						},
+						data: { status: 'SINGLE_FAILED', analysisError: 'Generation was interrupted. Please retry.' }
+					});
+					if (changed.count && story.analysisAttemptId)
+						await this.credits.finish(tx, 'single:' + story.analysisAttemptId, false);
+				});
 			const pending = await this.prisma.audioStory.findMany({
 				where: { status: 'SINGLE_PENDING' },
 				select: { id: true }
@@ -423,10 +452,14 @@ export class SingleVoiceService implements OnModuleInit, OnModuleDestroy {
 				return;
 			const wav = parts.length === 1 ? parts[0] : mergeWavBuffers(parts, 180);
 
-			const filename = `${randomUUID()}.wav`;
+			const savedStory = await this.prisma.audioStory.findUniqueOrThrow({
+				where: { id: storyId },
+				select: { title: true }
+			});
+			const filename = `${storageLabel(storyDownloadName(storyId, savedStory.title), 'narration')}.wav`;
 
 			const filePath = await this.storageService.upload({
-				key: `audio-stories/${storyId}/single/${filename}`,
+				key: `${storyFolder(storyId, savedStory.title, true)}/attempt-${attemptId}/${filename}`,
 				buffer: wav,
 				contentType: 'audio/wav'
 			});
@@ -440,6 +473,8 @@ export class SingleVoiceService implements OnModuleInit, OnModuleDestroy {
 				});
 				if (!story) return;
 				const config = story.analysisResult as { voiceId: number; style?: string };
+				await this.storageService.confirmUpload(tx, filePath);
+				await this.credits.finish(tx, 'single:' + attemptId, true);
 				await tx.audioAsset.create({
 					data: {
 						storyId,
@@ -467,15 +502,13 @@ export class SingleVoiceService implements OnModuleInit, OnModuleDestroy {
 		} catch (error) {
 			// Keep the previously completed asset accessible
 			// when regeneration fails.
-			await this.prisma.audioStory
-				.updateMany({
+			await this.prisma.$transaction(async tx => {
+				await this.credits.finish(tx, 'single:' + attemptId, false);
+				await tx.audioStory.updateMany({
 					where: { id: storyId, status: 'SINGLE_PROCESSING', analysisAttemptId: attemptId },
-					data: {
-						status: 'SINGLE_FAILED',
-						analysisError: safeAiError(error)
-					}
-				})
-				.catch(() => undefined);
+					data: { status: 'SINGLE_FAILED', analysisError: safeAiError(error) }
+				});
+			});
 
 			console.error(`Single Voice generation failed for story ${storyId}`, error);
 		}

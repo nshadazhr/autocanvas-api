@@ -6,6 +6,8 @@ export interface AITextRequest {
 	userPrompt: string;
 	temperature?: number;
 	maxOutputTokens?: number;
+	jsonSchema?: Record<string, unknown>;
+	onRequest?: () => Promise<void>;
 }
 
 export interface AITextResponse {

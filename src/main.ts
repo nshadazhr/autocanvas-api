@@ -1,3 +1,4 @@
+import { authAllowedOrigins } from './auth/services/auth-origins.js';
 import { NestFactory } from '@nestjs/core';
 import { AppModule, ObserveInstrument } from './app.module.js';
 import { ValidationPipe } from '@nestjs/common';
@@ -8,6 +9,7 @@ import { join } from 'node:path';
 
 async function bootstrap() {
 	const app = await NestFactory.create<NestExpressApplication>(AppModule, {
+		rawBody: true,
 		instrument: ObserveInstrument
 	});
 
@@ -20,7 +22,7 @@ async function bootstrap() {
 	);
 
 	app.enableCors({
-		origin: [process.env.REQUEST_ORIGIN_PORT ? process.env.REQUEST_ORIGIN_PORT : 'http://localhost:3000'],
+		origin: authAllowedOrigins(),
 		methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
 		allowedHeaders: ['Content-Type', 'Authorization'],
 		credentials: true
@@ -28,8 +30,8 @@ async function bootstrap() {
 
 	app.use(cookieParser());
 
-	app.useStaticAssets(join(process.cwd(), 'uploads'), {
-		prefix: '/uploads/'
+	app.useStaticAssets(join(process.cwd(), 'autocanvas-assets'), {
+		prefix: '/autocanvas-assets/'
 	});
 
 	const config = new DocumentBuilder()

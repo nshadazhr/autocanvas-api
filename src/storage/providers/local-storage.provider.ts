@@ -13,7 +13,7 @@ import type {
 
 @Injectable()
 export class LocalStorageProvider implements StorageAdapter {
-	private readonly root = resolve(process.cwd(), 'uploads');
+	private readonly root = resolve(process.cwd(), 'autocanvas-assets');
 
 	private resolvePath(key: string): string {
 		const absolutePath = resolve(this.root, key);

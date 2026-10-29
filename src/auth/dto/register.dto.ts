@@ -1,42 +1,42 @@
-import {
-  IsEmail,
-  IsNotEmpty,
-  IsString,
-  IsStrongPassword,
-  Matches,
-} from 'class-validator';
+import { IsEmail, MaxLength, IsNotEmpty, IsString, IsStrongPassword, Matches } from 'class-validator';
 
 export class RegisterDto {
-  @IsNotEmpty()
-  @IsString()
-  name: string;
+	@IsNotEmpty()
+	@IsString()
+	name: string;
 
-  @IsEmail()
-  email: string;
+	@MaxLength(254)
+	@IsEmail()
+	email: string;
 
-  @IsStrongPassword()
-  password: string;
+	@IsStrongPassword()
+	password: string;
 }
 
 export class LoginDto {
-  @IsEmail()
-  email: string;
+	@MaxLength(254)
+	@IsEmail()
+	email: string;
 
-  @IsString()
-  password: string;
+	@IsNotEmpty()
+	@MaxLength(1024)
+	@IsString()
+	password: string;
 }
 
 export class VerifyOtpDto {
-  @IsEmail()
-  email: string;
+	@MaxLength(254)
+	@IsEmail()
+	email: string;
 
-  @IsString()
-  @Matches(/^\d{6}$/, {
-    message: 'OTP must be a 6-digit number',
-  })
-  otp: string;
+	@IsString()
+	@Matches(/^\d{6}$/, {
+		message: 'OTP must be a 6-digit number'
+	})
+	otp: string;
 }
 export class ResendOtpDto {
-  @IsEmail()
-  email: string;
+	@MaxLength(254)
+	@IsEmail()
+	email: string;
 }

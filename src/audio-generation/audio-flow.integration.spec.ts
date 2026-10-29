@@ -1,3 +1,4 @@
+import { CreditsService } from '../credits/credits.service.js';
 import { sceneDownloadFilename } from './utils/scene-download-filename.js';
 import { beforeAll, afterAll, beforeEach, afterEach, describe, expect, it, vi } from 'vitest';
 import { randomUUID } from 'node:crypto';
@@ -7,7 +8,7 @@ import { PrismaClient } from '../generated/prisma/client.js';
 import { audioGenerationService } from './audio-generation.service.js';
 import { SingleVoiceService } from './single-voice.service.js';
 import { AudioStoriesService } from '../audio-stories/audio-stories.service.js';
-import { GeminiKeysUnavailableError } from './errors/gemini-keys-unavailable.error.js';
+import { ProviderRateLimitError } from './errors/provider-rate-limit.error.js';
 import { sceneAudioRevision } from './utils/scene-audio-revision.js';
 import { Test } from '@nestjs/testing';
 import { JwtService } from '@nestjs/jwt';
@@ -42,8 +43,12 @@ describe.skipIf(!databaseUrl)('audio flow with real PostgreSQL and stubbed Gemin
 	wav.writeUInt16LE(16, 34);
 	wav.write('data', 36);
 	wav.writeUInt32LE(48000, 40);
-	const tts = { generateSpeech: vi.fn(async (_text: string, _voice: string, _model: string) => wav) };
+	const tts = {
+		assertEnabled: async () => undefined,
+		generateSpeech: vi.fn(async (_text: string, _voice: string, _model: string) => wav)
+	};
 	const storage = {
+		confirmUpload: async () => undefined,
 		upload: vi.fn(async ({ key, buffer }: { key: string; buffer: Buffer }) => {
 			files.set(key, buffer);
 			return key;
@@ -69,10 +74,20 @@ describe.skipIf(!databaseUrl)('audio flow with real PostgreSQL and stubbed Gemin
 		prisma as any,
 		tts as any,
 		{ get: () => undefined } as any,
-		storage as any
+		storage as any,
+		{ section: async () => ({ values: { maxRecoveryAttempts: 3, recoveryRetryDelayMs: 60000 } }) } as any,
+		new CreditsService(prisma as any)
 	);
-	const single = new SingleVoiceService(prisma as any, tts as any, storage as any);
-	const stories = new AudioStoriesService(prisma as any, {} as any, {} as any, {} as any, {} as any, {} as any);
+	const single = new SingleVoiceService(prisma as any, tts as any, storage as any, new CreditsService(prisma as any));
+	const stories = new AudioStoriesService(
+		prisma as any,
+		{} as any,
+		{} as any,
+		{} as any,
+		{} as any,
+		{} as any,
+		new CreditsService(prisma as any)
+	);
 	let userId: number;
 	let voice: any;
 	let story: any;
@@ -125,7 +140,7 @@ describe.skipIf(!databaseUrl)('audio flow with real PostgreSQL and stubbed Gemin
 			]
 		})
 			.overrideGuard(AuthGuard)
-			.useValue(new AuthGuard(jwt))
+			.useValue(new AuthGuard({ verifyAccessToken: (token: string) => jwt.verifyAsync(token) } as any))
 			.compile();
 		app = module.createNestApplication();
 		app.useGlobalPipes(new ValidationPipe({ transform: true, whitelist: true }));
@@ -139,6 +154,8 @@ describe.skipIf(!databaseUrl)('audio flow with real PostgreSQL and stubbed Gemin
 		await prisma.audioGenerationJob.deleteMany({ where: { userId } });
 		await prisma.audioScene.deleteMany({ where: { story: { userId } } });
 		await prisma.audioStory.deleteMany({ where: { userId } });
+		await prisma.creditTransaction.deleteMany({ where: { userId } });
+		await prisma.creditPurchase.deleteMany({ where: { userId } });
 		await prisma.user.delete({ where: { id: userId } });
 		await prisma.voice.delete({ where: { id: voice.id } });
 		await prisma.$disconnect();
@@ -151,6 +168,12 @@ describe.skipIf(!databaseUrl)('audio flow with real PostgreSQL and stubbed Gemin
 	});
 
 	beforeEach(async () => {
+		await prisma.configuration.upsert({
+			where: { key: 'credits_settings' },
+			create: { key: 'credits_settings', value: {} },
+			update: { value: {} }
+		});
+		await prisma.user.update({ where: { id: userId }, data: { creditBalance: 100, creditWelcomeGranted: true } });
 		tts.generateSpeech.mockReset();
 		tts.generateSpeech.mockResolvedValue(wav);
 		story = await prisma.audioStory.create({
@@ -179,7 +202,38 @@ describe.skipIf(!databaseUrl)('audio flow with real PostgreSQL and stubbed Gemin
 					language: 'hi-IN'
 				}
 			});
-		scenes = await prisma.audioScene.findMany({ where: { storyId: story.id }, orderBy: { sceneOrder: 'asc' } });
+		scenes = await prisma.audioScene.findMany({
+			where: { storyId: story.id },
+			orderBy: { sceneOrder: 'asc' }
+		});
+	});
+
+	it('settles paid partial work and charges only the successful failed-scene retry', async () => {
+		await prisma.configuration.update({
+			where: { key: 'credits_settings' },
+			data: { value: { audioCreditsPer1000Characters: 1000 } }
+		});
+		tts.generateSpeech.mockRejectedValueOnce(new Error('Invalid voice configuration'));
+		const first = await service.createGenerationJob(story.id, userId);
+		expect((await prisma.user.findUniqueOrThrow({ where: { id: userId } })).creditBalance).toBe(86);
+		await service.processGenerationJob(first.id);
+		expect((await prisma.user.findUniqueOrThrow({ where: { id: userId } })).creditBalance).toBe(93);
+		const retry = await service.retryFailedJob(first.id, userId);
+		await service.processGenerationJob(retry.id);
+		expect((await prisma.user.findUniqueOrThrow({ where: { id: userId } })).creditBalance).toBe(86);
+	});
+	it('refunds paid pending cancellation exactly once', async () => {
+		await prisma.configuration.update({
+			where: { key: 'credits_settings' },
+			data: { value: { audioCreditsPer1000Characters: 1000 } }
+		});
+		const job = await service.createGenerationJob(story.id, userId);
+		await service.cancelGenerationJob(job.id, userId);
+		await service.cancelGenerationJob(job.id, userId);
+		expect((await prisma.user.findUniqueOrThrow({ where: { id: userId } })).creditBalance).toBe(100);
+		expect(await prisma.creditTransaction.count({ where: { userId, storyId: story.id, status: 'RESERVED' } })).toBe(
+			0
+		);
 	});
 
 	it('serializes concurrent full-job requests: exactly one job is committed', async () => {
@@ -224,9 +278,33 @@ describe.skipIf(!databaseUrl)('audio flow with real PostgreSQL and stubbed Gemin
 		const exported = await service.getExportedAudioFile(combined.id, userId);
 		expect(files.get(exported.filePath)!.subarray(0, 4).toString()).toBe('RIFF');
 	});
+	it('deletes a completed generated story without scene/job foreign-key errors and preserves its ledger', async () => {
+		const job = await service.createGenerationJob(story.id, userId);
+		await service.processGenerationJob(job.id);
+		const entries = await prisma.creditTransaction.count({ where: { userId, storyId: story.id } });
+		await stories.remove(story.id, userId);
+		expect(await prisma.audioStory.findUnique({ where: { id: story.id } })).toBeNull();
+		expect(await prisma.audioGenerationJob.count({ where: { storyId: story.id } })).toBe(0);
+		expect(await prisma.audioScene.count({ where: { storyId: story.id } })).toBe(0);
+		expect(await prisma.creditTransaction.count({ where: { userId, storyId: story.id } })).toBe(entries);
+	});
+	it('rejects story deletion during active generation without deleting its job', async () => {
+		const job = await service.createGenerationJob(story.id, userId);
+		await expect(stories.remove(story.id, userId)).rejects.toThrow();
+		expect(await prisma.audioGenerationJob.findUnique({ where: { id: job.id } })).not.toBeNull();
+	});
+
 	it('two processors claiming the same job generate each scene once', async () => {
 		const job = await service.createGenerationJob(story.id, userId);
 		await Promise.all([service.processGenerationJob(job.id), service.processGenerationJob(job.id)]);
+		const saved = await prisma.sceneAudio.findMany({ where: { scene: { storyId: story.id } } });
+		expect(
+			saved.every(audio =>
+				/audio-stories\/multiple-voice\/story_\d+_[A-Za-z0-9_]+\/job-\d+\/take-[a-f0-9-]+\/\d{3}_[A-Za-z0-9_]+\.wav$/.test(
+					audio.filePath
+				)
+			)
+		).toBe(true);
 		expect(tts.generateSpeech).toHaveBeenCalledTimes(2);
 	});
 	it('records permanent scene errors and continues remaining scenes', async () => {
@@ -241,7 +319,7 @@ describe.skipIf(!databaseUrl)('audio flow with real PostgreSQL and stubbed Gemin
 	});
 	it('waits on quota with nextRetryAt and refunds the attempt', async () => {
 		tts.generateSpeech.mockRejectedValueOnce(
-			new GeminiKeysUnavailableError('Quota waiting', new Date(Date.now() + 60000))
+			new ProviderRateLimitError('Quota waiting', new Date(Date.now() + 60000))
 		);
 		const job = await service.createGenerationJob(story.id, userId);
 		await service.processGenerationJob(job.id);
@@ -368,6 +446,20 @@ describe.skipIf(!databaseUrl)('audio flow with real PostgreSQL and stubbed Gemin
 		expect(history.scenes[0].latestAudio).toBeTruthy();
 		expect(history.scenes[0].lastGeneration?.status).toBe('FAILED');
 	});
+	it('charges a paid single-voice output and charges a new manual regeneration', async () => {
+		await prisma.configuration.update({
+			where: { key: 'credits_settings' },
+			data: { value: { audioCreditsPer1000Characters: 1000 } }
+		});
+		const project = await single.create(userId, 'Paid single', 'Hello');
+		await single.generate(project.id, userId, voice.id);
+		await waitFor(async () => (await single.get(project.id, userId)).status === 'SINGLE_COMPLETED');
+		expect((await prisma.user.findUniqueOrThrow({ where: { id: userId } })).creditBalance).toBe(95);
+		await single.generate(project.id, userId, voice.id);
+		await waitFor(async () => (await single.get(project.id, userId)).status === 'SINGLE_COMPLETED');
+		expect((await prisma.user.findUniqueOrThrow({ where: { id: userId } })).creditBalance).toBe(90);
+	});
+
 	it('single-voice generation saves changed draft text before regeneration', async () => {
 		const project = await single.create(userId, 'Draft', 'Old script');
 		await single.generate(project.id, userId, voice.id);
@@ -384,6 +476,135 @@ describe.skipIf(!databaseUrl)('audio flow with real PostgreSQL and stubbed Gemin
 		expect(updated.audioIsCurrent).toBe(true);
 		expect(tts.generateSpeech.mock.calls.some(call => call[0].includes('Changed script'))).toBe(true);
 	});
+	it('a stale single pending reader cannot steal a newly reserved replacement attempt', async () => {
+		await prisma.configuration.update({
+			where: { key: 'credits_settings' },
+			data: { value: { audioCreditsPer1000Characters: 1000 } }
+		});
+		const project = await single.create(userId, 'Claim race', 'short');
+		const process = (single as any).processPending.bind(single);
+		const dispatch = vi.spyOn(single as any, 'processPending').mockResolvedValue(undefined);
+		await single.generate(project.id, userId, voice.id);
+		const old = (await prisma.audioStory.findUniqueOrThrow({ where: { id: project.id } })).analysisAttemptId;
+		const original = prisma.audioStory.findFirst.bind(prisma.audioStory);
+		const spy = vi.spyOn(prisma.audioStory as any, 'findFirst').mockImplementationOnce(async (query: any) => {
+			const snapshot = await original(query);
+			await single.cancel(project.id, userId);
+			await single.generate(project.id, userId, voice.id);
+			return snapshot;
+		});
+		try {
+			await process(project.id);
+		} finally {
+			spy.mockRestore();
+			dispatch.mockRestore();
+		}
+		const replacement = await prisma.audioStory.findUniqueOrThrow({ where: { id: project.id } });
+		expect(replacement.status).toBe('SINGLE_PENDING');
+		expect(replacement.analysisAttemptId).not.toBe(old);
+		expect(
+			await prisma.creditTransaction.count({ where: { reference: 'single:' + old, status: 'REFUNDED' } })
+		).toBe(1);
+		expect(
+			await prisma.creditTransaction.count({
+				where: { reference: 'single:' + replacement.analysisAttemptId, status: 'RESERVED' }
+			})
+		).toBe(1);
+		await process(project.id);
+		expect((await single.get(project.id, userId)).status).toBe('SINGLE_COMPLETED');
+		expect(
+			await prisma.creditTransaction.count({
+				where: { reference: 'single:' + replacement.analysisAttemptId, status: 'COMPLETED' }
+			})
+		).toBe(1);
+	});
+	it('a late terminal failure cannot refund a replacement worker reservation', async () => {
+		await prisma.configuration.update({
+			where: { key: 'credits_settings' },
+			data: { value: { audioCreditsPer1000Characters: 1000 } }
+		});
+		const job = await service.createSingleSceneJob(story.id, scenes[0].id, userId);
+		const item = (await service.getGenerationJob(job.id, userId)).items[0];
+		const transaction = prisma.$transaction.bind(prisma);
+		let replacementStartedAt!: Date;
+		let interleaved = false;
+		let transactionSpy: ReturnType<typeof vi.spyOn> | undefined;
+		const generate = vi.spyOn(service, 'generateSceneAudio').mockImplementationOnce(async () => {
+			// Replace ownership after the catch's optimistic ownsJob check, but
+			// before its settlement transaction starts.
+			transactionSpy = vi.spyOn(prisma as any, '$transaction').mockImplementationOnce(async (callback: any) => {
+				const current = await prisma.audioGenerationJob.findUniqueOrThrow({ where: { id: job.id } });
+				replacementStartedAt = new Date(current.started_at!.getTime() + 1000);
+				await prisma.audioGenerationJob.update({
+					where: { id: job.id },
+					data: { started_at: replacementStartedAt }
+				});
+				interleaved = true;
+				return transaction(callback);
+			});
+			throw new Error('Invalid audio request');
+		});
+		try {
+			await service.processGenerationJob(job.id);
+		} finally {
+			transactionSpy?.mockRestore();
+			generate.mockRestore();
+		}
+		expect(interleaved).toBe(true);
+		expect((await service.getGenerationJob(job.id, userId)).status).toBe('PROCESSING');
+		expect((await prisma.audioGenerationJobItem.findUniqueOrThrow({ where: { id: item.id } })).status).toBe(
+			'PROCESSING'
+		);
+		expect(
+			(await prisma.creditTransaction.findUniqueOrThrow({ where: { reference: 'audio:' + item.id } })).status
+		).toBe('RESERVED');
+		await service.generateSceneAudio(item.sceneId, undefined, undefined, undefined, item.id, {
+			jobId: job.id,
+			startedAt: replacementStartedAt
+		});
+		expect(
+			(await prisma.creditTransaction.findUniqueOrThrow({ where: { reference: 'audio:' + item.id } })).status
+		).toBe('COMPLETED');
+		expect(await prisma.sceneAudio.count({ where: { jobItemId: item.id } })).toBe(1);
+	});
+	it('recovery preserves audio committed after its stale scan and before the row claim', async () => {
+		const j = await service.createSingleSceneJob(story.id, scenes[0].id, userId);
+		const item = (await service.getGenerationJob(j.id, userId)).items[0];
+		const startedAt = new Date(0);
+		await prisma.audioGenerationJob.update({
+			where: { id: j.id },
+			data: { status: 'PROCESSING', started_at: startedAt, updated_at: new Date(0) }
+		});
+		await prisma.audioGenerationJobItem.update({
+			where: { id: item.id },
+			data: { status: 'PROCESSING', attempts: 3 }
+		});
+		const original = prisma.audioGenerationJob.findMany.bind(prisma.audioGenerationJob);
+		const spy = vi
+			.spyOn(prisma.audioGenerationJob as any, 'findMany')
+			.mockImplementationOnce(async (query: any) => {
+				const snapshot = await original(query);
+				await service.generateSceneAudio(item.sceneId, undefined, undefined, undefined, item.id, {
+					jobId: j.id,
+					startedAt
+				});
+				return snapshot;
+			});
+		try {
+			await service.recoverInterruptedJobs();
+		} finally {
+			spy.mockRestore();
+		}
+		expect((await service.getGenerationJob(j.id, userId)).status).toBe('COMPLETED');
+		expect((await prisma.audioGenerationJobItem.findUniqueOrThrow({ where: { id: item.id } })).status).toBe(
+			'COMPLETED'
+		);
+		expect(await prisma.sceneAudio.count({ where: { jobItemId: item.id } })).toBe(1);
+		expect(
+			await prisma.creditTransaction.count({ where: { reference: 'audio:' + item.id, status: 'COMPLETED' } })
+		).toBe(1);
+	});
+
 	it('single-voice restart recovers pending and releases stale processing state', async () => {
 		const project = await single.create(userId, 'Interrupted', 'Old script');
 		await prisma.audioStory.update({
@@ -503,6 +724,54 @@ describe.skipIf(!databaseUrl)('audio flow with real PostgreSQL and stubbed Gemin
 			.expect('Content-Type', /application\/zip/);
 	});
 
+	it('serves R2-prefixed scene playback, ZIP and combined exports with existing ownership checks', async () => {
+		const originalUpload = storage.upload.getMockImplementation()!;
+		storage.upload.mockImplementation(async ({ key, buffer }) => {
+			const location = 'r2://' + key;
+			files.set(location, buffer);
+			return location;
+		});
+		try {
+			const job = await service.createGenerationJob(story.id, userId);
+			await service.processGenerationJob(job.id);
+			const history = await service.getStoryAudioHistory(story.id, userId);
+			const audioId = history.scenes[0].latestAudio!.id;
+			expect((await service.getAudioFile(audioId, userId)).filePath).toMatch(/^r2:\/\//);
+			await request(app.getHttpServer())
+				.get(`/audio-generation/audio/${audioId}/stream`)
+				.auth(token, { type: 'bearer' })
+				.set('Range', 'bytes=0-43')
+				.expect(206)
+				.expect('Content-Length', '44')
+				.expect('Content-Range', `bytes 0-43/${wav.length}`);
+			await request(app.getHttpServer())
+				.get(`/audio-generation/stories/${story.id}/download-zip`)
+				.auth(token, { type: 'bearer' })
+				.expect(200)
+				.expect('Content-Type', /application\/zip/);
+			const exported = await service.exportStoryWav(story.id, userId);
+			const asset = await service.getExportedAudioFile(exported.id, userId);
+			expect(asset.filePath).toMatch(/^r2:\/\//);
+			await request(app.getHttpServer())
+				.get(`/audio-generation/exports/${exported.id}/download`)
+				.auth(token, { type: 'bearer' })
+				.expect(200)
+				.expect('Content-Type', /audio\/wav/);
+			await request(app.getHttpServer()).get(`/audio-generation/exports/${exported.id}/download`).expect(401);
+			const otherToken = jwt.sign({ id: userId + 99999 });
+			await request(app.getHttpServer())
+				.get(`/audio-generation/audio/${audioId}/stream`)
+				.auth(otherToken, { type: 'bearer' })
+				.expect(404);
+			await request(app.getHttpServer())
+				.get(`/audio-generation/exports/${exported.id}/download`)
+				.auth(otherToken, { type: 'bearer' })
+				.expect(404);
+		} finally {
+			storage.upload.mockImplementation(originalUpload);
+		}
+	});
+
 	it('HTTP concurrent generation requests return one 201 and one 409', async () => {
 		tts.generateSpeech.mockImplementation(async () => {
 			await new Promise(resolve => setTimeout(resolve, 60));
@@ -554,7 +823,7 @@ describe.skipIf(!databaseUrl)('audio flow with real PostgreSQL and stubbed Gemin
 		expect(tts.generateSpeech).toHaveBeenCalledTimes(2);
 	});
 	it('cancelled quota-wait jobs are not resumed by recovery', async () => {
-		tts.generateSpeech.mockRejectedValue(new GeminiKeysUnavailableError('Quota', new Date(Date.now() + 60000)));
+		tts.generateSpeech.mockRejectedValue(new ProviderRateLimitError('Quota', new Date(Date.now() + 60000)));
 		const j = await service.createGenerationJob(story.id, userId);
 		await service.processGenerationJob(j.id);
 		expect((await service.getGenerationJob(j.id, userId)).status).toBe('WAITING');

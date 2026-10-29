@@ -7,6 +7,15 @@ build
 !.env.example
 *.log
 coverage
+autocanvas-assets
+uploads
+src/generated/prisma
+*.tsbuildinfo
+.agents
+.cursor
+.claude
+.devin
+.windsurf
 .vscode
 .idea
 .DS_Store

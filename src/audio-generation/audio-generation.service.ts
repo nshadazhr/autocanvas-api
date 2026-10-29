@@ -1,3 +1,6 @@
+import { storyFolder, storageLabel, storyDownloadName, ownedExportKey } from './utils/audio-storage-names.js';
+import { CreditsService } from '../credits/credits.service.js';
+import { AppSettingsService } from '../settings/app-settings.service.js';
 import { sceneDownloadFilename } from './utils/scene-download-filename.js';
 import { safeAiError } from '../ai/usage/safe-ai-error.js';
 import { AiCapacityError } from '../ai/usage/ai-capacity.error.js';
@@ -8,7 +11,7 @@ import { mkdir, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { OnModuleDestroy, OnModuleInit } from '@nestjs/common';
-import { GeminiKeysUnavailableError } from './errors/gemini-keys-unavailable.error.js';
+import { ProviderRateLimitError } from './errors/provider-rate-limit.error.js';
 import { readFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { mergeWavBuffers } from './utils/wav-merge.util.js';
@@ -27,17 +30,16 @@ export class audioGenerationService implements OnModuleInit, OnModuleDestroy {
 		private readonly prisma: PrismaService,
 		private readonly geminiTtsService: GeminiTtsService,
 		private readonly configService: ConfigService,
-		private readonly storageService: StorageService
+		private readonly storageService: StorageService,
+		private readonly settings: AppSettingsService,
+		private readonly credits: CreditsService
 	) {
-		this.maxRecoveryAttempts = this.readPositiveEnv('AUDIO_MAX_RECOVERY_ATTEMPTS', 3);
-		this.recoveryRetryDelayMs = this.readPositiveEnv('AUDIO_RECOVERY_RETRY_DELAY_MS', 60_000);
 		this.retryScanIntervalMs = this.readPositiveEnv('AUDIO_RETRY_SCAN_INTERVAL_MS', 30_000);
 	}
-	private retryTimer: ReturnType<typeof setInterval> | null = null;
+	private retryTimer: ReturnType<typeof setTimeout> | null = null;
+	private retryScannerStopped = true;
 	private retryScanRunning = false;
-	private readonly maxRecoveryAttempts: number;
-	private readonly recoveryRetryDelayMs: number;
-	private readonly retryScanIntervalMs: number;
+	private retryScanIntervalMs: number;
 
 	private readPositiveEnv(name: string, fallback: number): number {
 		const raw = this.configService.get<string>(name);
@@ -105,7 +107,7 @@ export class audioGenerationService implements OnModuleInit, OnModuleDestroy {
 		}
 		const scene = await this.prisma.audioScene.findUnique({
 			where: { id: sceneId },
-			include: { character: true, story: { select: { userId: true } } }
+			include: { character: true, story: { select: { userId: true, title: true } } }
 		});
 
 		if (!scene) {
@@ -211,9 +213,9 @@ export class audioGenerationService implements OnModuleInit, OnModuleDestroy {
 		}
 
 		await assertOwner();
-		const filename = `${scene.id}-${randomUUID()}.wav`;
+		const filename = sceneDownloadFilename(scene.sceneOrder, scene.title, scene.text);
 
-		const storageKey = `audio-stories/${scene.storyId}/${filename}`;
+		const storageKey = `${storyFolder(scene.storyId, scene.story.title)}/${owner ? 'job-' + owner.jobId : 'attempt-' + randomUUID()}/take-${randomUUID()}/${storageLabel(filename.replace(/\.wav$/, ''), 'scene')}.wav`;
 
 		const filePath = await this.storageService.upload({
 			key: storageKey,
@@ -231,6 +233,14 @@ export class audioGenerationService implements OnModuleInit, OnModuleDestroy {
 				}))
 			)
 				throw new Error('Generation ownership expired');
+			if (jobItemId) {
+				await this.credits.finish(tx, 'audio:' + jobItemId, true);
+				await tx.audioGenerationJobItem.update({
+					where: { id: jobItemId },
+					data: { status: 'COMPLETED', error: null, completed_at: new Date() }
+				});
+			}
+			await this.storageService.confirmUpload(tx, filePath);
 			return tx.sceneAudio.create({
 				data: {
 					sceneId: scene.id,
@@ -291,6 +301,7 @@ export class audioGenerationService implements OnModuleInit, OnModuleDestroy {
 			// A scene whose audio committed just before cancellation remains completed.
 			for (const item of items) {
 				if (!['PENDING', 'PROCESSING', 'WAITING'].includes(item.status)) continue;
+				await this.credits.finish(tx, 'audio:' + item.id, !!item.audio);
 				await tx.audioGenerationJobItem.update({
 					where: { id: item.id },
 					data: {
@@ -301,7 +312,9 @@ export class audioGenerationService implements OnModuleInit, OnModuleDestroy {
 					}
 				});
 			}
-			const completedScenes = await tx.audioGenerationJobItem.count({ where: { jobId, status: 'COMPLETED' } });
+			const completedScenes = await tx.audioGenerationJobItem.count({
+				where: { jobId, status: 'COMPLETED' }
+			});
 			const failedScenes = await tx.audioGenerationJobItem.count({ where: { jobId, status: 'FAILED' } });
 			await tx.audioGenerationJob.update({
 				where: { id: jobId },
@@ -312,7 +325,10 @@ export class audioGenerationService implements OnModuleInit, OnModuleDestroy {
 	}
 
 	async getLatestStoryJob(storyId: number, userId: number) {
-		const story = await this.prisma.audioStory.findFirst({ where: { id: storyId, userId }, select: { id: true } });
+		const story = await this.prisma.audioStory.findFirst({
+			where: { id: storyId, userId },
+			select: { id: true }
+		});
 		if (!story) throw new NotFoundException('Audio story not found');
 		const active = await this.prisma.audioGenerationJob.findFirst({
 			where: { storyId, userId, status: { in: ['PENDING', 'PROCESSING', 'WAITING'] } },
@@ -320,11 +336,26 @@ export class audioGenerationService implements OnModuleInit, OnModuleDestroy {
 		});
 		const latest =
 			active ??
-			(await this.prisma.audioGenerationJob.findFirst({ where: { storyId, userId }, orderBy: { id: 'desc' } }));
+			(await this.prisma.audioGenerationJob.findFirst({
+				where: { storyId, userId },
+				orderBy: { id: 'desc' }
+			}));
 		return latest ? this.getGenerationJob(latest.id, userId) : null;
 	}
 
+	private async reserveJob(
+		tx: import('../generated/prisma/client.js').Prisma.TransactionClient,
+		jobId: number,
+		userId: number,
+		storyId: number
+	) {
+		const items = await tx.audioGenerationJobItem.findMany({ where: { jobId } });
+		for (const item of items)
+			await this.credits.reserve(tx, userId, 'audio:' + item.id, 'AUDIO', [item.textSnapshot ?? ''], storyId);
+	}
+
 	async createGenerationJob(storyId: number, userId: number) {
+		await this.geminiTtsService.assertEnabled();
 		return withStoryLock(this.prisma, storyId, async tx => {
 			const story = await tx.audioStory.findFirst({
 				where: {
@@ -398,6 +429,7 @@ export class audioGenerationService implements OnModuleInit, OnModuleDestroy {
 				}
 			});
 
+			await this.reserveJob(tx, job.id, userId, storyId);
 			return {
 				id: job.id,
 				storyId: job.storyId,
@@ -410,6 +442,7 @@ export class audioGenerationService implements OnModuleInit, OnModuleDestroy {
 	}
 
 	async createSingleSceneJob(storyId: number, sceneId: number, userId: number) {
+		await this.geminiTtsService.assertEnabled();
 		return withStoryLock(this.prisma, storyId, async tx => {
 			const story = await tx.audioStory.findFirst({
 				where: {
@@ -486,6 +519,7 @@ export class audioGenerationService implements OnModuleInit, OnModuleDestroy {
 				}
 			});
 
+			await this.reserveJob(tx, job.id, userId, storyId);
 			return {
 				id: job.id,
 				storyId: job.storyId,
@@ -498,6 +532,7 @@ export class audioGenerationService implements OnModuleInit, OnModuleDestroy {
 	}
 
 	async processGenerationJob(jobId: number) {
+		const { values: processing } = await this.settings.section('processing');
 		const startedAt = new Date();
 		const ownsJob = async () =>
 			!!(await this.prisma.audioGenerationJob.findFirst({
@@ -602,11 +637,11 @@ export class audioGenerationService implements OnModuleInit, OnModuleDestroy {
 					});
 				} catch (error: unknown) {
 					if (!(await ownsJob())) return;
-					if (error instanceof GeminiKeysUnavailableError || error instanceof AiCapacityError) {
+					if (error instanceof ProviderRateLimitError || error instanceof AiCapacityError) {
 						const nextRetryAt = error.nextRetryAt;
 
 						if (!nextRetryAt) {
-							throw new Error('Gemini keys unavailable without a retry time');
+							throw new Error('Provider rate limit without a retry time');
 						}
 
 						// Avoid immediate retry loops.
@@ -636,14 +671,16 @@ export class audioGenerationService implements OnModuleInit, OnModuleDestroy {
 					const transient =
 						['NETWORK', 'NO_AUDIO'].includes(classifyGeminiTtsError(error)) ||
 						/\b(?:500|502|503|504)\b/.test(error instanceof Error ? error.message : '');
-					if (transient && item.attempts + 1 < this.maxRecoveryAttempts) {
+					if (transient && item.attempts + 1 < Number(processing.maxRecoveryAttempts)) {
 						await this.prisma.audioGenerationJobItem.updateMany({
 							where: { id: item.id, job: { id: jobId, status: 'PROCESSING', started_at: startedAt } },
 							data: {
 								status: 'WAITING',
 								error: safeAiError(error),
 								lastErrorAt: new Date(),
-								nextRetryAt: new Date(Date.now() + this.recoveryRetryDelayMs * 2 ** item.attempts)
+								nextRetryAt: new Date(
+									Date.now() + Number(processing.recoveryRetryDelayMs) * 2 ** item.attempts
+								)
 							}
 						});
 						await this.updateJobProgress(jobId);
@@ -654,14 +691,30 @@ export class audioGenerationService implements OnModuleInit, OnModuleDestroy {
 						return;
 					}
 
-					await this.prisma.audioGenerationJobItem.updateMany({
-						where: { id: item.id, job: { id: jobId, status: 'PROCESSING', started_at: startedAt } },
-						data: {
-							status: 'FAILED',
-							error: safeAiError(error),
-							lastErrorAt: new Date(),
-							completed_at: new Date()
-						}
+					await this.prisma.$transaction(async tx => {
+						// Serialize settlement with cancellation, recovery and successful commits.
+						await tx.$queryRaw`SELECT id FROM "AudioGenerationJob" WHERE id = ${jobId} FOR UPDATE`;
+						if (
+							!(await tx.audioGenerationJob.findFirst({
+								where: { id: jobId, status: 'PROCESSING', started_at: startedAt },
+								select: { id: true }
+							}))
+						)
+							return;
+						const failed = await tx.audioGenerationJobItem.updateMany({
+							where: {
+								id: item.id,
+								status: 'PROCESSING',
+								job: { id: jobId, status: 'PROCESSING', started_at: startedAt }
+							},
+							data: {
+								status: 'FAILED',
+								error: safeAiError(error),
+								lastErrorAt: new Date(),
+								completed_at: new Date()
+							}
+						});
+						if (failed.count === 1) await this.credits.finish(tx, 'audio:' + item.id, false);
 					});
 				}
 
@@ -739,18 +792,10 @@ export class audioGenerationService implements OnModuleInit, OnModuleDestroy {
 	}
 
 	async recoverInterruptedJobs() {
+		const { values: processing } = await this.settings.section('processing');
 		const interruptedJobs = await this.prisma.audioGenerationJob.findMany({
 			where: { status: 'PROCESSING', updated_at: { lt: new Date(Date.now() - 5 * 60_000) } },
-			select: {
-				id: true,
-				items: {
-					where: { status: 'PROCESSING' },
-					select: {
-						id: true,
-						attempts: true
-					}
-				}
-			}
+			select: { id: true }
 		});
 
 		for (const job of interruptedJobs) {
@@ -760,8 +805,15 @@ export class audioGenerationService implements OnModuleInit, OnModuleDestroy {
 					data: { status: 'WAITING' }
 				});
 				if (claimed.count !== 1) return;
-				for (const item of job.items) {
-					const exhausted = item.attempts >= this.maxRecoveryAttempts;
+				// The job row is locked by the claim. Re-read items after that lock so
+				// a completed commit between the scan and claim cannot be overwritten.
+				const processingItems = await tx.audioGenerationJobItem.findMany({
+					where: { jobId: job.id, status: 'PROCESSING' },
+					select: { id: true, attempts: true }
+				});
+				for (const item of processingItems) {
+					const exhausted = item.attempts >= Number(processing.maxRecoveryAttempts);
+					if (exhausted) await this.credits.finish(tx, 'audio:' + item.id, false);
 
 					await tx.audioGenerationJobItem.update({
 						where: { id: item.id },
@@ -775,7 +827,7 @@ export class audioGenerationService implements OnModuleInit, OnModuleDestroy {
 							: {
 									status: 'WAITING',
 									error: 'Generation interrupted; retry scheduled',
-									nextRetryAt: new Date(Date.now() + this.recoveryRetryDelayMs)
+									nextRetryAt: new Date(Date.now() + Number(processing.recoveryRetryDelayMs))
 								}
 					});
 				}
@@ -826,6 +878,7 @@ export class audioGenerationService implements OnModuleInit, OnModuleDestroy {
 	}
 
 	async onModuleInit() {
+		this.retryScannerStopped = false;
 		const recovered = await this.recoverInterruptedJobs();
 
 		if (recovered > 0) {
@@ -833,21 +886,53 @@ export class audioGenerationService implements OnModuleInit, OnModuleDestroy {
 		}
 		await this.resumeWaitingJobs();
 
-		this.retryTimer = setInterval(() => {
-			void this.resumeWaitingJobs().catch((error: unknown) => {
-				console.error('Failed to resume waiting audio jobs:', error);
-			});
+		if (this.retryScannerStopped) return;
+		await this.refreshRetryScanInterval();
+		this.scheduleRetryScan();
+	}
+
+	private async refreshRetryScanInterval() {
+		try {
+			const { values } = await this.settings.section('processing');
+			const value = Number(values.retryScanIntervalMs);
+			if (!Number.isSafeInteger(value) || value < 1000 || value > 1000000)
+				throw new Error('Invalid audio retry scan interval');
+			this.retryScanIntervalMs = value;
+		} catch (error) {
+			// Keep scanning at the last known interval if configuration cannot be read.
+			console.error('Failed to refresh audio retry scan interval:', error);
+		}
+	}
+
+	private scheduleRetryScan() {
+		if (this.retryScannerStopped) return;
+		this.retryTimer = setTimeout(() => {
+			this.retryTimer = null;
+			void (async () => {
+				try {
+					await this.resumeWaitingJobs();
+				} catch (error) {
+					console.error('Failed to resume waiting audio jobs:', error);
+				} finally {
+					if (!this.retryScannerStopped) {
+						await this.refreshRetryScanInterval();
+						this.scheduleRetryScan();
+					}
+				}
+			})();
 		}, this.retryScanIntervalMs);
 	}
 
 	onModuleDestroy() {
+		this.retryScannerStopped = true;
 		if (this.retryTimer) {
-			clearInterval(this.retryTimer);
+			clearTimeout(this.retryTimer);
 			this.retryTimer = null;
 		}
 	}
 
 	async retryFailedJob(jobId: number, userId: number) {
+		await this.geminiTtsService.assertEnabled();
 		const job = await this.prisma.audioGenerationJob.findFirst({
 			where: {
 				id: jobId,
@@ -936,6 +1021,7 @@ export class audioGenerationService implements OnModuleInit, OnModuleDestroy {
 				}
 			});
 
+			await this.reserveJob(tx, retryJob.id, userId, job.storyId);
 			return {
 				id: retryJob.id,
 				storyId: retryJob.storyId,
@@ -1079,7 +1165,10 @@ export class audioGenerationService implements OnModuleInit, OnModuleDestroy {
 		const story = {
 			...history,
 			id: history.storyId,
-			scenes: history.scenes.map(scene => ({ ...scene, audios: scene.latestAudio ? [scene.latestAudio] : [] }))
+			scenes: history.scenes.map(scene => ({
+				...scene,
+				audios: scene.latestAudio ? [scene.latestAudio] : []
+			}))
 		};
 
 		if (!story) {
@@ -1104,7 +1193,7 @@ export class audioGenerationService implements OnModuleInit, OnModuleDestroy {
 			// Ownership verification
 			const audioFile = await this.getAudioFile(audioId, userId);
 
-			// Read from Local or Supabase Storage
+			// Read from the provider recorded with the asset.
 			const storedFile = await this.storageService.getFile(audioFile.filePath);
 
 			const audioBuffer = await this.streamToBuffer(storedFile.stream);
@@ -1119,9 +1208,9 @@ export class audioGenerationService implements OnModuleInit, OnModuleDestroy {
 
 		const durationMs = Math.round((dataSize / byteRate) * 1000);
 
-		const filename = `story-${storyId}-${randomUUID()}.wav`;
+		const filename = `${storyDownloadName(storyId, story.title)}.wav`;
 
-		const storageKey = `audio-stories/${storyId}/exports/${filename}`;
+		const storageKey = `${storyFolder(storyId, story.title)}/exports/export-${randomUUID()}/${storageLabel(filename.replace(/\.wav$/, ''), 'audio')}.wav`;
 
 		const filePath = await this.storageService.upload({
 			key: storageKey,
@@ -1129,16 +1218,19 @@ export class audioGenerationService implements OnModuleInit, OnModuleDestroy {
 			contentType: 'audio/wav'
 		});
 
-		const asset = await this.prisma.audioAsset.create({
-			data: {
-				storyId,
-				type: 'COMBINED_AUDIO',
-				filePath: filePath,
-				format: 'wav',
-				mimeType: 'audio/wav',
-				fileSizeBytes: BigInt(mergedBuffer.length),
-				durationMs: durationMs
-			}
+		const asset = await this.prisma.$transaction(async tx => {
+			await this.storageService.confirmUpload(tx, filePath);
+			return tx.audioAsset.create({
+				data: {
+					storyId,
+					type: 'COMBINED_AUDIO',
+					filePath: filePath,
+					format: 'wav',
+					mimeType: 'audio/wav',
+					fileSizeBytes: BigInt(mergedBuffer.length),
+					durationMs: durationMs
+				}
+			});
 		});
 
 		return {
@@ -1163,7 +1255,8 @@ export class audioGenerationService implements OnModuleInit, OnModuleDestroy {
 				id: true,
 				storyId: true,
 				filePath: true,
-				mimeType: true
+				mimeType: true,
+				story: { select: { title: true } }
 			}
 		});
 
@@ -1171,20 +1264,8 @@ export class audioGenerationService implements OnModuleInit, OnModuleDestroy {
 			throw new NotFoundException('Exported audio not found');
 		}
 
-		// Verify that this asset belongs to its story's export directory.
-		const expectedPrefix = `audio-stories/${asset.storyId}/exports/`;
-
-		const normalizedPath = asset.filePath.replace(/\\/g, '/');
-
-		const storageKey = normalizedPath.replace(/^(local|supabase):\/\//, '').replace(/^uploads\//, '');
-
-		if (
-			!storageKey.startsWith(expectedPrefix) ||
-			!storageKey.slice(expectedPrefix.length) ||
-			storageKey.split('/').includes('..')
-		) {
+		if (!ownedExportKey(asset.filePath, asset.storyId))
 			throw new NotFoundException('Exported audio file not found');
-		}
 
 		const metadata = await this.storageService.getMetadata(asset.filePath);
 
@@ -1192,7 +1273,7 @@ export class audioGenerationService implements OnModuleInit, OnModuleDestroy {
 			filePath: asset.filePath,
 			fileSize: metadata.size,
 			mimeType: asset.mimeType || metadata.contentType,
-			filename: `story-${asset.storyId}-export-${asset.id}.wav`
+			filename: `${storyDownloadName(asset.storyId, asset.story.title)}.wav`
 		};
 	}
 
@@ -1201,7 +1282,10 @@ export class audioGenerationService implements OnModuleInit, OnModuleDestroy {
 		const story = {
 			...history,
 			id: history.storyId,
-			scenes: history.scenes.map(scene => ({ ...scene, audios: scene.latestAudio ? [scene.latestAudio] : [] }))
+			scenes: history.scenes.map(scene => ({
+				...scene,
+				audios: scene.latestAudio ? [scene.latestAudio] : []
+			}))
 		};
 
 		if (!story) {
@@ -1277,7 +1361,7 @@ export class audioGenerationService implements OnModuleInit, OnModuleDestroy {
 
 		return {
 			stream,
-			filename: `story-${storyId}-audio.zip`
+			filename: `${storyDownloadName(storyId, history.title)}.zip`
 		};
 	}
 

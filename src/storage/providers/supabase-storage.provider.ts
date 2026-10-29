@@ -13,9 +13,7 @@ import type {
 	StorageMetadata
 } from '../storage.interface.js';
 
-type RealtimeTransport = NonNullable<
-  NonNullable<SupabaseClientOptions<'public'>['realtime']>['transport']
->;
+type RealtimeTransport = NonNullable<NonNullable<SupabaseClientOptions<'public'>['realtime']>['transport']>;
 
 const SupabaseWebSocketTransport = WebSocket as unknown as RealtimeTransport;
 
@@ -28,7 +26,7 @@ export class SupabaseStorageProvider implements StorageAdapter {
 		const url = this.configService.get<string>('SUPABASE_URL');
 		const key = this.configService.get<string>('SUPABASE_SERVICE_ROLE_KEY');
 
-		this.bucket = this.configService.get<string>('SUPABASE_STORAGE_BUCKET') || 'autocanvas-audio';
+		this.bucket = this.configService.get<string>('SUPABASE_STORAGE_BUCKET') || 'autocanvas-assets';
 
 		// Local mode mein Supabase credentials required nahi hain.
 

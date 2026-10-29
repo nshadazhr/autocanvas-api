@@ -1,24 +1,39 @@
+import { ProviderCredentialsService } from '../../settings/provider-credentials.service.js';
+import { AppSettingsService } from '../../settings/app-settings.service.js';
 import { Injectable } from '@nestjs/common';
-import { ConfigService } from '@nestjs/config';
 import OpenAI from 'openai';
 
 import { AIProvider, AITextRequest, AITextResponse } from './ai-provider.interface.js';
 
 @Injectable()
 export class OpenAIProvider implements AIProvider {
-	private readonly client: OpenAI;
-
-	constructor(private readonly configService: ConfigService) {
-		this.client = new OpenAI({
-			apiKey: this.configService.getOrThrow<string>('OPENAI_API_KEY')
-		});
-	}
+	constructor(
+		private readonly credentials: ProviderCredentialsService,
+		private readonly settings: AppSettingsService
+	) {}
 
 	async generateText(request: AITextRequest): Promise<AITextResponse> {
-		const response = await this.client.responses.create({
+		await this.settings.assertEnabled('openaiEnabled');
+		const client = new OpenAI({
+			apiKey: await this.credentials.primary('openai'),
+			...(request.jsonSchema ? { maxRetries: 0, timeout: 90000 } : {})
+		});
+		await request.onRequest?.();
+		const response = await client.responses.create({
 			model: request.model,
 			instructions: request.systemPrompt,
 			input: request.userPrompt,
+			...(request.jsonSchema && {
+				store: false,
+				text: {
+					format: {
+						type: 'json_schema' as const,
+						name: 'story_analysis',
+						strict: true,
+						schema: request.jsonSchema
+					}
+				}
+			}),
 			...(request.temperature !== undefined && {
 				temperature: request.temperature
 			}),
