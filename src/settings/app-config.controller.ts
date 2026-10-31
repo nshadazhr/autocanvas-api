@@ -10,4 +10,10 @@ export class AppConfigController {
 	get(@Query('locale') locale?: string) {
 		return this.settings.appConfig(locale);
 	}
+
+	@Get('maintenance')
+	@Header('Cache-Control', 'no-store')
+	maintenance() {
+		return this.settings.maintenanceStatus();
+	}
 }

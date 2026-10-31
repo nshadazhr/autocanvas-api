@@ -86,6 +86,15 @@ AUDIO_FLOW_TEST_DATABASE_URL=postgresql://postgres@127.0.0.1:5432/autocanvas_tes
 ```
 
 
+For the complete backend suite, use that same migrated disposable database and run files serially:
+
+```sh
+AUDIO_FLOW_TEST_DATABASE_URL=postgresql://postgres@127.0.0.1:5432/autocanvas_test npx vitest run --no-file-parallelism --testTimeout 20000 --hookTimeout 20000
+AUDIO_FLOW_TEST_DATABASE_URL=postgresql://postgres@127.0.0.1:5432/autocanvas_test npm run test:e2e
+```
+
+The HTTP smoke suite validates the current `/app-config`, maintenance and protected-profile boundaries. It requires the explicit local `_test` URL before initializing the full application, selects that database instead of the application DATABASE_URL, uses fixture provider credentials/local storage and blocks external fetch requests. It does not exercise real provider payments, AI generation or cloud storage. Unit tests for auth, user profiles and generic projects use typed dependency fixtures to check public-field/cookie/realm/ownership boundaries; HTTP authorization is exercised separately by integration suites.
+
 Missing test DB configuration causes those database suites to skip. Example connection details are placeholders, not deployed credentials. The suites require an explicitly configured disposable test database; skipped suites are not passed tests.
 
 
@@ -125,7 +134,7 @@ and [audio flow](docs/audio-flow.md).
 Super Admin now manages shared web text (English/Hindi), public JSON app settings, new-AI/provider feature switches, analysis and outline model settings, multi-scene recovery settings, credits pricing and new-payment checkout enablement. Read [API overview](docs/api-overview.md) and [audio flow](docs/audio-flow.md) before deployment. Provider credentials are managed only through backend GEMINI_API_KEY / OPENAI_API_KEY environment settings. Apply migration `20261028143000_env_only_provider_keys` and regenerate Prisma when upgrading; it removes stored credentials and source flags, preserving models and feature settings. Credits billing and Razorpay INR checkout are implemented; activation requires merchant configuration. See environment notes below and the retained API/auth guides for setup boundaries.
 
 
-The public app bootstrap is `GET /app-config` returning appStrings/appSettings/locale/features. Local frontend defaults remain the fallback. Admin saves reuse one existing AppSetting writer; provider credentials stay in the backend environment. No generated string catalog, new config table or schema migration is required. See the frontend guide for the four-step request/context/hook flow.
+The public app bootstrap is `GET /app-config` returning appStrings/appSettings/locale/features and optional maintenanceNotice. The web app loads that snapshot once per full page load; normal settings/strings changes require a reload. Public `GET /app-config/maintenance` returns only maintenanceMode/maintenanceNotice for the separate visible-tab background check, with no-store caching. Deploy this backend endpoint before the updated web client. Local frontend defaults remain the fallback. Admin saves reuse one existing AppSetting writer; provider credentials stay in the backend environment. No generated string catalog, new config table or schema migration is required. See the frontend guide for the four-step request/context/hook flow.
 
 
 Automatic provider key switching is removed. Only GEMINI_API_KEY / OPENAI_API_KEY are used; legacy multi-key env flags and per-key quota controls are ignored. Provider keys stay in server environment configuration.

@@ -717,6 +717,48 @@ describe.skipIf(!url)('Super Admin analysis-model settings', () => {
 		expect(JSON.stringify(result.body)).not.toContain('AIza-fixture');
 	});
 
+	it('publishes only maintenance state without fetching public settings or strings', async () => {
+		await settings.updateSection('features', { maintenanceMode: true, audioEnabled: false });
+		await settings.updateSection('models', { outlineModel: 'private-model' });
+		const section = vi.spyOn(settings, 'section');
+		try {
+			const response = await request(app.getHttpServer())
+				.get('/app-config/maintenance')
+				.expect(200)
+				.expect('Cache-Control', 'no-store');
+			expect(response.body).toEqual({ maintenanceMode: true, maintenanceNotice: null });
+			expect(section.mock.calls.map(call => call[0]).sort()).toEqual(['features', 'maintenance']);
+			expect(JSON.stringify(response.body)).not.toContain('private-model');
+			expect(JSON.stringify(response.body)).not.toContain('AIza-fixture');
+			await settings.updateSection('features', { maintenanceMode: false });
+			expect(
+				(await request(app.getHttpServer()).get('/app-config/maintenance').expect(200)).body.maintenanceMode
+			).toBe(false);
+		} finally {
+			section.mockRestore();
+		}
+	});
+
+	it('shares notice allowlisting with bootstrap and removes disabled or expired notices', async () => {
+		await settings.updateSection('maintenance', {
+			noticeEnabled: true,
+			message: 'Save your work before maintenance.',
+			startsAt: new Date(Date.now() + 3600000).toISOString(),
+			endsAt: new Date(Date.now() + 7200000).toISOString()
+		});
+		const response = await request(app.getHttpServer()).get('/app-config/maintenance').expect(200);
+		expect(response.body.maintenanceNotice).toEqual((await settings.appConfig()).maintenanceNotice);
+		expect(Object.keys(response.body).sort()).toEqual(['maintenanceMode', 'maintenanceNotice']);
+		await settings.updateSection('maintenance', { noticeEnabled: false });
+		expect((await settings.maintenanceStatus()).maintenanceNotice).toBeNull();
+		await settings.updateSection('maintenance', {
+			noticeEnabled: true,
+			startsAt: new Date(Date.now() - 7200000).toISOString(),
+			endsAt: new Date(Date.now() - 3600000).toISOString()
+		});
+		expect((await settings.maintenanceStatus()).maintenanceNotice).toBeNull();
+	});
+
 	it('publishes web text/settings with locale fallback and never exposes backend settings', async () => {
 		await request(app.getHttpServer())
 			.patch('/admin/config/web-settings')

@@ -1,20 +1,11 @@
-import { Test, TestingModule } from '@nestjs/testing';
+import { describe, expect, it } from 'vitest';
 import { ProfileController } from './profile.controller.js';
 import { ProfileService } from './profile.service.js';
 
-describe('ProfileController', () => {
-  let controller: ProfileController;
-
-  beforeEach(async () => {
-    const module: TestingModule = await Test.createTestingModule({
-      controllers: [ProfileController],
-      providers: [ProfileService],
-    }).compile();
-
-    controller = module.get<ProfileController>(ProfileController);
-  });
-
-  it('should be defined', () => {
-    expect(controller).toBeDefined();
-  });
+describe('Legacy profile alias', () => {
+	it('uses the guard-provided identity rather than a caller-supplied body', () => {
+		const controller = new ProfileController(new ProfileService());
+		const user = { id: 17, email: 'fixture@example.test' };
+		expect(controller.getProfile({ user, body: { id: 99 } })).toBe(user);
+	});
 });

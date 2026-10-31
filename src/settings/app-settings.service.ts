@@ -218,6 +218,42 @@ export class AppSettingsService {
 			);
 	}
 
+	private publicMaintenanceNotice(notice: Values) {
+		return notice.noticeEnabled === true &&
+			typeof notice.message === 'string' &&
+			typeof notice.startsAt === 'string' &&
+			typeof notice.endsAt === 'string' &&
+			notice.message.trim().length > 0 &&
+			notice.message.length <= 500 &&
+			Number.isFinite(Date.parse(notice.startsAt)) &&
+			Date.parse(notice.endsAt) > Date.now() &&
+			Date.parse(notice.endsAt) > Date.parse(notice.startsAt)
+			? {
+					enabled: true,
+					message: notice.message,
+					startsAt: notice.startsAt,
+					endsAt: notice.endsAt,
+					reminderMinutes: [
+						notice.earlyReminderMinutes,
+						notice.soonReminderMinutes,
+						notice.finalReminderMinutes
+					]
+				}
+			: null;
+	}
+
+	/** Public status only; ordinary frontend settings/strings are loaded once at bootstrap. */
+	async maintenanceStatus() {
+		const [{ values: flags }, { values: notice }] = await Promise.all([
+			this.section('features'),
+			this.section('maintenance')
+		]);
+		return {
+			maintenanceMode: flags.maintenanceMode === true,
+			maintenanceNotice: this.publicMaintenanceNotice(notice)
+		};
+	}
+
 	/** Public allowlists only: never return credentials or whole private configuration sections. */
 	async appConfig(locale?: string) {
 		const { values: appSettings } = await this.section('web-settings');
@@ -231,28 +267,7 @@ export class AppSettingsService {
 			appSettings,
 			appStrings,
 			locale: language,
-			maintenanceNotice:
-				notice.noticeEnabled === true &&
-				typeof notice.message === 'string' &&
-				typeof notice.startsAt === 'string' &&
-				typeof notice.endsAt === 'string' &&
-				notice.message.trim().length > 0 &&
-				notice.message.length <= 500 &&
-				Number.isFinite(Date.parse(notice.startsAt)) &&
-				Date.parse(notice.endsAt) > Date.now() &&
-				Date.parse(notice.endsAt) > Date.parse(notice.startsAt)
-					? {
-							enabled: true,
-							message: notice.message,
-							startsAt: notice.startsAt,
-							endsAt: notice.endsAt,
-							reminderMinutes: [
-								notice.earlyReminderMinutes,
-								notice.soonReminderMinutes,
-								notice.finalReminderMinutes
-							]
-						}
-					: null,
+			maintenanceNotice: this.publicMaintenanceNotice(notice),
 			features: {
 				maintenanceMode: flags.maintenanceMode,
 				audioEnabled: flags.audioEnabled,
